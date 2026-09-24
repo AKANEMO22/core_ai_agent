@@ -60,6 +60,7 @@ class SessionWorkspace:
         session_id: str,
         root_path: Union[str, Path],
         normalized_session_id: Optional[str] = None,
+        fsync: bool = True,
     ) -> None:
         """Initialize session workspace reference.
 
@@ -67,10 +68,13 @@ class SessionWorkspace:
             session_id: Raw session identifier.
             root_path: Base directory for the session sandbox.
             normalized_session_id: Optional precomputed normalized session name.
+            fsync: Whether to enforce os.fsync on atomic writes.
         """
         self.session_id = session_id
         self.root_path = Path(root_path).resolve()
         self.normalized_session_id = normalized_session_id or normalize_session_id(session_id)
+        self.fsync = fsync
+        self._json_cache: Dict[str, Any] = {}
 
     def initialize(self) -> None:
         """Create workspace directory structure on disk if not already existing."""
@@ -173,7 +177,8 @@ class SessionWorkspace:
         try:
             json.dump(envelope, temp_file, indent=2)
             temp_file.flush()
-            os.fsync(temp_file.fileno())
+            if self.fsync:
+                os.fsync(temp_file.fileno())
             temp_file.close()
             os.replace(temp_file.name, target_path)
         except Exception:
@@ -188,6 +193,9 @@ class SessionWorkspace:
         except OSError:
             pass
 
+        key = str(rel_path).replace("\\", "/")
+        self._json_cache[key] = envelope
+
         return target_path
 
     def read_json(self, rel_path: Union[str, Path]) -> dict[str, Any]:
@@ -199,9 +207,16 @@ class SessionWorkspace:
         Returns:
             dict: Parsed JSON data.
         """
+        key = str(rel_path).replace("\\", "/")
+        if key in self._json_cache:
+            cached = self._json_cache[key]
+            return dict(cached) if isinstance(cached, dict) else cached
+
         target_path = self.resolve_path(rel_path)
         with open(target_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            self._json_cache[key] = data
+            return data
 
     def write_text(self, rel_path: Union[str, Path], text: str) -> Path:
         """Atomically write text content (e.g. Markdown reports) to workspace.
@@ -226,7 +241,8 @@ class SessionWorkspace:
         try:
             temp_file.write(text)
             temp_file.flush()
-            os.fsync(temp_file.fileno())
+            if self.fsync:
+                os.fsync(temp_file.fileno())
             temp_file.close()
             os.replace(temp_file.name, target_path)
         except Exception:
@@ -264,6 +280,9 @@ class SessionWorkspace:
         Returns:
             bool: True if the path exists on disk, False otherwise.
         """
+        key = str(rel_path).replace("\\", "/")
+        if key in self._json_cache:
+            return True
         return self.resolve_path(rel_path).exists()
 
     def list_artifacts(self, subdir: str = "") -> List[Path]:
@@ -284,16 +303,23 @@ class SessionWorkspace:
 class SessionWorkspaceManager:
     """Manages creation, resolution, and isolation of session workspaces."""
 
-    def __init__(self, root_base: Optional[Union[str, Path]] = None) -> None:
+    def __init__(
+        self,
+        root_base: Optional[Union[str, Path]] = None,
+        fsync: bool = True,
+    ) -> None:
         """Initialize workspace manager with configurable root base.
 
         Args:
             root_base: Base directory for session workspaces (defaults to settings.WORKSPACE_ROOT_BASE).
+            fsync: Whether to enforce os.fsync on managed workspaces.
         """
         if root_base is not None:
             self.root_base = Path(root_base).resolve()
         else:
             self.root_base = Path(get_settings().WORKSPACE_ROOT_BASE).resolve()
+        self.fsync = fsync
+        self._workspaces: dict[str, SessionWorkspace] = {}
 
     def get_or_create_workspace(self, session_id: str) -> SessionWorkspace:
         """Get or initialize an isolated workspace for the given session ID.
@@ -307,12 +333,20 @@ class SessionWorkspaceManager:
         Returns:
             SessionWorkspace: Initialized session workspace object.
         """
+        if session_id in self._workspaces:
+            cached_ws = self._workspaces[session_id]
+            if cached_ws.root_path.exists():
+                return cached_ws
+            del self._workspaces[session_id]
+
         normalized_id = normalize_session_id(session_id)
         workspace_path = self.root_base / normalized_id
         workspace = SessionWorkspace(
             session_id=session_id,
             root_path=workspace_path,
             normalized_session_id=normalized_id,
+            fsync=self.fsync,
         )
         workspace.initialize()
+        self._workspaces[session_id] = workspace
         return workspace

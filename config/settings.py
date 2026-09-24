@@ -57,6 +57,10 @@ class Settings(BaseSettings):
         default=24,
         description="Retention duration for session workspaces in hours",
     )
+    WORKSPACE_FSYNC: bool = Field(
+        default=True,
+        description="Enforce os.fsync on atomic file writes",
+    )
 
     # Message Queue & State
     REDIS_URL: str = Field(

@@ -92,16 +92,17 @@ class MockLLMClient:
                         matched_payload = val
                         break
 
-            if matched_payload is None:
+            if matched_payload is None and not self.canned_tokens:
                 keys = list(self.canned_json_responses.keys())
                 if self.call_count <= len(keys):
                     matched_payload = self.canned_json_responses[keys[self.call_count - 1]]
                 else:
                     matched_payload = self.canned_json_responses
 
-            resp_str = json.dumps(matched_payload)
-            yield IterationChunk(token=resp_str, finish_reason="stop")
-            return
+            if matched_payload is not None:
+                resp_str = json.dumps(matched_payload)
+                yield IterationChunk(token=resp_str, finish_reason="stop")
+                return
 
         # 3. Check if scripted multi-turn responses provided
         if self.canned_turns and self.call_count <= len(self.canned_turns):
@@ -155,9 +156,11 @@ class MockLLMClient:
 
         # 5. Handle canned token stream
         if self.canned_tokens:
-            for tok in self.canned_tokens:
+            for i, tok in enumerate(self.canned_tokens):
                 if self.stream_delay > 0:
                     await asyncio.sleep(self.stream_delay)
+                elif i > 0:
+                    await asyncio.sleep(0)
                 yield IterationChunk(token=tok)
             yield IterationChunk(finish_reason="stop")
             return

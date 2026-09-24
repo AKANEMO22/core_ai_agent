@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from core.interview.context import ContextAssembler
@@ -43,6 +44,9 @@ class InteractiveSubagentRunner:
         self.stage_director = stage_director
         self.assessment_queue = assessment_queue
         self.state_mgr = state_mgr or stage_director.state_mgr
+        self._cached_spec: Optional[Dict[str, Any]] = None
+        self._cached_profile: Optional[Dict[str, Any]] = None
+        self._cached_intel: Optional[Dict[str, Any]] = None
 
     def _read_json_safe(self, rel_path: str, default: Any = None) -> Any:
         """Safely read a JSON artifact from workspace if it exists."""
@@ -150,16 +154,11 @@ class InteractiveSubagentRunner:
             "vad_metrics": dict(vad_metrics or {}),
             "timestamp": time.time(),
         }
-        self.workspace.write_artifact(
-            f"turns/turn_{turn_number}_candidate.json",
-            artifact_type="turn_candidate",
-            payload=candidate_payload,
-        )
-
-        # 3. Enqueue background evaluation job to AssessmentQueue
-        prev_question = self._get_previous_question(turn_number)
+        # 2. Asynchronously persist candidate turn artifact and enqueue background evaluation job
+        enqueue_job = None
         if self.assessment_queue is not None:
-            job = AssessmentJob(
+            prev_question = self._get_previous_question(turn_number)
+            enqueue_job = AssessmentJob(
                 schema_version="1.0",
                 job_id=f"{session_id}:{turn_id}:{rubric_version}",
                 session_id=session_id,
@@ -172,15 +171,33 @@ class InteractiveSubagentRunner:
                 rubric_target=list(rubric_target or []),
                 created_at=time.time(),
             )
-            await self.assessment_queue.enqueue(job)
 
-        # 4. Assemble context prompt within token ceiling
-        spec = self._read_json_safe(
-            "context/interview_spec.json",
-            default={"interviewer_persona": "Interviewer", "tone": "professional"},
-        )
-        profile = self._read_json_safe("context/candidate_profile.json", default={})
-        company_intel = self._read_json_safe("context/company_intel.json", default={})
+        async def _persist_candidate_and_enqueue() -> None:
+            await asyncio.to_thread(
+                self.workspace.write_artifact,
+                f"turns/turn_{turn_number}_candidate.json",
+                artifact_type="turn_candidate",
+                payload=candidate_payload,
+            )
+            if enqueue_job is not None and self.assessment_queue is not None:
+                await self.assessment_queue.enqueue(enqueue_job)
+
+        bg_task = asyncio.create_task(_persist_candidate_and_enqueue())
+
+        # 4. Assemble context prompt within token ceiling (using cached blueprints)
+        if self._cached_spec is None:
+            self._cached_spec = self._read_json_safe(
+                "context/interview_spec.json",
+                default={"interviewer_persona": "Interviewer", "tone": "professional"},
+            )
+        if self._cached_profile is None:
+            self._cached_profile = self._read_json_safe("context/candidate_profile.json", default={})
+        if self._cached_intel is None:
+            self._cached_intel = self._read_json_safe("context/company_intel.json", default={})
+
+        spec = self._cached_spec
+        profile = self._cached_profile
+        company_intel = self._cached_intel
         curr_stage = self.stage_director.get_current_stage(state) or {}
         recent_turns = self._load_recent_turns(up_to_turn=turn_number - 1)
 
@@ -200,6 +217,7 @@ class InteractiveSubagentRunner:
 
         interviewer_tokens: List[str] = []
         tool_calls_emitted: List[Dict[str, Any]] = []
+        complete_payload: Dict[str, Any] = {}
 
         async for event in self.runtime_agent.run_loop_streaming(
             session_id=session_id,
@@ -212,8 +230,14 @@ class InteractiveSubagentRunner:
                 interviewer_tokens.append(event.payload.get("token", ""))
             elif event.type == LoopEventType.TOOL_CALL_START:
                 tool_calls_emitted.append(event.payload)
+            elif event.type == LoopEventType.COMPLETE:
+                complete_payload = event.payload
+                continue
 
             yield event
+
+        # Ensure candidate persistence and assessment enqueue completed before finishing turn
+        await bg_task
 
         # 6. Atomically persist interviewer turn artifact
         interviewer_text = "".join(interviewer_tokens)
@@ -226,13 +250,47 @@ class InteractiveSubagentRunner:
             "content": interviewer_text,
             "timestamp": time.time(),
         }
-        self.workspace.write_artifact(
+        await asyncio.to_thread(
+            self.workspace.write_artifact,
             f"turns/turn_{turn_number}_interviewer.json",
             artifact_type="turn_interviewer",
             payload=interviewer_payload,
         )
 
         # 7. Record turn progression once with tool_calls and advance stage if completed
+        prev_stage_id = state.current_stage_id
         state = self.stage_director.record_turn(state, tool_calls=tool_calls_emitted)
         if state.is_stage_complete:
             state = self.stage_director.advance_stage(state)
+            yield LoopEvent(
+                schema_version="1.0",
+                event_id=f"evt_{uuid.uuid4().hex[:16]}",
+                session_id=session_id,
+                turn_id=turn_id,
+                sequence=0,
+                timestamp=time.time(),
+                type=LoopEventType.STAGE_TRANSITION,
+                payload={
+                    "from_stage": prev_stage_id,
+                    "to_stage": state.current_stage_id,
+                    "is_curriculum_complete": state.status == LifecycleStatus.DIALOGUE_COMPLETED,
+                    "new_status": state.status.value,
+                },
+            )
+
+        yield LoopEvent(
+            schema_version="1.0",
+            event_id=f"evt_{uuid.uuid4().hex[:16]}",
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=0,
+            timestamp=time.time(),
+            type=LoopEventType.TURN_COMPLETE,
+            payload={
+                "turn_number": turn_number,
+                "turn_id": turn_id,
+                "stage_id": state.current_stage_id,
+                "interviewer_response": interviewer_text,
+                "usage": complete_payload.get("usage"),
+            },
+        )

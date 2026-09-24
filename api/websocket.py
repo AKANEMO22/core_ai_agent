@@ -77,6 +77,23 @@ class ConnectionManager:
             event.sequence = 0
         return self.event_store.append(session_id, event)
 
+    async def record_event_async(self, session_id: str, event: LoopEvent) -> LoopEvent:
+        """Record an event to the session event store ensuring monotonic sequence numbers and Redis persistence.
+
+        Args:
+            session_id: Target session identifier.
+            event: Event to persist.
+
+        Returns:
+            LoopEvent: The recorded event with monotonic sequence.
+        """
+        latest_seq = self.event_store.get_latest_sequence(session_id)
+        if event.sequence <= latest_seq:
+            event.sequence = 0
+        if hasattr(self.event_store, "append_async"):
+            return await self.event_store.append_async(session_id, event)
+        return self.event_store.append(session_id, event)
+
     def get_events_after(
         self,
         session_id: str,
@@ -115,6 +132,30 @@ class ConnectionManager:
             return list(all_events)
 
         return list(all_events)
+
+    async def get_events_after_async(
+        self,
+        session_id: str,
+        last_sequence: Optional[int] = None,
+        last_event_id: Optional[str] = None,
+    ) -> List[LoopEvent]:
+        """Asynchronously retrieve events strictly after sequence or event_id, loading from Redis if absent.
+
+        Args:
+            session_id: Target session identifier.
+            last_sequence: Optional lower sequence boundary filter.
+            last_event_id: Optional last event ID anchor filter.
+
+        Returns:
+            List[LoopEvent]: Sliced event list.
+        """
+        if not self.event_store._events.get(session_id) and hasattr(self.event_store, "load_from_redis_async"):
+            await self.event_store.load_from_redis_async(session_id)
+        return self.get_events_after(
+            session_id,
+            last_sequence=last_sequence,
+            last_event_id=last_event_id,
+        )
 
     async def acquire_lease(self, session_id: str, websocket: Any) -> ConnectionLease:
         """Acquire a connection lease for a session, displacing any existing active lease.
@@ -338,7 +379,7 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
             if msg_type == "replay":
                 last_seq = payload.get("last_sequence")
                 last_eid = payload.get("last_event_id")
-                missed = connection_mgr.get_events_after(
+                missed = await connection_mgr.get_events_after_async(
                     session_id,
                     last_sequence=last_seq,
                     last_event_id=last_eid,
@@ -356,7 +397,7 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
 
                 # Replay any pending events if requested in frame
                 if candidate_msg.last_sequence is not None or candidate_msg.last_event_id is not None:
-                    missed = connection_mgr.get_events_after(
+                    missed = await connection_mgr.get_events_after_async(
                         session_id,
                         last_sequence=candidate_msg.last_sequence,
                         last_event_id=candidate_msg.last_event_id,
@@ -403,7 +444,7 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         type=LoopEventType.ERROR,
                         payload={"error": "Interactive runner not configured for session", "code": "RUNNER_UNAVAILABLE"},
                     )
-                    persisted_err = connection_mgr.record_event(session_id, err_event)
+                    persisted_err = await connection_mgr.record_event_async(session_id, err_event)
                     await websocket.send_text(persisted_err.model_dump_json())
                     continue
 
@@ -419,7 +460,7 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         type=LoopEventType.ERROR,
                         payload={"error": f"Session '{session_id}' not ready or runner unavailable", "code": "NOT_READY"},
                     )
-                    persisted_err = connection_mgr.record_event(session_id, err_event)
+                    persisted_err = await connection_mgr.record_event_async(session_id, err_event)
                     await websocket.send_text(persisted_err.model_dump_json())
                     continue
 
@@ -431,10 +472,16 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         vad_metrics=vad_metrics,
                         expected_turn=expected_turn,
                     ):
-                        persisted_event = connection_mgr.record_event(session_id, event)
+                        persisted_event = await connection_mgr.record_event_async(session_id, event)
                         # Send only if lease is still active
                         if lease.is_active:
-                            await websocket.send_text(persisted_event.model_dump_json())
+                            payload_json = (
+                                getattr(persisted_event, "_cached_json", None)
+                                or persisted_event.model_dump_json()
+                            )
+                            await websocket.send_text(payload_json)
+                            if event.type == LoopEventType.RESPONSE_TOKEN:
+                                await asyncio.sleep(0)
                         else:
                             break
                 except Exception as e:

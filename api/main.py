@@ -73,7 +73,10 @@ def create_app(
     # 2. Workspace Management
     ws_base_path = Path(workspace_base) if workspace_base else app_settings.WORKSPACE_ROOT_BASE
     ws_base_path.mkdir(parents=True, exist_ok=True)
-    workspace_mgr = SessionWorkspaceManager(root_base=str(ws_base_path))
+    workspace_mgr = SessionWorkspaceManager(
+        root_base=str(ws_base_path),
+        fsync=app_settings.WORKSPACE_FSYNC,
+    )
     cleanup_mgr = WorkspaceCleanupManager(root_base=str(ws_base_path))
 
     # 3. Redis Client & Event Storage

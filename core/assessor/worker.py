@@ -4,12 +4,14 @@ import hashlib
 import json
 import logging
 import time
-from typing import Any, Callable, Dict, Optional, Union
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from core.assessor.queue import RedisAssessmentQueue
 from core.assessor.subagent import TurnEvaluator
 from core.runtime.agent import sanitize_secrets
 from core.runtime.client import RuntimeLLMClient
+from core.runtime.types import LoopEvent, LoopEventType
 from core.session.events import SessionEventStore
 from core.session.state import LifecycleStatus, SessionStateManager
 from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
@@ -34,6 +36,7 @@ class AssessorWorker:
         event_store: Optional[SessionEventStore] = None,
         max_retries: int = 3,
         evaluator: Optional[TurnEvaluator] = None,
+        connection_manager: Optional[Any] = None,
     ) -> None:
         """Initialize AssessorWorker.
 
@@ -46,6 +49,7 @@ class AssessorWorker:
             event_store: Optional SessionEventStore for appending replayable events.
             max_retries: Maximum execution attempts before dead-letter routing (default 3).
             evaluator: Optional TurnEvaluator instance.
+            connection_manager: Optional ConnectionManager for dispatching live events.
         """
         self.redis_client = redis_client
         self.queue = queue
@@ -55,6 +59,7 @@ class AssessorWorker:
         self.event_store = event_store
         self.max_retries = max_retries
         self.evaluator = evaluator or TurnEvaluator(llm_client=llm_client)
+        self.connection_manager = connection_manager
 
     def _get_workspace(self, session_id: str) -> SessionWorkspace:
         """Resolve SessionWorkspace instance for the given session ID."""
@@ -85,6 +90,46 @@ class AssessorWorker:
             return False
 
         message_id, job_data = jobs[0]
+        return await self._process_job_data(group_name, message_id, job_data)
+
+    async def recover_and_process_idle_jobs(
+        self,
+        group_name: str = "assessor_workers",
+        consumer_name: str = "recovery_worker",
+        min_idle_time_ms: int = 0,
+        count: int = 10,
+    ) -> int:
+        """Claim idle unacknowledged jobs from other workers using XAUTOCLAIM and process them.
+
+        Args:
+            group_name: Consumer group name.
+            consumer_name: Worker consumer identifier claiming the jobs.
+            min_idle_time_ms: Minimum idle duration in milliseconds.
+            count: Maximum number of jobs to reclaim.
+
+        Returns:
+            int: Number of idle jobs successfully claimed and processed.
+        """
+        claimed = await self.queue.claim_idle_jobs(
+            group_name=group_name,
+            consumer_name=consumer_name,
+            min_idle_time_ms=min_idle_time_ms,
+            count=count,
+        )
+        processed_count = 0
+        for msg_id, job_data in claimed:
+            success = await self._process_job_data(group_name, msg_id, job_data)
+            if success:
+                processed_count += 1
+        return processed_count
+
+    async def _process_job_data(
+        self,
+        group_name: str,
+        message_id: str,
+        job_data: Dict[str, Any],
+    ) -> bool:
+        """Process a single assessment job with idempotency, evaluation, persistence, and event dispatch."""
         session_id = job_data.get("session_id", "")
         turn_id = job_data.get("turn_id", "")
         job_id = job_data.get("job_id", "")
@@ -178,6 +223,31 @@ class AssessorWorker:
                     event_type="assessment_completed",
                     payload=artifact_payload,
                 )
+
+            # Broadcast assessment_update to connection manager if configured
+            if self.connection_manager is not None:
+                update_event = LoopEvent(
+                    schema_version="1.0",
+                    event_id=f"evt_{uuid.uuid4().hex[:16]}",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    sequence=0,
+                    timestamp=time.time(),
+                    type=LoopEventType.ASSESSMENT_UPDATE,
+                    payload={
+                        "job_id": job_id,
+                        "turn_id": turn_id,
+                        "stage_id": stage_id,
+                        "content_score": artifact_payload["content_score"],
+                        "communication_score": artifact_payload["communication_score"],
+                        "status": "COMPLETED",
+                    },
+                )
+                if hasattr(self.connection_manager, "record_event_async"):
+                    await self.connection_manager.record_event_async(session_id, update_event)
+                else:
+                    self.connection_manager.record_event(session_id, update_event)
+                await self.connection_manager.send_event(session_id, update_event)
 
             # Synchronize to Redis stream session:{session_id}:events
             try:

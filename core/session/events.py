@@ -102,6 +102,40 @@ class SessionEventStore:
 
         return event
 
+    async def append_async(self, session_id: str, event: LoopEvent) -> LoopEvent:
+        """Asynchronously append an event to the session event log, awaiting Redis persistence."""
+        current_seq = self._sequences[session_id]
+
+        if event.sequence <= 0:
+            next_seq = current_seq + 1
+            event.sequence = next_seq
+        else:
+            if event.sequence <= current_seq:
+                raise SequenceOrderingError(
+                    f"Event sequence {event.sequence} is non-monotonic for session "
+                    f"'{session_id}'; current sequence is {current_seq}"
+                )
+
+        if event.session_id != session_id:
+            event.session_id = session_id
+
+        self._sequences[session_id] = event.sequence
+        self._events[session_id].append(event)
+        serialized = event.model_dump_json()
+        object.__setattr__(event, "_cached_json", serialized)
+
+        if self._redis is not None and hasattr(self._redis, "rpush"):
+            try:
+                redis_key = f"{self._prefix}{session_id}"
+                res = self._redis.rpush(redis_key, serialized)
+                if hasattr(res, "__await__"):
+                    await res
+            except Exception as e:
+                logger.warning(
+                    f"Failed to persist event to Redis: {sanitize_secrets(str(e))}"
+                )
+        return event
+
     def append_event(
         self,
         session_id: str,
@@ -142,6 +176,23 @@ class SessionEventStore:
         )
         return self.append(session_id, event)
 
+    async def load_from_redis_async(self, session_id: str) -> List[LoopEvent]:
+        """Asynchronously load historical events from Redis into in-memory store."""
+        if self._redis is not None and hasattr(self._redis, "lrange"):
+            try:
+                redis_key = f"{self._prefix}{session_id}"
+                res = self._redis.lrange(redis_key, 0, -1)
+                raw_items = await res if hasattr(res, "__await__") else res
+                loaded = [LoopEvent.model_validate_json(item) for item in raw_items]
+                self._events[session_id] = loaded
+                if loaded:
+                    self._sequences[session_id] = max(e.sequence for e in loaded)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load events from Redis: {sanitize_secrets(str(e))}"
+                )
+        return list(self._events.get(session_id, []))
+
     def get_events(self, session_id: str) -> List[LoopEvent]:
         """Retrieve all recorded events for a session in sequence order."""
         if self._redis is not None and not self._events.get(session_id):
@@ -149,10 +200,11 @@ class SessionEventStore:
                 redis_key = f"{self._prefix}{session_id}"
                 if hasattr(self._redis, "lrange"):
                     raw_items = self._redis.lrange(redis_key, 0, -1)
-                    loaded = [LoopEvent.model_validate_json(item) for item in raw_items]
-                    self._events[session_id] = loaded
-                    if loaded:
-                        self._sequences[session_id] = max(e.sequence for e in loaded)
+                    if not hasattr(raw_items, "__await__"):
+                        loaded = [LoopEvent.model_validate_json(item) for item in raw_items]
+                        self._events[session_id] = loaded
+                        if loaded:
+                            self._sequences[session_id] = max(e.sequence for e in loaded)
             except Exception as e:
                 logger.warning(
                     f"Failed to read events from Redis: {sanitize_secrets(str(e))}"
