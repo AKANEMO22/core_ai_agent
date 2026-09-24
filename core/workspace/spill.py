@@ -1,5 +1,6 @@
 """Payload spillover management to disk when tool execution outputs exceed threshold."""
 
+import base64
 import json
 import re
 import uuid
@@ -47,18 +48,28 @@ class WorkspaceSpillManager:
         Returns:
             dict: Metadata containing either unspilled payload or spill reference with preview.
         """
+        is_binary = False
         if isinstance(payload, str):
             payload_str = payload
             payload_bytes = payload.encode("utf-8")
+            content_for_artifact = payload
         elif isinstance(payload, (bytes, bytearray)):
             payload_bytes = bytes(payload)
-            payload_str = payload_bytes.decode("utf-8", errors="replace")
+            try:
+                payload_str = payload_bytes.decode("utf-8")
+                content_for_artifact = payload_str
+            except UnicodeDecodeError:
+                is_binary = True
+                content_for_artifact = base64.b64encode(payload_bytes).decode("ascii")
+                payload_str = f"<binary data: {len(payload_bytes)} bytes>"
         elif isinstance(payload, (dict, list)):
             payload_str = json.dumps(payload)
             payload_bytes = payload_str.encode("utf-8")
+            content_for_artifact = payload
         else:
             payload_str = str(payload)
             payload_bytes = payload_str.encode("utf-8")
+            content_for_artifact = payload_str
 
         size_bytes = len(payload_bytes)
 
@@ -80,7 +91,8 @@ class WorkspaceSpillManager:
             artifact_type="tool_spill",
             payload={
                 "tool_name": tool_name,
-                "content": payload,
+                "content": content_for_artifact,
+                "is_binary": is_binary,
                 "size_bytes": size_bytes,
             },
         )
@@ -110,5 +122,7 @@ class WorkspaceSpillManager:
             data = json.load(f)
 
         if isinstance(data, dict) and "content" in data:
+            if data.get("is_binary"):
+                return base64.b64decode(data["content"].encode("ascii"))
             return data["content"]
         return data

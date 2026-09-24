@@ -229,3 +229,105 @@ def test_cleanup_manager_size_and_listing(tmp_path: Path):
     size = cleanup_mgr.get_workspace_size_bytes(ws_dir.name)
     assert size >= 10
 
+
+def test_cleanup_manager_path_traversal_defense(tmp_path: Path):
+    """Verify cleanup manager rejects path traversal attempts and root base deletion."""
+    root_base = tmp_path / "workspaces"
+    root_base.mkdir()
+    cleanup_mgr = WorkspaceCleanupManager(root_base=root_base)
+
+    with pytest.raises(WorkspacePathError):
+        cleanup_mgr.delete_workspace("..")
+
+    with pytest.raises(WorkspacePathError):
+        cleanup_mgr.delete_workspace("../../outside")
+
+    with pytest.raises(WorkspacePathError):
+        cleanup_mgr.delete_workspace(".")
+
+
+def test_cleanup_manager_no_prefix_hazard_and_normalized_delete(tmp_path: Path):
+    """Verify cleanup manager disallows empty/generic prefixes and resolves raw session ID."""
+    root_base = tmp_path / "workspaces"
+    root_base.mkdir()
+    ws_dir = root_base / "session_cand_456-123456789012"
+    ws_dir.mkdir()
+
+    cleanup_mgr = WorkspaceCleanupManager(root_base=root_base)
+
+    # Empty string should not match or delete
+    assert cleanup_mgr.delete_workspace("") is False
+    assert ws_dir.exists()
+
+    # Short prefix should not match or delete
+    assert cleanup_mgr.delete_workspace("session_") is False
+    assert ws_dir.exists()
+
+    # Deleting by raw session ID works via normalization
+    from core.workspace.session import SessionWorkspaceManager
+    mgr = SessionWorkspaceManager(root_base=root_base)
+    raw_session_id = "cand@456"
+    ws = mgr.get_or_create_workspace(raw_session_id)
+    assert ws.root_path.exists()
+    assert cleanup_mgr.delete_workspace(raw_session_id) is True
+    assert not ws.root_path.exists()
+
+
+def test_spillover_binary_payload(tmp_path: Path):
+    """Verify raw binary bytes exceeding threshold are base64-serialized without crashing."""
+    ws = SessionWorkspace(session_id="sess_bin", root_path=tmp_path / "sess_bin")
+    ws.initialize()
+    spill_mgr = WorkspaceSpillManager(ws, max_bytes=50)
+
+    binary_data = b"\x00\x01\x02\xff\xfe\xfd" * 20  # Non-UTF8 binary data > 50 bytes
+    res = spill_mgr.maybe_spill(tool_name="audio_tool", payload=binary_data)
+    assert res["is_spilled"] is True
+    assert Path(res["spill_path"]).exists()
+
+    # Read back and verify exact binary recovery
+    recovered = spill_mgr.read_spilled(res["spill_path"])
+    assert recovered == binary_data
+
+
+def test_validate_upload_content_allowed_mime_types():
+    """Verify allowed_mime_types enforces MIME restrictions and detects violations."""
+    pdf_bytes = b"%PDF-1.5 test document"
+    allowed = {"application/pdf"}
+
+    # Permitted PDF
+    assert validate_upload_content(pdf_bytes, filename="cv.pdf", allowed_mime_types=allowed) == pdf_bytes
+
+    # Disallowed plain text
+    with pytest.raises(WorkspaceUploadError):
+        validate_upload_content(b"Hello plain text", filename="cv.txt", allowed_mime_types=allowed)
+
+    # Disallowed explicit content_type
+    with pytest.raises(WorkspaceUploadError):
+        validate_upload_content(
+            pdf_bytes,
+            filename="cv.pdf",
+            content_type="text/plain",
+            allowed_mime_types=allowed,
+        )
+
+
+def test_workspace_root_mtime_touch_on_write(tmp_path: Path):
+    """Verify write_artifact and write_text touch workspace root directory mtime."""
+    ws = SessionWorkspace(session_id="sess_touch", root_path=tmp_path / "sess_touch")
+    ws.initialize()
+
+    # Backdate root_path mtime
+    past_time = time.time() - 5000
+    os.utime(ws.root_path, (past_time, past_time))
+    assert abs(ws.root_path.stat().st_mtime - past_time) < 2
+
+    # write_artifact touches root_path
+    ws.write_artifact("turns/turn_1.json", artifact_type="turn", payload={"step": 1})
+    assert time.time() - ws.root_path.stat().st_mtime < 5
+
+    # Backdate again and test write_text
+    os.utime(ws.root_path, (past_time, past_time))
+    ws.write_text("turns/transcript.txt", "Turn 1 transcript")
+    assert time.time() - ws.root_path.stat().st_mtime < 5
+
+

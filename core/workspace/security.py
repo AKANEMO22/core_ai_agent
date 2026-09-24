@@ -157,4 +157,36 @@ def validate_upload_content(
             if (filename and filename.lower().endswith(".json")) or (content_type and "json" in content_type.lower()):
                 raise WorkspaceUploadError(f"Invalid JSON syntax in upload: {e}") from e
 
+    # Detect MIME type for policy enforcement
+    detected_mime: Optional[str] = None
+    if raw_bytes.startswith(b"%PDF-"):
+        detected_mime = "application/pdf"
+    elif raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_mime = "image/png"
+    elif raw_bytes.startswith(b"\xff\xd8\xff"):
+        detected_mime = "image/jpeg"
+    elif is_json:
+        detected_mime = "application/json"
+    else:
+        try:
+            raw_bytes.decode("utf-8")
+            if filename and filename.lower().endswith(".md"):
+                detected_mime = "text/markdown"
+            else:
+                detected_mime = "text/plain"
+        except UnicodeDecodeError:
+            detected_mime = "application/octet-stream"
+
+    # Enforce allowed_mime_types if specified
+    if allowed_mime_types is not None:
+        effective_mime = (
+            content_type.lower().split(";")[0].strip()
+            if content_type
+            else detected_mime
+        )
+        if not effective_mime or effective_mime not in allowed_mime_types:
+            raise WorkspaceUploadError(
+                f"MIME type '{effective_mime}' is not permitted in allowed MIME types: {sorted(allowed_mime_types)}"
+            )
+
     return raw_bytes

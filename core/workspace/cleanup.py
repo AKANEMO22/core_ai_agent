@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 from config.settings import get_settings
+from core.workspace.security import WorkspacePathError, validate_path_safety
+from core.workspace.session import normalize_session_id
 
 
 class WorkspaceCleanupManager:
@@ -39,16 +41,36 @@ class WorkspaceCleanupManager:
         )
 
     def _resolve_workspace_dir(self, session_id_or_dir: str) -> Optional[Path]:
-        """Resolve a workspace directory path by exact name, normalized name, or prefix."""
-        target = self.root_base / session_id_or_dir
-        if target.exists() and target.is_dir():
-            return target
+        """Resolve a workspace directory path with strict traversal and ancestor checks.
 
-        # Search for directory starting with session_id_or_dir
-        if self.root_base.exists():
-            for entry in self.root_base.iterdir():
-                if entry.is_dir() and (entry.name == session_id_or_dir or entry.name.startswith(session_id_or_dir)):
-                    return entry
+        Args:
+            session_id_or_dir: Directory name or raw session identifier.
+
+        Returns:
+            Optional[Path]: Absolute resolved directory if found and valid, else None.
+
+        Raises:
+            WorkspacePathError: If path escapes root_base or targets root_base itself.
+        """
+        if not session_id_or_dir or not str(session_id_or_dir).strip():
+            return None
+
+        # Verify path safety to prevent directory traversal
+        target_path = validate_path_safety(self.root_base, session_id_or_dir)
+
+        # Enforce that target is strictly a descendant of root_base (not root_base itself)
+        if target_path == self.root_base:
+            raise WorkspacePathError("Target directory cannot be the workspace root base itself")
+
+        if target_path.exists() and target_path.is_dir():
+            return target_path
+
+        # If not found directly, check by normalized session ID
+        normalized_name = normalize_session_id(session_id_or_dir)
+        normalized_path = validate_path_safety(self.root_base, normalized_name)
+        if normalized_path.exists() and normalized_path.is_dir():
+            return normalized_path
+
         return None
 
     def delete_workspace(self, session_id_or_dir: str) -> bool:
@@ -73,6 +95,8 @@ class WorkspaceCleanupManager:
     def cleanup_expired_workspaces(self, max_age_hours: Optional[int] = None) -> List[str]:
         """Scan workspace root and remove workspaces older than retention threshold.
 
+        Considers latest modification time across workspace root and all contained files.
+
         Args:
             max_age_hours: Override retention period in hours.
 
@@ -91,8 +115,18 @@ class WorkspaceCleanupManager:
                 continue
 
             try:
-                stat = entry.stat()
-                last_active = stat.st_mtime
+                # Find latest modification time across directory and all contained files
+                last_active = entry.stat().st_mtime
+                for root, _, files in os.walk(entry):
+                    for f in files:
+                        try:
+                            fp = os.path.join(root, f)
+                            fmtime = os.path.getmtime(fp)
+                            if fmtime > last_active:
+                                last_active = fmtime
+                        except OSError:
+                            continue
+
                 if last_active < cutoff_time:
                     shutil.rmtree(entry, ignore_errors=True)
                     deleted.append(entry.name)

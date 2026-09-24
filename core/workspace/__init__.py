@@ -7,7 +7,7 @@ from core.workspace.security import (
     validate_path_safety,
     validate_upload_content,
 )
-from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
+from core.workspace.session import SessionWorkspace, SessionWorkspaceManager, normalize_session_id
 from core.workspace.spill import WorkspaceSpillManager
 from core.workspace.cleanup import WorkspaceCleanupManager
 
@@ -19,6 +19,7 @@ __all__ = [
     "validate_upload_content",
     "SessionWorkspace",
     "SessionWorkspaceManager",
+    "normalize_session_id",
     "WorkspaceSpillManager",
     "WorkspaceCleanupManager",
 ]

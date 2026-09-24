@@ -13,6 +13,22 @@ from config.settings import get_settings
 from core.workspace.security import validate_path_safety
 
 
+def normalize_session_id(session_id: str) -> str:
+    """Derive a deterministic, safe directory name from a session identifier.
+
+    Format: `session_{clean_id}-{sha256(session_id)[:12]}`.
+
+    Args:
+        session_id: Raw session identifier.
+
+    Returns:
+        str: Sanitized directory name.
+    """
+    clean_id = re.sub(r"[^a-zA-Z0-9]+", "_", session_id).strip("_")
+    hash_suffix = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+    return f"session_{clean_id}-{hash_suffix}"
+
+
 class SessionWorkspace:
     """Represents a sandboxed, isolated workspace for an interview session.
 
@@ -54,13 +70,7 @@ class SessionWorkspace:
         """
         self.session_id = session_id
         self.root_path = Path(root_path).resolve()
-
-        if normalized_session_id:
-            self.normalized_session_id = normalized_session_id
-        else:
-            clean_id = re.sub(r"[^a-zA-Z0-9]+", "_", session_id).strip("_")
-            hash_suffix = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
-            self.normalized_session_id = f"session_{clean_id}-{hash_suffix}"
+        self.normalized_session_id = normalized_session_id or normalize_session_id(session_id)
 
     def initialize(self) -> None:
         """Create workspace directory structure on disk if not already existing."""
@@ -173,6 +183,11 @@ class SessionWorkspace:
                 os.remove(temp_file.name)
             raise
 
+        try:
+            os.utime(self.root_path, None)
+        except OSError:
+            pass
+
         return target_path
 
     def read_json(self, rel_path: Union[str, Path]) -> dict[str, Any]:
@@ -220,6 +235,11 @@ class SessionWorkspace:
             if os.path.exists(temp_file.name):
                 os.remove(temp_file.name)
             raise
+
+        try:
+            os.utime(self.root_path, None)
+        except OSError:
+            pass
 
         return target_path
 
@@ -287,10 +307,7 @@ class SessionWorkspaceManager:
         Returns:
             SessionWorkspace: Initialized session workspace object.
         """
-        clean_id = re.sub(r"[^a-zA-Z0-9]+", "_", session_id).strip("_")
-        hash_suffix = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
-        normalized_id = f"session_{clean_id}-{hash_suffix}"
-
+        normalized_id = normalize_session_id(session_id)
         workspace_path = self.root_base / normalized_id
         workspace = SessionWorkspace(
             session_id=session_id,
