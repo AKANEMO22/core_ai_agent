@@ -272,3 +272,169 @@ def test_websocket_auth_handshake_first_message(tmp_path):
         pong = ws.receive_json()
         assert pong["type"] == "pong"
 
+
+def test_websocket_multi_turn_monotonic_sequence(tmp_path):
+    """Verify that turn 2 and subsequent turns maintain strictly monotonic sequence numbers without crashing."""
+    from fastapi.testclient import TestClient
+    from api.main import create_app
+    from api.auth import create_service_token
+    from config.settings import get_settings
+
+    settings = get_settings()
+    app = create_app(workspace_base=str(tmp_path / "workspaces"), fake_redis=True)
+    client = TestClient(app)
+
+    service_token = create_service_token(secret=settings.JWT_SECRET)
+    create_res = client.post(
+        "/api/v1/sessions",
+        json={"candidate_name": "Multi Turn Candidate", "target_role": "Backend Engineer"},
+        headers={"Authorization": f"Bearer {service_token}"},
+    )
+    assert create_res.status_code == 202
+    sess_id = create_res.json()["session_id"]
+    sess_token = create_res.json()["session_token"]
+
+    with client.websocket_connect(
+        f"/ws/sessions/{sess_id}/stream",
+        headers={"Authorization": f"Bearer {sess_token}"},
+    ) as ws:
+        # Turn 1
+        ws.send_json({
+            "type": "candidate_answer",
+            "candidate_answer": "Turn 1: I have experience in distributed systems.",
+        })
+        turn1_sequences = []
+        for _ in range(20):
+            try:
+                frame = ws.receive_json()
+                turn1_sequences.append(frame["sequence"])
+                if frame["type"] in ("complete", "turn_complete", "error"):
+                    break
+            except Exception:
+                break
+
+        assert len(turn1_sequences) > 0
+        max_turn1_seq = max(turn1_sequences)
+
+        # Turn 2: RuntimeAgent resets sequence to 1, but ConnectionManager must ensure monotonic increment
+        ws.send_json({
+            "type": "candidate_answer",
+            "candidate_answer": "Turn 2: We used Redis for distributed locking.",
+        })
+        turn2_sequences = []
+        for _ in range(20):
+            try:
+                frame = ws.receive_json()
+                turn2_sequences.append(frame["sequence"])
+                if frame["type"] in ("complete", "turn_complete", "error"):
+                    break
+            except Exception:
+                break
+
+        assert len(turn2_sequences) > 0
+        # All turn 2 sequences must be strictly greater than max turn 1 sequence
+        for seq in turn2_sequences:
+            assert seq > max_turn1_seq
+
+
+def test_websocket_ready_session_auto_transition_and_turn(tmp_path):
+    """Verify session in READY status automatically transitions to STAGE_ACTIVE on first candidate turn."""
+    from fastapi.testclient import TestClient
+    from api.main import create_app
+    from api.auth import create_service_token
+    from core.session.state import LifecycleStatus
+    from config.settings import get_settings
+
+    settings = get_settings()
+    app = create_app(workspace_base=str(tmp_path / "workspaces"), fake_redis=True)
+    client = TestClient(app)
+
+    service_token = create_service_token(secret=settings.JWT_SECRET)
+    create_res = client.post(
+        "/api/v1/sessions",
+        json={"candidate_name": "Ready State Candidate"},
+        headers={"Authorization": f"Bearer {service_token}"},
+    )
+    sess_id = create_res.json()["session_id"]
+    sess_token = create_res.json()["session_token"]
+
+    # Explicitly set session to READY (simulating profiling completion)
+    curr_state = app.state.state_mgr.get_state(sess_id)
+    app.state.state_mgr.transition(
+        curr_state,
+        expected_version=curr_state.state_version,
+        new_status=LifecycleStatus.READY,
+    )
+    assert app.state.state_mgr.get_state(sess_id).status == LifecycleStatus.READY
+
+    # Connect WebSocket and send candidate_answer without manual STAGE_ACTIVE transition
+    with client.websocket_connect(
+        f"/ws/sessions/{sess_id}/stream",
+        headers={"Authorization": f"Bearer {sess_token}"},
+    ) as ws:
+        ws.send_json({
+            "type": "candidate_answer",
+            "candidate_answer": "Hello, I am ready for the technical interview.",
+        })
+        events = []
+        for _ in range(20):
+            try:
+                frame = ws.receive_json()
+                events.append(frame)
+                if frame["type"] in ("complete", "turn_complete", "error"):
+                    break
+            except Exception:
+                break
+
+        assert len(events) > 0
+        # No error events emitted
+        assert not any(e["type"] == "error" for e in events)
+        # Session state must now be STAGE_ACTIVE
+        updated_state = app.state.state_mgr.get_state(sess_id)
+        assert updated_state.status == LifecycleStatus.STAGE_ACTIVE
+
+
+def test_websocket_concurrency_ceiling_enforced(tmp_path):
+    """Verify that WebSocket connections exceeding concurrency ceiling are rejected with code 1013."""
+    from fastapi.testclient import TestClient
+    from api.main import create_app
+    from api.auth import create_session_token
+    import asyncio
+    import pytest
+
+    from config.settings import get_settings
+
+    settings = get_settings()
+    app = create_app(workspace_base=str(tmp_path / "workspaces"), fake_redis=True)
+    # Set capacity to 1 for testing concurrency ceiling
+    app.state.concurrency_semaphore = asyncio.Semaphore(1)
+    client = TestClient(app)
+
+    token1 = create_session_token("sess_conc_1", secret=settings.JWT_SECRET)
+    token2 = create_session_token("sess_conc_2", secret=settings.JWT_SECRET)
+
+    # Client 1 connects and holds the only permit
+    with client.websocket_connect(
+        "/ws/sessions/sess_conc_1/stream",
+        headers={"Authorization": f"Bearer {token1}"},
+    ) as ws1:
+        ws1.send_json({"type": "ping"})
+        assert ws1.receive_json()["type"] == "pong"
+
+        # Client 2 attempts to connect when 0 permits remain -> rejected with 1013
+        with pytest.raises(Exception):
+            with client.websocket_connect(
+                "/ws/sessions/sess_conc_2/stream",
+                headers={"Authorization": f"Bearer {token2}"},
+            ) as ws2:
+                pass
+
+    # After Client 1 disconnects, permit is released -> Client 2 can now connect
+    with client.websocket_connect(
+        "/ws/sessions/sess_conc_2/stream",
+        headers={"Authorization": f"Bearer {token2}"},
+    ) as ws2:
+        ws2.send_json({"type": "ping"})
+        assert ws2.receive_json()["type"] == "pong"
+
+

@@ -333,9 +333,10 @@ async def get_session_report(
 async def cancel_session(
     session_id: str,
     request: Request,
-    claims: Dict[str, Any] = Depends(require_service_token),
+    claims: Dict[str, Any] = Depends(require_session_or_service_token),
 ) -> CancelSessionResponse:
     """Idempotently cancel an interview session."""
+    _validate_session_access(claims, session_id)
     state_mgr: SessionStateManager = request.app.state.state_mgr
 
     state = state_mgr.get_state(session_id)

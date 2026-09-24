@@ -256,3 +256,34 @@ async def test_rest_report_flow(tmp_path):
         assert "Interview Report" in rep_data["report_markdown"]
         assert rep_data["final_assessment"]["overall_score"] == 8.5
 
+
+@pytest.mark.asyncio
+async def test_candidate_self_cancel_session(tmp_path):
+    """Verify that a candidate using their session token can cancel their own session and not others."""
+    from httpx import ASGITransport, AsyncClient
+    from api.main import create_app
+    from config.settings import get_settings
+
+    settings = get_settings()
+    app = create_app(workspace_base=str(tmp_path / "workspaces"), fake_redis=True)
+    service_token = create_service_token(issuer="backend", audience="ai-runtime", secret=settings.JWT_SECRET)
+    service_headers = {"Authorization": f"Bearer {service_token}"}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        # Create session
+        c_res = await ac.post("/api/v1/sessions", json={"candidate_name": "Self Cancel Candidate"}, headers=service_headers)
+        assert c_res.status_code == 202
+        sess_id = c_res.json()["session_id"]
+        sess_token = c_res.json()["session_token"]
+        candidate_headers = {"Authorization": f"Bearer {sess_token}"}
+
+        # Candidate cancels their own session -> 200 CANCELLED
+        cancel_res = await ac.post(f"/api/v1/sessions/{sess_id}/cancel", headers=candidate_headers)
+        assert cancel_res.status_code == 200
+        assert cancel_res.json()["status"] == "CANCELLED"
+
+        # Verify candidate cannot cancel another session -> 403 Forbidden
+        other_cancel = await ac.post("/api/v1/sessions/other_session_999/cancel", headers=candidate_headers)
+        assert other_cancel.status_code == 403
+
+

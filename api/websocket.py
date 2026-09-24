@@ -15,6 +15,7 @@ from api.schemas import CandidateAnswerMessage
 from core.runtime.agent import sanitize_secrets
 from core.runtime.types import LoopEvent, LoopEventType
 from core.session.events import EventReplayer, SessionEventStore
+from core.session.state import LifecycleStatus
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +63,18 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
 
     def record_event(self, session_id: str, event: LoopEvent) -> LoopEvent:
-        """Record an event to the session event store.
+        """Record an event to the session event store ensuring monotonic sequence numbers.
 
         Args:
             session_id: Target session identifier.
             event: Event to persist.
 
         Returns:
-            LoopEvent: The recorded event.
+            LoopEvent: The recorded event with monotonic sequence.
         """
+        latest_seq = self.event_store.get_latest_sequence(session_id)
+        if event.sequence <= latest_seq:
+            event.sequence = 0
         return self.event_store.append(session_id, event)
 
     def get_events_after(
@@ -290,6 +294,21 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
     if not is_authenticated:
         return
 
+    # Enforce concurrency ceiling
+    semaphore = getattr(app.state, "concurrency_semaphore", None)
+    semaphore_acquired = False
+    if semaphore is not None:
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=0.5)
+            semaphore_acquired = True
+        except (asyncio.TimeoutError, Exception):
+            logger.warning("Rejected WebSocket connection for '%s': max concurrency ceiling reached", session_id)
+            await websocket.close(
+                code=status.WS_1013_TRY_AGAIN_LATER,
+                reason="Max concurrent sessions limit reached",
+            )
+            return
+
     # If already accepted in step 5, websocket is open. If not, accept now.
     if websocket.client_state.name != "CONNECTED":
         await websocket.accept()
@@ -345,6 +364,31 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                     for evt in missed:
                         await websocket.send_text(evt.model_dump_json())
 
+                # Transition session to STAGE_ACTIVE if currently in READY
+                state_mgr = getattr(app.state, "state_mgr", None)
+                if state_mgr is not None:
+                    curr_state = state_mgr.get_state(session_id)
+                    if curr_state is not None and curr_state.status == LifecycleStatus.READY:
+                        initial_stage = "warmup"
+                        ws_mgr = getattr(app.state, "workspace_mgr", None)
+                        if ws_mgr is not None:
+                            try:
+                                session_ws = ws_mgr.get_or_create_workspace(session_id)
+                                if session_ws.exists("context/stage_plan.json"):
+                                    plan_data = session_ws.read_json("context/stage_plan.json")
+                                    stages = plan_data.get("stages", [])
+                                    if stages and isinstance(stages[0], dict) and "stage_id" in stages[0]:
+                                        initial_stage = stages[0]["stage_id"]
+                            except Exception:
+                                pass
+                        state_mgr.transition(
+                            curr_state,
+                            expected_version=curr_state.state_version,
+                            new_status=LifecycleStatus.STAGE_ACTIVE,
+                            current_stage_id=initial_stage,
+                        )
+                        logger.info("Session '%s' transitioned from READY to STAGE_ACTIVE (stage: %s)", session_id, initial_stage)
+
                 # Resolve runner for this session
                 runner_resolver = getattr(app.state, "get_runner", None)
                 if runner_resolver is None:
@@ -354,13 +398,13 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         event_id=f"evt_{uuid.uuid4().hex[:16]}",
                         session_id=session_id,
                         turn_id=f"turn_{(expected_turn or 1):03d}",
-                        sequence=1,
+                        sequence=0,
                         timestamp=time.time(),
                         type=LoopEventType.ERROR,
                         payload={"error": "Interactive runner not configured for session", "code": "RUNNER_UNAVAILABLE"},
                     )
-                    connection_mgr.record_event(session_id, err_event)
-                    await websocket.send_text(err_event.model_dump_json())
+                    persisted_err = connection_mgr.record_event(session_id, err_event)
+                    await websocket.send_text(persisted_err.model_dump_json())
                     continue
 
                 runner = await runner_resolver(session_id)
@@ -370,13 +414,13 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         event_id=f"evt_{uuid.uuid4().hex[:16]}",
                         session_id=session_id,
                         turn_id=f"turn_{(expected_turn or 1):03d}",
-                        sequence=1,
+                        sequence=0,
                         timestamp=time.time(),
                         type=LoopEventType.ERROR,
                         payload={"error": f"Session '{session_id}' not ready or runner unavailable", "code": "NOT_READY"},
                     )
-                    connection_mgr.record_event(session_id, err_event)
-                    await websocket.send_text(err_event.model_dump_json())
+                    persisted_err = connection_mgr.record_event(session_id, err_event)
+                    await websocket.send_text(persisted_err.model_dump_json())
                     continue
 
                 # Stream turn execution
@@ -387,10 +431,10 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         vad_metrics=vad_metrics,
                         expected_turn=expected_turn,
                     ):
-                        connection_mgr.record_event(session_id, event)
+                        persisted_event = connection_mgr.record_event(session_id, event)
                         # Send only if lease is still active
                         if lease.is_active:
-                            await websocket.send_text(event.model_dump_json())
+                            await websocket.send_text(persisted_event.model_dump_json())
                         else:
                             break
                 except Exception as e:
@@ -400,18 +444,22 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                         event_id=f"evt_{uuid.uuid4().hex[:16]}",
                         session_id=session_id,
                         turn_id=f"turn_{(expected_turn or 1):03d}",
-                        sequence=999,
+                        sequence=0,
                         timestamp=time.time(),
                         type=LoopEventType.ERROR,
                         payload={"error": sanitize_secrets(str(e)), "code": "TURN_ERROR"},
                     )
-                    connection_mgr.record_event(session_id, err_evt)
+                    persisted_err = connection_mgr.record_event(session_id, err_evt)
                     if lease.is_active:
-                        await websocket.send_text(err_evt.model_dump_json())
+                        await websocket.send_text(persisted_err.model_dump_json())
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected for session '%s'", session_id)
     except Exception as e:
         logger.warning("WebSocket error for session '%s': %s", session_id, sanitize_secrets(str(e)))
     finally:
-        await connection_mgr.release_lease(session_id, lease)
+        try:
+            await connection_mgr.release_lease(session_id, lease)
+        finally:
+            if semaphore_acquired and semaphore is not None:
+                semaphore.release()
