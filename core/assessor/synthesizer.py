@@ -97,12 +97,7 @@ class ReportSynthesizer:
             elif state and "expected_assessment_count" in state.metadata:
                 expected = int(state.metadata["expected_assessment_count"])
 
-        if expected is None:
-            # Fallback: check workspace evaluation count if available
-            ws = self._get_workspace(session_id)
-            eval_files = ws.list_artifacts("evaluations")
-            expected = len(eval_files) if eval_files else completed_count
-
+        # If expected assessments cannot be resolved, fail safe (is_ready = False)
         is_ready = (
             failed_count == 0
             and expected is not None

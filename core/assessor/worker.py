@@ -111,7 +111,8 @@ class AssessorWorker:
                 existing_payload = existing_doc.get("payload", existing_doc)
                 if (
                     existing_payload.get("job_id") == job_id
-                    or existing_payload.get("input_sha256") == input_sha256
+                    and existing_payload.get("input_sha256") == input_sha256
+                    and existing_payload.get("rubric_version") == rubric_version
                 ):
                     # Already evaluated: update Redis set and XACK without re-running LLM
                     await self.redis_client.sadd(
