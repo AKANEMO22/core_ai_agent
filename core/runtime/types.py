@@ -17,6 +17,13 @@ class LoopEventType(str, Enum):
     TOOL_CALL_RESULT = "tool_call_result"
     COMPLETE = "complete"
     ERROR = "error"
+    TURN_COMPLETE = "turn_complete"
+    STAGE_TRANSITION = "stage_transition"
+    ASSESSMENT_UPDATE = "assessment_update"
+    ASSESSMENT_COMPLETED = "assessment_completed"
+    REPORT_READY = "report_ready"
+    SESSION_FAILED = "session_failed"
+    SESSION_CANCELLED = "session_cancelled"
 
 
 class LoopStatus(str, Enum):

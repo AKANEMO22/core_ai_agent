@@ -87,7 +87,14 @@ class SessionEventStore:
                 redis_key = f"{self._prefix}{session_id}"
                 serialized = event.model_dump_json()
                 if hasattr(self._redis, "rpush"):
-                    self._redis.rpush(redis_key, serialized)
+                    res = self._redis.rpush(redis_key, serialized)
+                    if hasattr(res, "__await__"):
+                        try:
+                            import asyncio
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(res)
+                        except RuntimeError:
+                            pass
             except Exception as e:
                 logger.warning(
                     f"Failed to persist event to Redis: {sanitize_secrets(str(e))}"
