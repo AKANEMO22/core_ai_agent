@@ -399,6 +399,9 @@ async def delete_session(
     # Run cleanup deletion
     try:
         cleanup_mgr.delete_workspace(session_id)
+        workspace_mgr = getattr(request.app.state, "workspace_mgr", None)
+        if workspace_mgr is not None and hasattr(workspace_mgr, "evict_workspace"):
+            workspace_mgr.evict_workspace(session_id)
     except Exception as e:
         logger.warning(
             "Encountered error during workspace deletion for '%s': %s",

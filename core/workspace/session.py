@@ -350,3 +350,12 @@ class SessionWorkspaceManager:
         workspace.initialize()
         self._workspaces[session_id] = workspace
         return workspace
+
+    def evict_workspace(self, session_id: str) -> None:
+        """Evict workspace from in-memory cache to prevent unbounded growth."""
+        self._workspaces.pop(session_id, None)
+
+    def clear_cache(self) -> None:
+        """Clear all in-memory workspace references."""
+        self._workspaces.clear()
+

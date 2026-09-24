@@ -72,6 +72,11 @@ class LoopEvent(BaseModel):
         timestamp: Unix epoch timestamp in seconds.
         type: Event classifier from LoopEventType.
         payload: Event-specific structured data dictionary.
+
+    Note:
+        Instances may hold an internal `_cached_json` string attribute dynamically
+        assigned by SessionEventStore.append_async to avoid redundant Pydantic
+        re-serialization during high-throughput WebSocket broadcast.
     """
 
     schema_version: str = "1.0"

@@ -219,25 +219,30 @@ class InteractiveSubagentRunner:
         tool_calls_emitted: List[Dict[str, Any]] = []
         complete_payload: Dict[str, Any] = {}
 
-        async for event in self.runtime_agent.run_loop_streaming(
-            session_id=session_id,
-            turn_id=turn_id,
-            messages=messages,
-            cancellation_token=cancellation_token,
-            **kwargs,
-        ):
-            if event.type == LoopEventType.RESPONSE_TOKEN:
-                interviewer_tokens.append(event.payload.get("token", ""))
-            elif event.type == LoopEventType.TOOL_CALL_START:
-                tool_calls_emitted.append(event.payload)
-            elif event.type == LoopEventType.COMPLETE:
-                complete_payload = event.payload
-                continue
+        try:
+            async for event in self.runtime_agent.run_loop_streaming(
+                session_id=session_id,
+                turn_id=turn_id,
+                messages=messages,
+                cancellation_token=cancellation_token,
+                **kwargs,
+            ):
+                if event.type == LoopEventType.RESPONSE_TOKEN:
+                    interviewer_tokens.append(event.payload.get("token", ""))
+                elif event.type == LoopEventType.TOOL_CALL_START:
+                    tool_calls_emitted.append(event.payload)
+                elif event.type == LoopEventType.COMPLETE:
+                    complete_payload = event.payload
+                    continue
 
-            yield event
-
-        # Ensure candidate persistence and assessment enqueue completed before finishing turn
-        await bg_task
+                yield event
+        finally:
+            # Guarantee candidate persistence and assessment enqueue task resolution
+            if not bg_task.done():
+                await bg_task
+            elif bg_task.exception() is not None:
+                # Re-raise or retrieve background exception if task failed
+                _ = bg_task.exception()
 
         # 6. Atomically persist interviewer turn artifact
         interviewer_text = "".join(interviewer_tokens)
