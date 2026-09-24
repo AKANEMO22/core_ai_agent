@@ -7,3 +7,4 @@ htmlcov/
 .env
 data/
 test_data/
+.venv/
