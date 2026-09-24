@@ -364,4 +364,123 @@ async def test_interactive_subagent_runner_tool_complete_stage(tmp_path: Path):
     # State should advance to s2 even though turn was only 1/10
     final_state = state_mgr.get_state("sess_tool_stage")
     assert final_state.current_stage_id == "s2"
+    assert final_state.current_turn == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_complete_stage_no_double_increment_and_sequential_turn(tmp_path: Path):
+    """Verify complete_stage does not double increment current_turn, allowing turn 2 to succeed."""
+    from core.runtime.tooling import RuntimeTool
+
+    ws = SessionWorkspace(session_id="sess_double_inc", root_path=tmp_path / "sess_double_inc")
+    ws.initialize()
+
+    state_mgr = SessionStateManager()
+    state_mgr.create_session(
+        session_id="sess_double_inc",
+        initial_status=LifecycleStatus.STAGE_ACTIVE,
+        current_stage_id="s1",
+    )
+    stages = [
+        {"stage_id": "s1", "target_turns": 10},
+        {"stage_id": "s2", "target_turns": 5},
+    ]
+    director = StageDirector(stages=stages, state_mgr=state_mgr)
+
+    complete_tool = RuntimeTool.from_callable(
+        name="complete_stage",
+        description="Mark current stage complete",
+        func=lambda reason="": f"Done: {reason}",
+    )
+
+    mock_llm = MockLLMClient(
+        canned_tool_calls=[{"name": "complete_stage", "arguments": {"reason": "Met"}}],
+        final_response="Moving to s2.",
+    )
+    runtime_agent = RuntimeAgent(client=mock_llm, tools=[complete_tool], workspace=ws)
+    runner = InteractiveSubagentRunner(
+        workspace=ws,
+        runtime_agent=runtime_agent,
+        context_assembler=ContextAssembler(),
+        stage_director=director,
+        state_mgr=state_mgr,
+    )
+
+    # Turn 1: trigger complete_stage
+    async for _ in runner.run_turn(
+        session_id="sess_double_inc",
+        candidate_answer="Answer turn 1",
+    ):
+        pass
+
+    state_after_turn_1 = state_mgr.get_state("sess_double_inc")
+    # Must be 1, NOT 2!
+    assert state_after_turn_1.current_turn == 1
+    assert state_after_turn_1.current_stage_id == "s2"
+
+    # Turn 2: next candidate turn arrives with expected_turn=2
+    mock_llm_turn2 = MockLLMClient(canned_tokens=["Welcome", " to", " stage", " 2!"])
+    runner.runtime_agent = RuntimeAgent(client=mock_llm_turn2, workspace=ws)
+
+    events_turn2 = []
+    async for event in runner.run_turn(
+        session_id="sess_double_inc",
+        candidate_answer="Answer turn 2",
+        expected_turn=2,
+    ):
+        events_turn2.append(event)
+
+    state_after_turn_2 = state_mgr.get_state("sess_double_inc")
+    assert state_after_turn_2.current_turn == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_no_candidate_duplication_in_system_prompt(tmp_path: Path):
+    """Verify that current candidate answer is passed as user message only, not duplicated in system prompt."""
+    ws = SessionWorkspace(session_id="sess_no_dup", root_path=tmp_path / "sess_no_dup")
+    ws.initialize()
+
+    state_mgr = SessionStateManager()
+    state_mgr.create_session(
+        session_id="sess_no_dup",
+        initial_status=LifecycleStatus.STAGE_ACTIVE,
+        current_stage_id="s1",
+    )
+    director = StageDirector(stages=[{"stage_id": "s1", "target_turns": 5}], state_mgr=state_mgr)
+
+    # Track messages passed to stream_chat
+    recorded_messages = []
+
+    class InspectingMockLLM(MockLLMClient):
+        async def stream_chat(self, messages, tools=None, **kwargs):
+            recorded_messages.extend(messages)
+            async for chunk in super().stream_chat(messages, tools, **kwargs):
+                yield chunk
+
+    mock_llm = InspectingMockLLM(canned_tokens=["Got it!"])
+    runtime_agent = RuntimeAgent(client=mock_llm, workspace=ws)
+    runner = InteractiveSubagentRunner(
+        workspace=ws,
+        runtime_agent=runtime_agent,
+        context_assembler=ContextAssembler(),
+        stage_director=director,
+        state_mgr=state_mgr,
+    )
+
+    unique_candidate_phrase = "UNIQUE_PHRASE_NEVER_DUPLICATED_12345"
+    async for _ in runner.run_turn(
+        session_id="sess_no_dup",
+        candidate_answer=f"My answer is {unique_candidate_phrase}",
+    ):
+        pass
+
+    assert len(recorded_messages) == 2
+    system_msg = recorded_messages[0]
+    user_msg = recorded_messages[1]
+
+    assert system_msg["role"] == "system"
+    assert user_msg["role"] == "user"
+    assert unique_candidate_phrase in user_msg["content"]
+    # Candidate phrase must NOT be present in system prompt
+    assert unique_candidate_phrase not in system_msg["content"]
 

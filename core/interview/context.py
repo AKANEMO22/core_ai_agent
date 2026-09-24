@@ -101,6 +101,7 @@ class ContextAssembler:
             active_old_turns: List[Dict[str, Any]],
             i_level: int,
             p_level: int,
+            qa_turns: Optional[List[Dict[str, Any]]] = None,
         ) -> str:
             sections = []
 
@@ -170,7 +171,8 @@ class ContextAssembler:
                 sections.append("\n".join(intel_lines))
 
             # 5. Conversation History (Droppable Priority 1: old turns) + Inviolable Current Q&A
-            all_turns = active_old_turns + current_qa_turns
+            qa_list = qa_turns if qa_turns is not None else current_qa_turns
+            all_turns = active_old_turns + qa_list
             if all_turns:
                 turn_lines = ["# Conversation History"]
                 for t in all_turns:
@@ -231,5 +233,38 @@ class ContextAssembler:
             if self.estimate_tokens(prompt) <= self.max_tokens:
                 return prompt
 
-        # Fallback: Inviolable core (persona, tone, stage goals, current Q&A) is always returned
+        # --- Truncation Priority 4: Truncate verbose candidate content in current Q&A ---
+        active_qa_turns = [dict(t) for t in current_qa_turns]
+        while self.estimate_tokens(prompt) > self.max_tokens:
+            excess_tokens = self.estimate_tokens(prompt) - self.max_tokens
+            excess_chars = excess_tokens * 4
+            candidate_turns = [
+                (idx, t)
+                for idx, t in enumerate(active_qa_turns)
+                if t.get("role") == "candidate" and len(t.get("content", "")) > 60
+            ]
+            if not candidate_turns:
+                candidate_turns = [
+                    (idx, t)
+                    for idx, t in enumerate(active_qa_turns)
+                    if len(t.get("content", "")) > 60
+                ]
+                if not candidate_turns:
+                    break
+
+            idx, longest_turn = max(
+                candidate_turns, key=lambda pair: len(pair[1].get("content", ""))
+            )
+            curr_content = longest_turn.get("content", "")
+            reduction = max(100, excess_chars + 20)
+            new_len = max(40, len(curr_content) - reduction)
+            active_qa_turns[idx]["content"] = (
+                curr_content[:new_len].rstrip() + "... [truncated]"
+            )
+            prompt = render_prompt(
+                turns_to_keep, intel_level, profile_level, active_qa_turns
+            )
+            if new_len <= 40:
+                break
+
         return prompt

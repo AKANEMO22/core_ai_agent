@@ -197,3 +197,32 @@ def test_estimate_tokens_empty_and_text():
     assert assembler.estimate_tokens("") == 0
     assert assembler.estimate_tokens(None) == 0
     assert assembler.estimate_tokens("Hello world") >= 1
+
+
+def test_context_assembler_truncates_huge_candidate_turn_under_budget():
+    """Verify that a massive candidate response is truncated to strictly fit under 1500 tokens."""
+    assembler = ContextAssembler(max_tokens=1500)
+    spec = {
+        "interviewer_persona": "Senior Architect",
+        "tone": "thorough",
+        "knowledge_scope": ["Distributed Storage"],
+    }
+    stage = {
+        "stage_id": "storage_design",
+        "name": "Storage Engine",
+        "goals": ["Evaluate LSM tree vs B-Tree tradeoffs"],
+    }
+    # 10,000 characters would be ~2500 tokens on its own
+    huge_answer = "LSM trees provide append-only sequential writes and compaction... " * 150
+    turns = [
+        {"role": "interviewer", "content": "Explain write amplification in LSM trees."},
+        {"role": "candidate", "content": huge_answer},
+    ]
+
+    prompt = assembler.assemble_prompt(spec=spec, stage=stage, recent_turns=turns)
+    token_est = assembler.estimate_tokens(prompt)
+    assert token_est <= 1500
+    assert "... [truncated]" in prompt
+    assert "Senior Architect" in prompt
+    assert "Storage Engine" in prompt
+

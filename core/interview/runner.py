@@ -175,10 +175,7 @@ class InteractiveSubagentRunner:
             )
             await self.assessment_queue.enqueue(job)
 
-        # 4. Record turn progression in StageDirector
-        state = self.stage_director.record_turn(state)
-
-        # 5. Assemble context prompt within token ceiling
+        # 4. Assemble context prompt within token ceiling
         spec = self._read_json_safe(
             "context/interview_spec.json",
             default={"interviewer_persona": "Interviewer", "tone": "professional"},
@@ -186,7 +183,7 @@ class InteractiveSubagentRunner:
         profile = self._read_json_safe("context/candidate_profile.json", default={})
         company_intel = self._read_json_safe("context/company_intel.json", default={})
         curr_stage = self.stage_director.get_current_stage(state) or {}
-        recent_turns = self._load_recent_turns(up_to_turn=turn_number)
+        recent_turns = self._load_recent_turns(up_to_turn=turn_number - 1)
 
         system_prompt = self.context_assembler.assemble_prompt(
             spec=spec,
@@ -194,10 +191,9 @@ class InteractiveSubagentRunner:
             profile=profile,
             company_intel=company_intel,
             recent_turns=recent_turns,
-            stage_complete=state.is_stage_complete,
         )
 
-        # 6. Stream through RuntimeAgent
+        # 5. Stream through RuntimeAgent
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": candidate_answer},
@@ -220,7 +216,7 @@ class InteractiveSubagentRunner:
 
             yield event
 
-        # 7. Atomically persist interviewer turn artifact
+        # 6. Atomically persist interviewer turn artifact
         interviewer_text = "".join(interviewer_tokens)
         interviewer_payload = {
             "turn_id": turn_id,
@@ -237,12 +233,7 @@ class InteractiveSubagentRunner:
             payload=interviewer_payload,
         )
 
-        # 8. Complete / Advance stage if triggered
-        tool_completed = any(
-            tc.get("tool_name") == "complete_stage" for tc in tool_calls_emitted
-        )
-        if tool_completed and not state.is_stage_complete:
-            state = self.stage_director.record_turn(state, complete_stage=True)
-
+        # 7. Record turn progression once with tool_calls and advance stage if completed
+        state = self.stage_director.record_turn(state, tool_calls=tool_calls_emitted)
         if state.is_stage_complete:
             self.stage_director.advance_stage(state)

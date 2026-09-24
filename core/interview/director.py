@@ -121,10 +121,14 @@ class StageDirector:
         tool_triggered = False
         if tool_calls:
             for tc in tool_calls:
-                name = tc.get("name") or (
-                    tc.get("function", {}).get("name")
-                    if isinstance(tc.get("function"), dict)
-                    else ""
+                name = (
+                    tc.get("tool_name")
+                    or tc.get("name")
+                    or (
+                        tc.get("function", {}).get("name")
+                        if isinstance(tc.get("function"), dict)
+                        else ""
+                    )
                 )
                 if name == "complete_stage":
                     tool_triggered = True
@@ -200,3 +204,35 @@ class StageDirector:
                 new_status=LifecycleStatus.DIALOGUE_COMPLETED,
                 is_stage_complete=True,
             )
+
+    def complete_current_stage(self, state: SessionState) -> SessionState:
+        """Mark active stage complete via CAS transition without incrementing turn counters.
+
+        Args:
+            state: The current SessionState snapshot.
+
+        Returns:
+            SessionState: Updated session state snapshot with is_stage_complete == True.
+
+        Raises:
+            StageSessionConflictError: If session is not currently in STAGE_ACTIVE status.
+            InvalidStateTransitionError: If CAS expected_version does not match registered state.
+        """
+        if state.status != LifecycleStatus.STAGE_ACTIVE:
+            raise StageSessionConflictError(
+                f"Cannot complete stage for session '{state.session_id}': status is {state.status.value}, "
+                f"expected {LifecycleStatus.STAGE_ACTIVE.value}"
+            )
+
+        registered = self.state_mgr.get_state(state.session_id)
+        if registered is not None and state.state_version != registered.state_version:
+            raise InvalidStateTransitionError(
+                f"CAS mismatch for session '{state.session_id}': expected version "
+                f"{registered.state_version}, but provided state has version {state.state_version}"
+            )
+
+        return self.state_mgr.transition(
+            state=state,
+            expected_version=state.state_version,
+            is_stage_complete=True,
+        )
