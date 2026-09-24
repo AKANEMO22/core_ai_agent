@@ -27,6 +27,7 @@ class MockLLMClient:
         stream_delay: float = 0.0,
         raise_error: Optional[Exception] = None,
         capabilities: Optional[ProviderCapabilities] = None,
+        canned_json_responses: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.canned_tokens = canned_tokens or []
         self.canned_tool_calls = canned_tool_calls
@@ -36,6 +37,7 @@ class MockLLMClient:
         self.repeat_tool_calls = repeat_tool_calls
         self.stream_delay = stream_delay
         self.raise_error = raise_error
+        self.canned_json_responses = canned_json_responses
         self.capabilities = capabilities or ProviderCapabilities(
             streaming=True,
             tool_calls=True,
@@ -68,7 +70,40 @@ class MockLLMClient:
                 await asyncio.sleep(self.stream_delay)
             yield IterationChunk(reasoning_summary=summary)
 
-        # 2. Check if scripted multi-turn responses provided
+        # 2. Check for canned structured JSON responses
+        if self.canned_json_responses:
+            matched_payload = None
+            user_content = ""
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    user_content = str(m.get("content", ""))
+                    break
+
+            # Check if user message explicitly requests a specific key
+            for key, val in self.canned_json_responses.items():
+                if f"for `{key}`" in user_content or f"for '{key}'" in user_content or f"for {key}" in user_content:
+                    matched_payload = val
+                    break
+
+            if matched_payload is None:
+                # Key matching in user content
+                for key, val in self.canned_json_responses.items():
+                    if f"`{key}`" in user_content:
+                        matched_payload = val
+                        break
+
+            if matched_payload is None:
+                keys = list(self.canned_json_responses.keys())
+                if self.call_count <= len(keys):
+                    matched_payload = self.canned_json_responses[keys[self.call_count - 1]]
+                else:
+                    matched_payload = self.canned_json_responses
+
+            resp_str = json.dumps(matched_payload)
+            yield IterationChunk(token=resp_str, finish_reason="stop")
+            return
+
+        # 3. Check if scripted multi-turn responses provided
         if self.canned_turns and self.call_count <= len(self.canned_turns):
             turn_spec = self.canned_turns[self.call_count - 1]
             if "tool_calls" in turn_spec:
