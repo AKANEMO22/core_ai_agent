@@ -484,3 +484,60 @@ async def test_runner_no_candidate_duplication_in_system_prompt(tmp_path: Path):
     # Candidate phrase must NOT be present in system prompt
     assert unique_candidate_phrase not in system_msg["content"]
 
+
+@pytest.mark.asyncio
+async def test_runner_loads_prior_interviewer_response_in_turn_2(tmp_path: Path):
+    """Verify that in turn 2, turn 1's interviewer response is loaded into recent turns in system prompt."""
+    ws = SessionWorkspace(session_id="sess_prior_turns", root_path=tmp_path / "sess_prior_turns")
+    ws.initialize()
+
+    state_mgr = SessionStateManager()
+    state_mgr.create_session(
+        session_id="sess_prior_turns",
+        initial_status=LifecycleStatus.STAGE_ACTIVE,
+        current_stage_id="s1",
+    )
+    director = StageDirector(stages=[{"stage_id": "s1", "target_turns": 5}], state_mgr=state_mgr)
+
+    turn1_question = "Explain ACID properties in relational databases."
+    turn2_messages = []
+
+    # Turn 1 LLM produces turn1_question
+    mock_llm_turn1 = MockLLMClient(canned_tokens=[turn1_question])
+    runtime_agent = RuntimeAgent(client=mock_llm_turn1, workspace=ws)
+    runner = InteractiveSubagentRunner(
+        workspace=ws,
+        runtime_agent=runtime_agent,
+        context_assembler=ContextAssembler(),
+        stage_director=director,
+        state_mgr=state_mgr,
+    )
+
+    async for _ in runner.run_turn(
+        session_id="sess_prior_turns",
+        candidate_answer="My background is backend engineering.",
+    ):
+        pass
+
+    # Turn 2: inspect messages passed to LLM
+    class InspectingMockLLM(MockLLMClient):
+        async def stream_chat(self, messages, tools=None, **kwargs):
+            turn2_messages.extend(messages)
+            async for chunk in super().stream_chat(messages, tools, **kwargs):
+                yield chunk
+
+    mock_llm_turn2 = InspectingMockLLM(canned_tokens=["Great explanation of ACID."])
+    runner.runtime_agent = RuntimeAgent(client=mock_llm_turn2, workspace=ws)
+
+    async for _ in runner.run_turn(
+        session_id="sess_prior_turns",
+        candidate_answer="ACID stands for Atomicity, Consistency, Isolation, Durability.",
+    ):
+        pass
+
+    assert len(turn2_messages) == 2
+    system_prompt = turn2_messages[0]["content"]
+    # Turn 1 interviewer question MUST be present in turn 2's system prompt conversation history!
+    assert turn1_question in system_prompt
+    assert "Atomicity, Consistency, Isolation" in turn2_messages[1]["content"]
+

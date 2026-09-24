@@ -78,13 +78,12 @@ class InteractiveSubagentRunner:
                 if content:
                     turns.append({"role": "candidate", "content": content})
 
-            if i < up_to_turn:
-                int_path = f"turns/turn_{i}_interviewer.json"
-                if self.workspace.exists(int_path):
-                    i_data = self._read_json_safe(int_path, {})
-                    content = i_data.get("content", "")
-                    if content:
-                        turns.append({"role": "interviewer", "content": content})
+            int_path = f"turns/turn_{i}_interviewer.json"
+            if self.workspace.exists(int_path):
+                i_data = self._read_json_safe(int_path, {})
+                content = i_data.get("content", "")
+                if content:
+                    turns.append({"role": "interviewer", "content": content})
 
         return turns
 
@@ -236,4 +235,4 @@ class InteractiveSubagentRunner:
         # 7. Record turn progression once with tool_calls and advance stage if completed
         state = self.stage_director.record_turn(state, tool_calls=tool_calls_emitted)
         if state.is_stage_complete:
-            self.stage_director.advance_stage(state)
+            state = self.stage_director.advance_stage(state)
