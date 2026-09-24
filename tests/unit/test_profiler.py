@@ -1,8 +1,11 @@
 """Unit tests for ProfilerAgent pre-flight reconnaissance and artifact generation."""
 
+import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
-from core.profiler.agent import ProfilerAgent
+from core.profiler.agent import ProfilerAgent, redact_sensitive_candidate_data
+from core.profiler.tools import MarketIntelTool, SafeWebSearchTool
 from core.runtime.providers.mock import MockLLMClient
 from core.workspace.session import SessionWorkspace
 
@@ -147,6 +150,38 @@ async def test_profiler_scrubs_secrets_from_errors(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_profiler_recursive_candidate_redaction(tmp_path):
+    """Verify recursive redaction scrub nested candidate identifiers, lists, emails, and phones."""
+    ws = SessionWorkspace(session_id="sess_p4_b", root_path=tmp_path / "sess_p4_b")
+    ws.initialize()
+
+    form_data = {
+        "candidate_name": "Jane TopSecret",
+        "nested": {
+            "skills": ["CustomSecretAlgorithm", "ProprietaryLedger"],
+            "contact": {
+                "email": "jane.secret@privatecorp.internal",
+                "phone": "+1-555-019-9988",
+            },
+        },
+    }
+    ws.write_artifact("inputs/form_input.json", artifact_type="input", payload=form_data)
+
+    mock_client = MockLLMClient(
+        raise_error=RuntimeError(
+            "Call failed for candidate Jane TopSecret with skill CustomSecretAlgorithm, email jane.secret@privatecorp.internal"
+        )
+    )
+    profiler = ProfilerAgent(llm_client=mock_client)
+    res = await profiler.run_profiling(ws)
+
+    assert res["status"] == "FAILED"
+    assert "Jane TopSecret" not in res["error"]
+    assert "CustomSecretAlgorithm" not in res["error"]
+    assert "jane.secret@privatecorp.internal" not in res["error"]
+
+
+@pytest.mark.asyncio
 async def test_profiler_single_bundle_generation(tmp_path):
     """Verify profiler can process an all-in-one bundle containing all 4 blueprints."""
     ws = SessionWorkspace(session_id="sess_p5", root_path=tmp_path / "sess_p5")
@@ -173,3 +208,43 @@ async def test_profiler_single_bundle_generation(tmp_path):
     assert (ws.root_path / "context" / "candidate_profile.json").exists()
     assert (ws.root_path / "context" / "interview_spec.json").exists()
     assert (ws.root_path / "context" / "stage_plan.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_safe_web_search_enforces_timeout_and_max_bytes():
+    """Verify SafeWebSearchTool enforces timeout and max_bytes when fetching a target URL."""
+    tool = SafeWebSearchTool(timeout=3.0, max_bytes=50)
+    assert tool.timeout == 3.0
+    assert tool.max_bytes == 50
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = b"A" * 200  # 200 bytes, exceeding max_bytes=50
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value.get.return_value = mock_resp
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        with patch("core.profiler.tools.validate_outbound_url", return_value=True):
+            res = await tool.execute({"query": "recon", "target_url": "https://example.com/api"})
+            assert res["status"] == "success"
+            assert res["truncated"] is True
+            assert res["total_bytes"] == 200
+            assert len(res["content"]) <= 50
+
+
+@pytest.mark.asyncio
+async def test_gather_recon_coordinates_tools(tmp_path):
+    """Verify ProfilerAgent._gather_recon coordinates both MarketIntelTool and SafeWebSearchTool."""
+    ws = SessionWorkspace(session_id="sess_p6", root_path=tmp_path / "sess_p6")
+    ws.initialize()
+
+    mock_client = MockLLMClient(canned_tokens=["{}"])
+    profiler = ProfilerAgent(llm_client=mock_client)
+
+    recon = await profiler._gather_recon("Google", "Senior SRE", workspace=ws)
+    assert recon is not None
+    assert "market_intel" in recon
+    assert recon["market_intel"]["company"] == "Google"
+    assert "web_recon" in recon
+    assert len(recon["web_recon"]) > 0

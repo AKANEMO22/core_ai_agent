@@ -3,6 +3,7 @@
 from core.profiler.agent import ProfilerAgent
 from core.profiler.prompts import (
     PROFILER_SYSTEM_PROMPT,
+    sanitize_prompt_field,
     wrap_untrusted_candidate_data,
     wrap_untrusted_market_intel,
 )
@@ -19,5 +20,6 @@ __all__ = [
     "MarketIntelTool",
     "wrap_untrusted_candidate_data",
     "wrap_untrusted_market_intel",
+    "sanitize_prompt_field",
     "PROFILER_SYSTEM_PROMPT",
 ]

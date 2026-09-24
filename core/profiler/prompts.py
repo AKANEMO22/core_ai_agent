@@ -1,6 +1,7 @@
 """Prompt templates and untrusted boundary wrappers for Pre-flight Reconnaissance Profiler."""
 
 import json
+import re
 from typing import Any, Dict, Optional
 
 # Security Delimiters for Untrusted Data Boundaries
@@ -8,6 +9,32 @@ UNTRUSTED_CANDIDATE_DATA_OPEN = "<untrusted_candidate_data>"
 UNTRUSTED_CANDIDATE_DATA_CLOSE = "</untrusted_candidate_data>"
 UNTRUSTED_MARKET_INTEL_OPEN = "<untrusted_market_intel>"
 UNTRUSTED_MARKET_INTEL_CLOSE = "</untrusted_market_intel>"
+
+
+def sanitize_prompt_field(val: Optional[str], default: str = "", max_length: int = 80) -> str:
+    """Sanitize user-provided fields to prevent instruction injection or template escaping.
+
+    Strips control characters, newlines, carriage returns, brackets, quotes, and braces,
+    and enforces maximum length constraints.
+
+    Args:
+        val: User-supplied candidate string.
+        default: Fallback string if field is empty or entirely sanitized away.
+        max_length: Maximum allowed length.
+
+    Returns:
+        str: Cleaned, safe string suitable for prompt templates.
+    """
+    if not val or not isinstance(val, str):
+        return default
+
+    # Remove newlines, carriage returns, control characters, quotes, and brackets/braces
+    cleaned = re.sub(r"[\r\n\t\x00-\x1f\x7f\"'{}<>]", " ", val)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return default
+
+    return cleaned[:max_length]
 
 
 def wrap_untrusted_candidate_data(content: str) -> str:
@@ -88,19 +115,33 @@ def build_company_intel_prompt(
     company_name: str,
     target_role: Optional[str] = None,
     recon_data: Optional[Dict[str, Any]] = None,
+    candidate_context: Optional[str] = None,
 ) -> str:
-    """Construct prompt requesting the company_intel JSON artifact."""
+    """Construct prompt requesting the company_intel JSON artifact with strict boundary encapsulation."""
+    clean_company = sanitize_prompt_field(company_name, default="Target Company")
+    clean_role = sanitize_prompt_field(target_role, default="Software Engineer")
+
+    target_request = {
+        "target_company": clean_company,
+        "target_role": clean_role,
+    }
+    wrapped_target = wrap_untrusted_candidate_data(json.dumps(target_request, indent=2))
+
     recon_section = ""
     if recon_data:
         recon_section = f"\nMarket Reconnaissance Context:\n{wrap_untrusted_market_intel(json.dumps(recon_data))}\n"
 
-    return f"""Target Company: {company_name}
-Target Role: {target_role or "Software Engineer"}
-{recon_section}
-Task: Generate the `company_intel` blueprint artifact in valid JSON format.
-Expected JSON Schema:
+    candidate_section = ""
+    if candidate_context:
+        candidate_section = f"\nCandidate Background Context (Untrusted):\n{candidate_context}\n"
+
+    return f"""Target Request (Untrusted):
+{wrapped_target}
+{candidate_section}{recon_section}
+Task: Generate the `company_intel` blueprint artifact in valid JSON format based on the target company and candidate context.
+Expected JSON Schema for `company_intel`:
 {{
-  "company": "{company_name}",
+  "company": "{clean_company}",
   "culture": "Engineering culture and hiring bar description",
   "tech_stack": ["primary", "technologies", "used"],
   "hiring_bar": "Expected seniority standard and depth",
@@ -134,7 +175,7 @@ Candidate Input (Untrusted):
 {wrapped_candidate}
 
 Task: Evaluate candidate background against company expectations and generate `candidate_profile` in valid JSON format.
-Expected JSON Schema:
+Expected JSON Schema for `candidate_profile`:
 {{
   "strengths": ["Key technical strengths inferred from background"],
   "gaps": ["Potential skill gaps or areas needing verification"],
@@ -151,8 +192,13 @@ def build_interview_spec_prompt(
     candidate_profile: Dict[str, Any],
     target_role: Optional[str] = None,
 ) -> str:
-    """Construct prompt requesting the interview_spec JSON artifact."""
-    return f"""Target Role: {target_role or "Software Engineer"}
+    """Construct prompt requesting the interview_spec JSON artifact with boundary encapsulation."""
+    clean_role = sanitize_prompt_field(target_role, default="Software Engineer")
+    wrapped_role = wrap_untrusted_candidate_data(f"Target Role: {clean_role}")
+
+    return f"""Target Role Context (Untrusted):
+{wrapped_role}
+
 Company Intel:
 {json.dumps(company_intel, indent=2)}
 

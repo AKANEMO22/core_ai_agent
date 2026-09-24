@@ -191,11 +191,37 @@ class SafeWebSearchTool(RuntimeTool):
             Dict[str, Any]: Search results or blocked security notification.
         """
         if target_url:
+            clean_url = sanitize_secrets(target_url)
             if not validate_outbound_url(target_url):
-                logger.warning("SSRF blocked attempt to access unsafe URL: %s", target_url)
+                logger.warning("SSRF blocked attempt to access unsafe URL: %s", clean_url)
                 return {
                     "status": "blocked",
-                    "error": f"URL '{sanitize_secrets(target_url)}' blocked by SSRF defense policy",
+                    "error": f"URL '{clean_url}' blocked by SSRF defense policy",
+                }
+
+            # Enforce timeout and max_bytes via controlled outbound request
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.get(target_url, follow_redirects=False)
+                    content_slice = resp.content[: self.max_bytes]
+                    text_content = content_slice.decode("utf-8", errors="replace")
+                    return {
+                        "status": "success",
+                        "url": clean_url,
+                        "status_code": resp.status_code,
+                        "content": text_content[:2000],
+                        "truncated": len(resp.content) > self.max_bytes,
+                        "total_bytes": len(resp.content),
+                    }
+            except Exception as req_err:
+                clean_err = sanitize_secrets(str(req_err))
+                logger.warning("Outbound request to %s failed: %s", clean_url, clean_err)
+                return {
+                    "status": "error",
+                    "url": clean_url,
+                    "error": clean_err,
                 }
 
         # Return structured recon search summary

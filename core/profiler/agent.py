@@ -12,6 +12,8 @@ from core.profiler.prompts import (
     build_company_intel_prompt,
     build_interview_spec_prompt,
     build_stage_plan_prompt,
+    sanitize_prompt_field,
+    wrap_untrusted_candidate_data,
 )
 from core.profiler.tools import MarketIntelTool, SafeWebSearchTool
 from core.runtime.agent import sanitize_secrets
@@ -26,6 +28,7 @@ def extract_json_payload(text: str) -> Dict[str, Any]:
     """Robustly parse JSON payload from LLM response text.
 
     Handles clean JSON, markdown fenced blocks, and extracts outer JSON objects.
+    Ensures no raw prompt or candidate fragments leak in raised exceptions.
 
     Args:
         text: Raw response string from LLM provider.
@@ -69,8 +72,64 @@ def extract_json_payload(text: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    sample = clean_text[:80] + "..." if len(clean_text) > 80 else clean_text
-    raise ValueError(f"Could not parse valid JSON object from model output: '{sample}'")
+    raise ValueError("Could not parse valid JSON object from model output")
+
+
+def redact_sensitive_candidate_data(
+    error_text: str,
+    form_data: Optional[Dict[str, Any]] = None,
+    cv_text: Optional[str] = None,
+) -> str:
+    """Recursively scrub candidate personal data, CV text, and identifiers from error messages.
+
+    Args:
+        error_text: Raw error message string.
+        form_data: Optional structured candidate form data dictionary.
+        cv_text: Optional plain text resume or CV content.
+
+    Returns:
+        str: Fully scrubbed error string safe for public logs and API responses.
+    """
+    clean = sanitize_secrets(error_text)
+
+    # 1. Redact emails and phone numbers via regex
+    clean = re.sub(
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+        "[REDACTED_EMAIL]",
+        clean,
+    )
+    clean = re.sub(r"\+?\d[\d -]{8,}\d", "[REDACTED_PHONE]", clean)
+
+    # 2. Redact full CV text and significant lines
+    if cv_text:
+        if cv_text in clean:
+            clean = clean.replace(cv_text, "[CANDIDATE_CV_REDACTED]")
+        for line in cv_text.splitlines():
+            line_str = line.strip()
+            if len(line_str) >= 5 and line_str in clean:
+                clean = clean.replace(line_str, "[REDACTED]")
+
+    # 3. Recursively extract all strings from form_data (including nested dicts/lists)
+    def extract_strings(obj: Any) -> List[str]:
+        res: List[str] = []
+        if isinstance(obj, str):
+            s = obj.strip()
+            if len(s) >= 3:
+                res.append(s)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                res.extend(extract_strings(v))
+        elif isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                res.extend(extract_strings(item))
+        return res
+
+    if form_data:
+        for s in sorted(extract_strings(form_data), key=len, reverse=True):
+            if s in clean:
+                clean = clean.replace(s, "[REDACTED]")
+
+    return clean
 
 
 class ProfilerAgent:
@@ -121,19 +180,33 @@ class ProfilerAgent:
         target_role: Optional[str] = None,
         workspace: Optional[SessionWorkspace] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Run safe market intel recon tool if available."""
+        """Coordinate market intel and safe web search tools for company reconnaissance."""
+        recon_data: Dict[str, Any] = {}
+
         if "market_intel" in self.tools_map:
-            tool = self.tools_map["market_intel"]
             try:
-                res = await tool.execute(
+                intel_res = await self.tools_map["market_intel"].execute(
                     {"company_name": company_name, "target_role": target_role},
                     workspace=workspace,
                 )
-                if isinstance(res, dict) and res.get("status") != "blocked":
-                    return res
+                if isinstance(intel_res, dict) and intel_res.get("status") != "blocked":
+                    recon_data["market_intel"] = intel_res
             except Exception as e:
                 logger.warning("Market intel tool execution error (skipped): %s", sanitize_secrets(str(e)))
-        return None
+
+        if "safe_web_search" in self.tools_map:
+            try:
+                search_query = f"{company_name} engineering culture tech stack"
+                search_res = await self.tools_map["safe_web_search"].execute(
+                    {"query": search_query, "max_results": 3},
+                    workspace=workspace,
+                )
+                if isinstance(search_res, dict) and search_res.get("status") != "blocked":
+                    recon_data["web_recon"] = search_res.get("results", [])
+            except Exception as e:
+                logger.warning("Safe web search tool execution error (skipped): %s", sanitize_secrets(str(e)))
+
+        return recon_data if recon_data else None
 
     def _load_inputs(self, workspace: SessionWorkspace) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Inspect workspace inputs directory and load form input or CV documents.
@@ -197,6 +270,9 @@ class ProfilerAgent:
         Returns:
             Dict[str, Any]: Pipeline outcome status and dictionary of written artifact paths.
         """
+        form_data: Optional[Dict[str, Any]] = None
+        cv_text: Optional[str] = None
+
         try:
             form_data, cv_text = self._load_inputs(workspace)
 
@@ -207,30 +283,46 @@ class ProfilerAgent:
                     "session_id": workspace.session_id,
                 }
 
-            # Extract target company and role from inputs
-            target_company = "TechCorp"
-            target_role = "Senior Software Engineer"
+            # Extract target company and role from inputs with defensive sanitization
+            raw_company = "TechCorp"
+            raw_role = "Senior Software Engineer"
 
             if form_data:
-                target_company = form_data.get("target_company") or form_data.get("company", target_company)
-                target_role = form_data.get("target_role") or form_data.get("role", target_role)
+                raw_company = form_data.get("target_company") or form_data.get("company", raw_company)
+                raw_role = form_data.get("target_role") or form_data.get("role", raw_role)
             elif cv_text:
-                # Basic heuristic extraction if form not provided
                 comp_match = re.search(r"Target Company:\s*([^\n\r]+)", cv_text, re.IGNORECASE)
                 if comp_match:
-                    target_company = comp_match.group(1).strip()
+                    raw_company = comp_match.group(1).strip()
                 role_match = re.search(r"Role:\s*([^\n\r]+)", cv_text, re.IGNORECASE)
                 if role_match:
-                    target_role = role_match.group(1).strip()
+                    raw_role = role_match.group(1).strip()
 
-            # Execute safe reconnaissance
+            target_company = sanitize_prompt_field(raw_company, default="Target Company")
+            target_role = sanitize_prompt_field(raw_role, default="Senior Software Engineer")
+
+            # Assemble untrusted candidate context upfront
+            candidate_data_parts: List[str] = []
+            if form_data:
+                candidate_data_parts.append(f"Form Input:\n{json.dumps(form_data, indent=2)}")
+            if cv_text:
+                candidate_data_parts.append(f"CV/Resume Text:\n{cv_text}")
+            combined_candidate = (
+                "\n\n".join(candidate_data_parts)
+                if candidate_data_parts
+                else "No candidate data provided."
+            )
+            wrapped_candidate = wrap_untrusted_candidate_data(combined_candidate)
+
+            # Execute safe reconnaissance with coordinated tools
             recon_data = await self._gather_recon(target_company, target_role, workspace=workspace)
 
-            # Step 1: Generate or check for bundle in first prompt
+            # Step 1: Generate company intel (including candidate context so single-bundle works without hallucination)
             company_prompt = build_company_intel_prompt(
                 company_name=target_company,
                 target_role=target_role,
                 recon_data=recon_data,
+                candidate_context=wrapped_candidate,
             )
             first_response = await self._query_model(company_prompt)
 
@@ -305,15 +397,11 @@ class ProfilerAgent:
 
         except Exception as e:
             # Strictly scrub credentials, API keys, and candidate personal data from error output
-            clean_error = sanitize_secrets(str(e))
-            # Also ensure no raw CV input text is leaked in error
-            if cv_text and cv_text in clean_error:
-                clean_error = clean_error.replace(cv_text, "[CANDIDATE_CV_REDACTED]")
-            if form_data:
-                for val in form_data.values():
-                    if isinstance(val, str) and val in clean_error:
-                        clean_error = clean_error.replace(val, "[REDACTED]")
-
+            clean_error = redact_sensitive_candidate_data(
+                str(e),
+                form_data=form_data,
+                cv_text=cv_text,
+            )
             logger.error("ProfilerAgent execution failed: %s", clean_error)
             return {
                 "status": "FAILED",
