@@ -69,7 +69,7 @@ class RuntimeAgent:
         client: RuntimeLLMClient,
         tools: Optional[List[RuntimeTool]] = None,
         workspace: Optional[SessionWorkspace] = None,
-        max_iterations: int = 10,
+        max_iterations: int = 5,
         schema_repair_budget: int = 1,
         transient_retry_budget: int = 1,
     ) -> None:
@@ -225,39 +225,52 @@ class RuntimeAgent:
 
                 # Case 2: Tool calls emitted -> Execute tools and feed results back
                 self.status = LoopStatus.WAITING_TOOL
+
+                # Normalize IDs across all tool calls once prior to building assistant_record
+                for tc in turn_tool_calls:
+                    if not tc.get("id"):
+                        tc["id"] = f"call_{uuid.uuid4().hex[:8]}"
+
                 assistant_record: Dict[str, Any] = {
                     "role": "assistant",
                     "content": turn_text if turn_text else None,
                     "tool_calls": [
                         {
-                            "id": tc.get("id", f"call_{i}"),
+                            "id": tc["id"],
                             "type": "function",
                             "function": {
                                 "name": tc.get("name"),
                                 "arguments": (
                                     json.dumps(tc.get("arguments"))
                                     if isinstance(tc.get("arguments"), dict)
-                                    else str(tc.get("arguments", "{}"))
+                                    else str(tc.get("arguments") if tc.get("arguments") is not None else "{}")
                                 ),
                             },
                         }
-                        for i, tc in enumerate(turn_tool_calls)
+                        for tc in turn_tool_calls
                     ],
                 }
                 working_messages.append(assistant_record)
 
-                for tc in turn_tool_calls:
-                    call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
-                    tool_name = tc.get("name", "")
-                    raw_args = tc.get("arguments", {})
+                schema_budget_exceeded = False
 
-                    if isinstance(raw_args, str):
+                for tc in turn_tool_calls:
+                    call_id = tc["id"]
+                    tool_name = tc.get("name", "")
+                    raw_args = tc.get("arguments")
+
+                    if raw_args is None:
+                        parsed_args = {}
+                    elif isinstance(raw_args, str):
                         try:
-                            parsed_args = json.loads(raw_args)
+                            parsed = json.loads(raw_args)
+                            parsed_args = parsed if isinstance(parsed, dict) else {"input": parsed}
                         except json.JSONDecodeError:
                             parsed_args = {"input": raw_args}
-                    else:
+                    elif isinstance(raw_args, dict):
                         parsed_args = dict(raw_args)
+                    else:
+                        parsed_args = {}
 
                     # Emit TOOL_CALL_START event
                     yield create_event(
@@ -300,8 +313,11 @@ class RuntimeAgent:
                                 "Please correct the parameters according to schema and retry."
                             )
                         else:
+                            schema_budget_exceeded = True
                             repair_feedback = (
-                                f"Schema validation error: {'; '.join(violations)}"
+                                f"Schema validation error: {'; '.join(violations)}. "
+                                "Schema repair budget exceeded. Do not attempt further tool calls; "
+                                "synthesize your final response to the candidate now."
                             )
 
                         yield create_event(
@@ -411,6 +427,18 @@ class RuntimeAgent:
                             "tool_call_id": call_id,
                             "name": tool_name,
                             "content": tool_content,
+                        }
+                    )
+
+                # Schema repair budget nudge: if budget exhausted, instruct model to answer directly
+                if schema_budget_exceeded:
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Schema repair budget exhausted. Please synthesize your final "
+                                "response to the candidate now without initiating further tool calls."
+                            ),
                         }
                     )
 

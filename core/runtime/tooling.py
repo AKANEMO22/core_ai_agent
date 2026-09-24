@@ -178,13 +178,18 @@ class RuntimeTool:
         Returns:
             Any: Tool execution output result.
         """
-        if isinstance(arguments, str):
+        if arguments is None:
+            args_dict = {}
+        elif isinstance(arguments, str):
             try:
-                args_dict = json.loads(arguments)
+                parsed = json.loads(arguments)
+                args_dict = parsed if isinstance(parsed, dict) else {"input": parsed}
             except json.JSONDecodeError:
                 args_dict = {"input": arguments}
-        else:
+        elif isinstance(arguments, dict):
             args_dict = dict(arguments)
+        else:
+            args_dict = {}
 
         # Inject workspace if requested in function signature
         sig = inspect.signature(self.func)
@@ -193,7 +198,7 @@ class RuntimeTool:
 
         if inspect.iscoroutinefunction(self.func):
             return await self.func(**args_dict)
-        return self.func(**args_dict)
+        return await asyncio.to_thread(self.func, **args_dict)
 
     def to_openai_format(self) -> Dict[str, Any]:
         """Export tool declaration to OpenAI tool calling format."""

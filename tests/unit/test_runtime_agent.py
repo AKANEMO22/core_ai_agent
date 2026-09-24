@@ -498,3 +498,127 @@ async def test_openai_client_streaming_tool_calls_assembly():
     assert tc["id"] == "call_abc123"
     assert tc["name"] == "fetch_user"
     assert tc["arguments"] == {"user_id": 42}
+
+
+@pytest.mark.asyncio
+async def test_tool_call_id_synchronization():
+    """Verify tool call IDs are synchronized between assistant message and tool response."""
+    def sample_tool() -> str:
+        return "result_ok"
+
+    tool = RuntimeTool.from_callable(name="sample_tool", description="Sample", func=sample_tool)
+    # Canned tool call with no 'id' field
+    mock_client = MockLLMClient(
+        canned_tool_calls=[{"name": "sample_tool", "arguments": {}}],
+        final_response="Completed sample.",
+    )
+    agent = RuntimeAgent(client=mock_client, tools=[tool])
+
+    events: List[LoopEvent] = []
+    async for event in agent.run_loop_streaming(
+        session_id="s1",
+        turn_id="turn_001",
+        messages=[{"role": "user", "content": "Execute sample"}],
+    ):
+        events.append(event)
+
+    start_events = [e for e in events if e.type == LoopEventType.TOOL_CALL_START]
+    result_events = [e for e in events if e.type == LoopEventType.TOOL_CALL_RESULT]
+
+    assert len(start_events) == 1
+    assert len(result_events) == 1
+    # Ensure call_id was generated and matches perfectly between start and result
+    call_id = start_events[0].payload["call_id"]
+    assert call_id is not None
+    assert call_id.startswith("call_")
+    assert result_events[0].payload["call_id"] == call_id
+
+
+def test_default_max_iterations_is_five():
+    """Verify default max_iterations is 5 per Global Constraints."""
+    mock_client = MockLLMClient(canned_tokens=["ok"])
+    agent = RuntimeAgent(client=mock_client)
+    assert agent.max_iterations == 5
+
+
+@pytest.mark.asyncio
+async def test_schema_repair_budget_ceiling_enforced():
+    """Verify that when schema repair budget is exhausted, the model is nudged to synthesize final answer."""
+    def strict_tool(req: str) -> str:
+        return f"Got {req}"
+
+    tool = RuntimeTool.from_callable(
+        name="strict_tool",
+        description="Strict",
+        func=strict_tool,
+        param_schema={"type": "object", "properties": {"req": {"type": "string"}}, "required": ["req"]},
+    )
+
+    # Repeat tool calls with invalid arguments
+    mock_client = MockLLMClient(
+        canned_tool_calls=[{"name": "strict_tool", "arguments": {}}],
+        repeat_tool_calls=True,
+    )
+    # Set repair budget to 1 and max_iterations to 3
+    agent = RuntimeAgent(client=mock_client, tools=[tool], schema_repair_budget=1, max_iterations=3)
+
+    events: List[LoopEvent] = []
+    async for event in agent.run_loop_streaming(
+        session_id="s1",
+        turn_id="turn_001",
+        messages=[{"role": "user", "content": "Run strict"}],
+    ):
+        events.append(event)
+
+    tool_results = [e for e in events if e.type == LoopEventType.TOOL_CALL_RESULT]
+    # In iteration 1: repair allowed
+    assert len(tool_results) >= 2
+    # In iteration 2: repair budget exceeded message returned
+    assert "schema repair budget exceeded" in tool_results[1].payload["result"].lower()
+
+
+@pytest.mark.asyncio
+async def test_null_tool_arguments_handled_safely():
+    """Verify tool execution gracefully handles null (None) arguments without crashing."""
+    def no_arg_tool() -> str:
+        return "Executed without arguments"
+
+    tool = RuntimeTool.from_callable(name="no_arg_tool", description="No args", func=no_arg_tool)
+    mock_client = MockLLMClient(
+        canned_tool_calls=[{"name": "no_arg_tool", "arguments": None}],
+        final_response="Success with null arguments.",
+    )
+    agent = RuntimeAgent(client=mock_client, tools=[tool])
+
+    events: List[LoopEvent] = []
+    async for event in agent.run_loop_streaming(
+        session_id="s1",
+        turn_id="turn_001",
+        messages=[{"role": "user", "content": "Call tool"}],
+    ):
+        events.append(event)
+
+    tool_results = [e for e in events if e.type == LoopEventType.TOOL_CALL_RESULT]
+    assert len(tool_results) == 1
+    assert "Executed without arguments" in tool_results[0].payload["result"]
+
+
+@pytest.mark.asyncio
+async def test_sync_tool_executed_in_thread():
+    """Verify synchronous tools are offloaded to worker threads via asyncio.to_thread."""
+    import threading
+
+    main_thread_ident = threading.get_ident()
+    executed_thread_ident = None
+
+    def blocking_sync_tool() -> str:
+        nonlocal executed_thread_ident
+        executed_thread_ident = threading.get_ident()
+        return "done"
+
+    tool = RuntimeTool.from_callable(name="blocking_sync_tool", description="Sync", func=blocking_sync_tool)
+    result = await tool.execute({})
+
+    assert result == "done"
+    # Thread should be a worker thread, distinct from the asyncio event loop thread
+    assert executed_thread_ident != main_thread_ident
