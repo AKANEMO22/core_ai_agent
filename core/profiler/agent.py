@@ -153,7 +153,7 @@ class ProfilerAgent:
         tools: Optional[List[RuntimeTool]] = None,
     ) -> None:
         self.llm_client = llm_client
-        self.tools = tools or [SafeWebSearchTool(), MarketIntelTool()]
+        self.tools = tools if tools is not None else [SafeWebSearchTool(), MarketIntelTool()]
         self.tools_map: Dict[str, RuntimeTool] = {t.name: t for t in self.tools}
 
     async def _query_model(

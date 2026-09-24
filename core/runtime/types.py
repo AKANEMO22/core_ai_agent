@@ -3,7 +3,7 @@
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -79,6 +79,6 @@ class LoopEvent(BaseModel):
     session_id: str
     turn_id: str
     sequence: int
-    timestamp: float = Field(default_factory=time.time)
+    timestamp: Union[float, str] = Field(default_factory=time.time)
     type: LoopEventType
     payload: Dict[str, Any] = Field(default_factory=dict)
