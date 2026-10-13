@@ -162,6 +162,7 @@ class RuntimeAgent:
         await self._emit_hook(HookEvent.TURN_START, session_id, turn_id, message_count=len(working_messages))
 
         try:
+            # Mỗi vòng gọi model có thể tạo tool call; kết quả tool được nối lại vào lịch sử rồi model chạy tiếp.
             while iteration < self.max_iterations:
                 iteration += 1
 

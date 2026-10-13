@@ -81,6 +81,7 @@ def compute_decision(
     uncovered: List[str] = []
     weighted_sum = 0.0
     weight_total = 0.0
+    # Must-have được xét trước điểm trung bình; điểm cao ở tiêu chí khác không thể bù cho tiêu chí bắt buộc thiếu.
     for cid in sorted(coverage):
         item = coverage[cid]
         covered = item.covered(config.min_confidence)

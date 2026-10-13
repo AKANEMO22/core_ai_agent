@@ -1,6 +1,7 @@
 """Integration tests for background assessment queue, assessor worker, and report synthesizer."""
 
 import json
+import asyncio
 import pytest
 import fakeredis.aioredis
 from core.assessor.queue import RedisAssessmentQueue
@@ -11,6 +12,172 @@ from core.runtime.providers.mock import MockLLMClient
 from core.session.events import SessionEventStore
 from core.session.state import LifecycleStatus, SessionState, SessionStateManager
 from core.workspace.session import SessionWorkspace
+from core.session.idempotency import RedisLease
+
+
+@pytest.mark.asyncio
+async def test_session_mutation_renews_owner_lease_during_slow_commit():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    queue.mutation_lock_ttl_ms = 300
+    key = "session:slow:assessment_lock"
+    async with queue.session_mutation("slow"):
+        assert 0 < await redis.pttl(key) <= 300
+        original_owner = await redis.get(key)
+        await asyncio.sleep(0.9)
+        assert await redis.get(key) == original_owner
+        assert await RedisLease(redis).acquire(key, 300) is None
+    assert not await redis.exists(key)
+
+
+@pytest.mark.asyncio
+async def test_mutation_lease_renewal_and_release_never_touch_another_owner():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis, mutation_lock_ttl_ms=300)
+    key = "session:slow:assessment_lock"
+    with pytest.raises(RuntimeError, match="ownership lost"):
+        async with queue.session_mutation("slow"):
+            await redis.set(key, "another-owner", px=10000)
+            await asyncio.sleep(0.15)
+    assert await redis.get(key) == "another-owner"
+    assert await redis.pttl(key) > 9000
+
+
+@pytest.mark.asyncio
+async def test_retry_promotion_preserves_job_when_stream_write_fails():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    job = {"session_id": "retry", "turn_id": "turn_001", "candidate_text": "private answer"}
+    await queue.schedule_retry(job, 0)
+    await redis.set(queue.stream_key, "wrong-type")
+
+    with pytest.raises(Exception):
+        await queue.promote_due_retries()
+
+    assert await redis.zcard(queue.delayed_key) == 1
+    await redis.delete(queue.stream_key)
+    assert await queue.promote_due_retries() == 1
+    assert await redis.zcard(queue.delayed_key) == 0
+    assert await redis.xlen(queue.stream_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_promotion_is_claimed_once_by_concurrent_promoters():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    await queue.schedule_retry({"session_id": "retry", "turn_id": "turn_001"}, 0)
+    results = await asyncio.gather(*(queue.promote_due_retries() for _ in range(8)))
+    assert sum(results) == 1
+    assert await redis.xlen(queue.stream_key) == 1
+    assert await redis.zcard(queue.delayed_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_promotion_retains_member_if_exec_never_reaches_redis(monkeypatch):
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    await queue.schedule_retry({"session_id": "retry", "turn_id": "turn_001"}, 0)
+    pipeline_type = type(redis.pipeline())
+    original_execute = pipeline_type.execute
+
+    async def disconnected_execute(self, *args, **kwargs):
+        raise ConnectionError("disconnected before EXEC")
+
+    monkeypatch.setattr(pipeline_type, "execute", disconnected_execute)
+    with pytest.raises(ConnectionError, match="before EXEC"):
+        await queue.promote_due_retries()
+    assert await redis.zcard(queue.delayed_key) == 1
+    assert await redis.xlen(queue.stream_key) == 0
+
+    monkeypatch.setattr(pipeline_type, "execute", original_execute)
+    assert await queue.promote_due_retries() == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_promotion_does_not_restore_revoked_payload():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    await queue.schedule_retry({"session_id": "deleted", "turn_id": "turn_001"}, 0)
+    await redis.set("session:deleted:revoked", "1")
+    assert await queue.promote_due_retries() == 0
+    assert await redis.zcard(queue.delayed_key) == 0
+    assert await redis.xlen(queue.stream_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_revoked_session_rejects_all_queue_payload_writes():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    job = {"session_id": "deleted", "turn_id": "turn_001", "candidate_text": "private answer"}
+    await redis.set("session:deleted:revoked", "1")
+    await queue.enqueue(job)
+    await queue.schedule_retry(job, 0)
+    await queue.send_to_dead_letter(job, "error")
+    assert await redis.xlen(queue.stream_key) == 0
+    assert await redis.zcard(queue.delayed_key) == 0
+    assert await redis.xlen(queue.dead_letter_stream_key) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decode_responses", [True, False])
+async def test_queue_purge_covers_multiple_stream_pages_and_byte_responses(decode_responses):
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=decode_responses)
+    queue = RedisAssessmentQueue(redis)
+    await queue.setup_consumer_group("g", "0")
+    async with redis.pipeline(transaction=True) as pipe:
+        for index in range(520):
+            job = {"session_id": "deleted", "turn_id": f"turn_{index}", "candidate_text": "private"}
+            pipe.xadd(queue.stream_key, {"payload": json.dumps(job), "session_id": "deleted"})
+            pipe.zadd(queue.delayed_key, {json.dumps(job): 0})
+        pipe.xadd(queue.stream_key, {"payload": json.dumps({"session_id": "other"}), "session_id": "other"})
+        await pipe.execute()
+    await queue.read_jobs("g", "c", count=520)
+    await redis.set("session:deleted:revoked", "1")
+    await queue.purge_session("deleted")
+    assert await redis.xlen(queue.stream_key) == 1
+    assert await redis.zcard(queue.delayed_key) == 0
+    assert (await redis.xpending(queue.stream_key, "g"))["pending"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["enqueue", "retry", "dead_letter"])
+async def test_revocation_during_queue_transaction_prevents_payload_commit(monkeypatch, operation):
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    job = {"session_id": "deleted", "turn_id": "turn_001", "candidate_text": "private"}
+    pipeline_type = type(redis.pipeline())
+    original_execute = pipeline_type.execute
+
+    async def revoke_before_exec(self, *args, **kwargs):
+        await redis.set("session:deleted:revoked", "1")
+        return await original_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_type, "execute", revoke_before_exec)
+    if operation == "enqueue":
+        await queue.enqueue(job)
+    elif operation == "retry":
+        await queue.schedule_retry(job, 0)
+    else:
+        await queue.send_to_dead_letter(job, "error")
+    assert await redis.xlen(queue.stream_key) == 0
+    assert await redis.zcard(queue.delayed_key) == 0
+    assert await redis.xlen(queue.dead_letter_stream_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_deleted_session_worker_does_not_resolve_workspace(tmp_path):
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    queue = RedisAssessmentQueue(redis)
+    await queue.setup_consumer_group("g", "0")
+    await queue.enqueue({"session_id": "deleted", "turn_id": "turn_001"})
+    await redis.set("session:deleted:revoked", "1")
+
+    def forbidden_resolver(session_id):
+        pytest.fail("Deleted session must be fenced before workspace resolution")
+
+    worker = AssessorWorker(redis, queue, MockLLMClient(), forbidden_resolver)
+    assert await worker.process_next_job("g", "c") is True
+    assert await redis.xlen(queue.stream_key) == 0
 
 
 @pytest.mark.asyncio

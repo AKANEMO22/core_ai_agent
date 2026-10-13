@@ -76,7 +76,7 @@ async def test_criterion_evaluator_scores_targets_with_verified_evidence(workspa
 
 
 @pytest.mark.asyncio
-async def test_invented_quotes_are_dropped_and_confidence_halved(workspace: SessionWorkspace):
+async def test_invented_quotes_leave_the_criterion_unscored(workspace: SessionWorkspace):
     def invented(prompt: str) -> Dict[str, Any]:
         return {
             "criteria": [{
@@ -91,7 +91,9 @@ async def test_invented_quotes_are_dropped_and_confidence_halved(workspace: Sess
         question="q", candidate_text=ANSWER, rubric_target=["be_distributed_systems"], session_id="s", turn_id="turn_001",
     )
     item = result["criteria"][0]
-    assert item["evidence"] == [] and item["confidence"] == 0.45
+    assert item["status"] == "insufficient_evidence"
+    assert item["level"] is None and item["confidence"] == 0.0
+    assert item["evidence"] == []
     assert result["flags"]["unverified_quotes_dropped"] == 1
 
 

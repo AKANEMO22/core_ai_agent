@@ -190,6 +190,7 @@ def build_transition(
     Raises:
         InvalidStateTransitionError: On version mismatch or disallowed transition.
     """
+    # Version là khóa CAS: nếu một worker khác đã cập nhật state, snapshot cũ không được ghi đè.
     if state.state_version != expected_version:
         raise InvalidStateTransitionError(
             f"CAS mismatch for session '{state.session_id}': expected version "

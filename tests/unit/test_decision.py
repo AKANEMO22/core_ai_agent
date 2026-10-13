@@ -66,6 +66,33 @@ def test_low_confidence_evidence_is_not_coverage():
     assert set(decision["uncovered_criteria"]) == {"design", "data", "comms"}
 
 
+def test_repeated_unverified_scores_do_not_become_coverage():
+    rubric = {
+        "pass_threshold": 3.0,
+        "competencies": [
+            {"competency_id": "design", "weight": 1.0, "must_have": False, "pass_level": 3},
+        ],
+    }
+    evaluations = [
+        {
+            "turn_id": f"t{i}",
+            "criteria": [{
+                "competency_id": "design",
+                "status": "scored",
+                "level": 4,
+                "confidence": 0.45,
+                "evidence": [],
+            }],
+        }
+        for i in (1, 2)
+    ]
+
+    decision = compute_decision(rubric, evaluations, DecisionConfig())
+
+    assert decision["verdict"] == NEEDS_REVIEW
+    assert decision["uncovered_criteria"] == ["design"]
+
+
 def test_decision_is_byte_identical_for_same_inputs_in_any_order():
     evaluations = [_eval(f"turn_{i:03d}", {"design": 3 + i % 2, "data": 3, "comms": 4}) for i in range(1, 6)]
     versions = {"code": "abc", "rubric_version": "r1"}

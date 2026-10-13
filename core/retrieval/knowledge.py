@@ -165,6 +165,7 @@ class InterviewKnowledgeService:
         )
         company_key = (target_company or "").strip().lower()
 
+        # Hồ sơ vai trò, rubric và bối cảnh công ty không phụ thuộc nhau nên lấy đồng thời để giảm độ trễ.
         role_chunks, rubric_chunks, company_chunks = await asyncio.gather(
             self._search(
                 RetrievalQuery(
@@ -201,6 +202,7 @@ class InterviewKnowledgeService:
         role_profile = self._build_role_profile(role_chunks, role_family, level)
         rubric = self._build_rubric(rubric_chunks, role_profile, role_family, level)
 
+        # Câu hỏi được tìm theo từng competency sau khi rubric đã xác định danh sách tiêu chí cần phỏng vấn.
         question_lists = await asyncio.gather(
             *[
                 self._search(

@@ -21,12 +21,13 @@ from core.runtime.types import LoopEvent, LoopEventType
 from core.session.cancellation import CancellationRegistry
 from core.session.idempotency import (
     IdempotencyConflictError,
+    LedgerEntry,
     MessageLedger,
     RedisLease,
     TokenBucket,
     compute_payload_hash,
 )
-from core.session.state import LifecycleStatus, SessionStateStore
+from core.session.state import LifecycleStatus, SessionState, SessionStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,81 @@ class InterviewSessionController:
         events = await self.publisher.event_store.get_turn_events(session_id, turn_id)
         return TurnRequestResult(status="replayed", turn_id=turn_id, replay_events=events)
 
+    async def _recover_answer(
+        self, session_id: str, entry: LedgerEntry, state: SessionState, answer_text: str
+    ) -> Optional[TurnRequestResult]:
+        """Reconcile an abandoned message while holding the session execution lease."""
+        replay = await self._replay(session_id, entry.turn_id)
+        if any(event.type == LoopEventType.TURN_COMPLETE for event in replay.replay_events):
+            # Turn đã hoàn tất; sửa ledger bị bỏ dở rồi phát lại, không gọi LLM lần nữa.
+            await self.ledger.complete(session_id, entry.message_id)
+            return replay
+
+        recovery_required = TurnRequestResult(
+            status="rejected", turn_id=entry.turn_id, error_code="TURN_RECOVERY_REQUIRED",
+            message="The abandoned turn needs reconciliation before it can be retried.",
+        )
+        try:
+            turn_number = int(entry.turn_id.removeprefix("turn_"))
+        except ValueError:
+            return recovery_required
+        if turn_number < 1 or entry.turn_id != turn_id_for(turn_number):
+            return recovery_required
+        # Chưa chuyển stage sau commit thì chưa có kết quả cuối đủ chắc chắn để replay.
+        if (
+            state.current_turn == turn_number
+            and state.is_stage_complete
+            and state.status == LifecycleStatus.STAGE_ACTIVE
+        ):
+            return recovery_required
+        runner = await self.runners.get(session_id)
+        if runner is None:
+            return TurnRequestResult(
+                status="rejected", turn_id=entry.turn_id, error_code="RUNNER_UNAVAILABLE"
+            )
+        interviewer_path = f"turns/turn_{turn_number}_interviewer.json"
+        if state.current_turn < turn_number:
+            # Chỉ chạy lại turn chưa commit và chưa lưu câu trả lời; giữ nguyên message → turn.
+            if state.current_turn + 1 == turn_number and not runner.workspace.exists(interviewer_path):
+                return None
+            return recovery_required
+        try:
+            candidate = await asyncio.to_thread(
+                runner.workspace.read_json, f"turns/turn_{turn_number}_candidate.json"
+            )
+            interviewer = await asyncio.to_thread(runner.workspace.read_json, interviewer_path)
+        except (OSError, ValueError):
+            return recovery_required
+        if not isinstance(candidate, dict) or not isinstance(interviewer, dict):
+            return recovery_required
+        if (
+            candidate.get("message_id") != entry.message_id
+            or candidate.get("content") != answer_text
+            or candidate.get("turn_id") != entry.turn_id
+            or interviewer.get("turn_id") != entry.turn_id
+            or candidate.get("session_id") != session_id
+            or interviewer.get("session_id") != session_id
+            or not isinstance(interviewer.get("content"), str)
+            or not interviewer["content"].strip()
+        ):
+            return recovery_required
+        # State đã commit nhưng thiếu event cuối: dựng lại từ artifact đúng message và turn.
+        await self.publisher.publish(
+            session_id,
+            LoopEvent(
+                session_id=session_id, turn_id=entry.turn_id, sequence=0,
+                type=LoopEventType.TURN_COMPLETE,
+                payload={
+                    "turn_number": turn_number, "turn_id": entry.turn_id,
+                    "stage_id": interviewer.get("stage_id"),
+                    "interviewer_response": interviewer["content"],
+                    "interrupted": bool(interviewer.get("interrupted")),
+                },
+            ),
+        )
+        await self.ledger.complete(session_id, entry.message_id)
+        return await self._replay(session_id, entry.turn_id)
+
     # ------------------------------------------------------------------
     # Opening
     # ------------------------------------------------------------------
@@ -305,7 +381,7 @@ class InterviewSessionController:
         vad_metrics: Optional[Dict[str, Any]] = None,
         expected_turn: Optional[int] = None,
     ) -> TurnRequestResult:
-        """Execute one candidate turn with exactly-once semantics per `message_id`."""
+        """Execute or recover a candidate turn identified by an idempotent `message_id`."""
         if not message_id:
             return TurnRequestResult(
                 status="rejected", error_code="MISSING_MESSAGE_ID", message="message_id is required"
@@ -323,9 +399,6 @@ class InterviewSessionController:
                     return TurnRequestResult(status="rejected", error_code="MESSAGE_ID_CONFLICT")
                 if existing.status == "completed":
                     return await self._replay(session_id, existing.turn_id)
-                return TurnRequestResult(
-                    status="rejected", turn_id=existing.turn_id, error_code="TURN_IN_PROGRESS"
-                )
         except IdempotencyConflictError:
             return TurnRequestResult(status="rejected", error_code="MESSAGE_ID_CONFLICT")
 
@@ -339,9 +412,21 @@ class InterviewSessionController:
         registered = False
         turn_id: Optional[str] = None
         try:
+            # Lease mới cho phép đối soát ledger cũ; lease còn hiệu lực vẫn chặn retry.
+            existing = await self.ledger.get(session_id, message_id)
+            if existing is not None:
+                if existing.payload_hash and existing.payload_hash != payload_hash:
+                    return TurnRequestResult(status="rejected", error_code="MESSAGE_ID_CONFLICT")
+                if existing.status == "completed":
+                    return await self._replay(session_id, existing.turn_id)
             state = await self.state_store.aget(session_id)
             if state is None:
                 return TurnRequestResult(status="rejected", error_code="SESSION_NOT_FOUND")
+            if existing is not None:
+                turn_id = existing.turn_id
+                recovered = await self._recover_answer(session_id, existing, state, answer_text)
+                if recovered is not None:
+                    return recovered
             if state.status == LifecycleStatus.READY:
                 return TurnRequestResult(
                     status="rejected",
@@ -372,7 +457,10 @@ class InterviewSessionController:
             if prior is not None:
                 if prior.status == "completed":
                     return await self._replay(session_id, prior.turn_id)
-                return TurnRequestResult(status="rejected", turn_id=prior.turn_id, error_code="TURN_IN_PROGRESS")
+                if prior.turn_id != turn_id:
+                    return TurnRequestResult(
+                        status="rejected", turn_id=prior.turn_id, error_code="TURN_RECOVERY_REQUIRED"
+                    )
             registered = True
 
             runner = await self.runners.get(session_id)

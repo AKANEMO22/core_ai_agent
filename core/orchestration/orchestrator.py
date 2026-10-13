@@ -222,6 +222,7 @@ class InterviewOrchestrator:
         state, workspace, stages = ctx["state"], ctx["workspace"], ctx["stages"]
         turn_id = f"turn_{turn_number:03d}"
 
+        # Agent phụ bổ sung phân tích; lượt phỏng vấn và coverage vẫn là dữ liệu để cổng quyết định kiểm tra.
         # 1. Parallel delegations, joined under a deadline
         latest_answer = str(_payload(workspace, f"turns/turn_{turn_number}_candidate.json").get("content", ""))
         latest_question = str(
@@ -403,6 +404,7 @@ class InterviewOrchestrator:
         turns_used: int = 0,
     ) -> Directive:
         """Apply the coverage gate and stage budget to the model's decision."""
+        # LLM chỉ đề xuất directive; hàm này ràng buộc theo rubric, bằng chứng và ngân sách stage trước khi lưu.
         raw = dict(decision["directive"])
         rubric_ids = {c.get("competency_id") for c in rubric.get("competencies", [])}
         if raw.get("target_criterion") not in rubric_ids:

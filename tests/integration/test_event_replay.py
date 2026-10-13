@@ -1,9 +1,11 @@
 """Integration tests for WebSocket connection manager, connection lease displacement, and event replay."""
 
 import asyncio
+import fakeredis.aioredis
 import pytest
 from api.websocket import ConnectionManager, ConnectionLease
 from core.runtime.types import LoopEvent, LoopEventType
+from core.session.events import SessionEventStore
 
 
 @pytest.mark.asyncio
@@ -79,6 +81,46 @@ async def test_event_replay_by_last_event_id():
     # Replay with unknown last_event_id returns all events
     all_events = mgr.get_events_after("sess_2", last_event_id="unknown_evt")
     assert len(all_events) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_length", [2, 3])
+async def test_append_before_first_replay_after_restart_preserves_retained_events(max_length):
+    """Appending with a cold cache must preserve Redis history for reconnect cursors."""
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    session_id = "sess_append_after_restart"
+    try:
+        original = ConnectionManager(SessionEventStore(redis_client=redis, max_length=max_length))
+        for event_id in ("evt_1", "evt_2"):
+            await original.record_event_async(session_id, LoopEvent(
+                session_id=session_id,
+                turn_id="turn_001",
+                sequence=0,
+                type=LoopEventType.RESPONSE_TOKEN,
+                event_id=event_id,
+                payload={"token": event_id},
+            ))
+
+        restarted = ConnectionManager(SessionEventStore(redis_client=redis, max_length=max_length))
+        newest = await restarted.record_event_async(session_id, LoopEvent(
+            session_id=session_id,
+            turn_id="turn_002",
+            sequence=0,
+            type=LoopEventType.RESPONSE_TOKEN,
+            event_id="evt_3",
+            payload={"token": "resumed"},
+        ))
+        assert newest.sequence == 3
+
+        replayed = await restarted.replay(session_id, last_sequence=1)
+        assert replayed.resync_required is False
+        assert [event.event_id for event in replayed.events] == ["evt_2", "evt_3"]
+        assert [event.sequence for event in replayed.events] == [2, 3]
+        retained_ids = ["evt_1", "evt_2", "evt_3"][-max_length:]
+        assert [event.event_id for event in await restarted.event_store.get_events_async(session_id)] == retained_ids
+        assert await redis.llen(f"session:events:{session_id}") == max_length
+    finally:
+        await redis.aclose()
 
 
 class MockWebSocket:

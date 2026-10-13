@@ -57,11 +57,13 @@ def validate_path_safety(root_path: Union[str, Path], target_path: Union[str, Pa
         root_resolved = Path(root_path).resolve()
         target = Path(target_path)
 
+        # Kiểm tra đường dẫn thuần trước, tránh cho ../ hoặc đường dẫn tuyệt đối chạm ra ngoài workspace.
         # 1. Lexical check: rejects '../' escapes and absolute paths without touching the filesystem.
         lexical = Path(os.path.normpath(root_resolved / target))
         if not _inside(lexical, root_resolved):
             raise ValueError("lexical escape")
 
+        # Kiểm tra thêm symlink vì đường dẫn hợp lệ về mặt chữ vẫn có thể trỏ ra ngoài qua liên kết.
         # 2. Symlink check. The parent directory is resolved (directories are never atomically
         #    replaced); the leaf is resolved only if it is a symlink. Resolving a regular file
         #    while another task atomically replaces it is unreliable on Windows.

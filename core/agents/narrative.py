@@ -147,5 +147,6 @@ class NarrativeWriter:
                 logger.warning("Narrative fell back to template: %s", str(e)[:200])
         if narrative is None:
             narrative = self.template(decision, evaluations)
+        # Narrative vẫn là đầu ra của model/template; chỉ giữ trích dẫn khớp transcript thật.
         narrative["citations_removed"] = self.verify_citations(narrative, candidate_texts)
         return narrative

@@ -516,6 +516,21 @@ async def delete_session(
 
 async def purge_session(app: Any, session_id: str) -> None:
     """Retention deletion shared by the DELETE endpoint and the retention sweeper."""
+    redis = app.state.redis_client
+    revocations = getattr(app.state, "revocations", None)
+    if revocations is not None:
+        await revocations.revoke(session_id)
+    else:
+        await redis.set(f"session:{session_id}:revoked", "1", ex=7 * 24 * 3600)
+    # Dựng hàng rào trước khi đợi/cancel: worker đang gọi LLM không được ghi lại dữ liệu.
+    queue = app.state.assessment_queue
+    async with queue.session_mutation(session_id):
+        async with queue.session_mutation(session_id, purpose="synth_lock"):
+            await _purge_session_contents(app, session_id)
+
+
+async def _purge_session_contents(app: Any, session_id: str) -> None:
+    """Purge under the assessment and synthesis leases after revocation is visible."""
     controller = getattr(app.state, "controller", None)
     if controller is not None:
         controller.runners.evict(session_id)
@@ -524,15 +539,12 @@ async def purge_session(app: Any, session_id: str) -> None:
     await app.state.connection_mgr.close_session(session_id, reason="Session deleted")
 
     redis = app.state.redis_client
-    revocations = getattr(app.state, "revocations", None)
-    if revocations is not None:
-        await revocations.revoke(session_id)
+    await app.state.assessment_queue.purge_session(session_id)
     await app.state.state_mgr.adelete(session_id)
     await app.state.connection_mgr.event_store.purge(session_id)
     keys = session_assessment_keys(session_id) + [
         f"session:{session_id}:messages",
         f"session:{session_id}:turn_lock",
-        f"session:{session_id}:synth_lock",
         f"session:{session_id}:blackboard",
         f"session:{session_id}:summary_lock",
     ]

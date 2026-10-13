@@ -174,6 +174,17 @@ class AssessorWorker:
         async with self.llm_semaphore:
             return await self.evaluator.evaluate_turn(**kwargs)
 
+    async def _discard_if_deleted(self, session_id: str, group_name: str, message_id: str) -> bool:
+        """Fence stale deliveries before resolving a workspace or committing any side effect."""
+        deleted = await self.queue.is_revoked(session_id)
+        if not deleted and self.state_manager is not None:
+            deleted = await self.state_manager.aget(session_id) is None
+        if deleted:
+            # Phiên đã xóa chỉ được ACK/XDEL; tuyệt đối không dựng lại file hoặc event.
+            await self.queue.ack_job(group_name, message_id)
+            await self.redis_client.xdel(self.queue.stream_key, message_id)
+        return deleted
+
     async def _process_job_data(
         self,
         group_name: str,
@@ -195,41 +206,44 @@ class AssessorWorker:
         if not input_sha256:
             input_sha256 = hashlib.sha256(f"{question}:{candidate_text}".encode("utf-8")).hexdigest()
 
-        ws = self._get_workspace(session_id)
-        eval_rel_path = f"evaluations/{turn_id}_eval.json"
+        async with self.queue.session_mutation(session_id):
+            if await self._discard_if_deleted(session_id, group_name, message_id):
+                return True
+            ws = self._get_workspace(session_id)
+            eval_rel_path = f"evaluations/{turn_id}_eval.json"
 
-        # 1. Superseded answers are acknowledged without evaluation
-        if self._is_superseded(ws, job_data):
-            # The newer answer shares this job_id, so the enqueued set already counts it once.
-            await self.queue.ack_job(group_name, message_id)
-            logger.info("Skipped superseded assessment job (session %s, %s)", session_ref(session_id), turn_id)
-            return True
+            # 1. Superseded answers are acknowledged without evaluation
+            if self._is_superseded(ws, job_data):
+                # The newer answer shares this job_id, so the enqueued set already counts it once.
+                await self.queue.ack_job(group_name, message_id)
+                logger.info("Skipped superseded assessment job (session %s, %s)", session_ref(session_id), turn_id)
+                return True
 
-        # 2. Idempotency: an existing artifact with the same key is reused
-        if ws.exists(eval_rel_path):
-            try:
-                existing_doc = ws.read_json(eval_rel_path)
-                existing_payload = existing_doc.get("payload", existing_doc)
-                if (
-                    existing_payload.get("job_id") == job_id
-                    and existing_payload.get("input_sha256") == input_sha256
-                    and existing_payload.get("rubric_version") == rubric_version
-                ):
-                    await self.redis_client.sadd(completed_assessments_key(session_id), job_id)
-                    await self.queue.ack_job(group_name, message_id)
-                    logger.info(
-                        "Idempotent assessment hit (session %s, %s); acknowledged without re-evaluation",
-                        session_ref(session_id),
-                        turn_id,
+            # 2. Idempotency: an existing artifact with the same key is reused
+            if ws.exists(eval_rel_path):
+                try:
+                    existing_doc = ws.read_json(eval_rel_path)
+                    existing_payload = existing_doc.get("payload", existing_doc)
+                    if (
+                        existing_payload.get("job_id") == job_id
+                        and existing_payload.get("input_sha256") == input_sha256
+                        and existing_payload.get("rubric_version") == rubric_version
+                    ):
+                        await self.redis_client.sadd(completed_assessments_key(session_id), job_id)
+                        await self.queue.ack_job(group_name, message_id)
+                        logger.info(
+                            "Idempotent assessment hit (session %s, %s); acknowledged without re-evaluation",
+                            session_ref(session_id),
+                            turn_id,
+                        )
+                        if self.on_assessment_completed is not None:
+                            await self.on_assessment_completed(session_id)
+                        return True
+                except Exception as e:
+                    logger.warning(
+                        "Failed checking existing evaluation artifact for idempotency: %s",
+                        sanitize_secrets(str(e)),
                     )
-                    if self.on_assessment_completed is not None:
-                        await self.on_assessment_completed(session_id)
-                    return True
-            except Exception as e:
-                logger.warning(
-                    "Failed checking existing evaluation artifact for idempotency: %s",
-                    sanitize_secrets(str(e)),
-                )
 
         # 3. Evaluate
         try:
@@ -259,73 +273,87 @@ class AssessorWorker:
                 if key not in artifact_payload:
                     artifact_payload[key] = value
 
-            # 4. Atomically write the artifact, then record completion, then ACK
-            await asyncio.to_thread(
-                ws.write_artifact,
-                eval_rel_path,
-                artifact_type="turn_evaluation",
-                payload=artifact_payload,
-                schema_version=str(artifact_payload["schema_version"]),
-            )
-            await self.redis_client.sadd(completed_assessments_key(session_id), job_id)
-            await self.queue.ack_job(group_name, message_id)
+            async with self.queue.session_mutation(session_id):
+                if await self._discard_if_deleted(session_id, group_name, message_id):
+                    return True
+                # 4. Atomically write the artifact, then record completion, then ACK
+                write_task = asyncio.create_task(asyncio.to_thread(
+                    ws.write_artifact, eval_rel_path, artifact_type="turn_evaluation",
+                    payload=artifact_payload, schema_version=str(artifact_payload["schema_version"]),
+                ))
+                try:
+                    await asyncio.shield(write_task)
+                except asyncio.CancelledError:
+                    # Cancel coroutine không dừng thread: giữ lease đến khi ghi file kết thúc.
+                    while not write_task.done():
+                        try:
+                            await asyncio.shield(write_task)
+                        except asyncio.CancelledError:
+                            continue
+                    write_task.result()
+                    raise
+                await self.redis_client.sadd(completed_assessments_key(session_id), job_id)
+                await self.queue.ack_job(group_name, message_id)
 
-            await self._publish(
-                session_id,
-                turn_id,
-                LoopEventType.ASSESSMENT_UPDATE,
-                {
-                    "job_id": job_id,
-                    "turn_id": turn_id,
-                    "stage_id": stage_id,
-                    "content_score": artifact_payload.get("content_score"),
-                    "communication_score": artifact_payload.get("communication_score"),
-                    "status": "COMPLETED",
-                },
-            )
+                await self._publish(
+                    session_id,
+                    turn_id,
+                    LoopEventType.ASSESSMENT_UPDATE,
+                    {
+                        "job_id": job_id,
+                        "turn_id": turn_id,
+                        "stage_id": stage_id,
+                        "content_score": artifact_payload.get("content_score"),
+                        "communication_score": artifact_payload.get("communication_score"),
+                        "status": "COMPLETED",
+                    },
+                )
 
             if self.on_assessment_completed is not None:
                 await self.on_assessment_completed(session_id)
             return True
 
         except Exception as exc:
-            clean_error = sanitize_secrets(str(exc))
-            logger.error(
-                "Evaluation failed (session %s, %s): %s", session_ref(session_id), turn_id, clean_error
-            )
-            retry_count = int(job_data.get("retry_count", 0)) + 1
-            job_data["retry_count"] = retry_count
-
-            if retry_count < self.max_retries:
-                delay = self.retry_base_delay_seconds * (2 ** (retry_count - 1))
-                delay += random.uniform(0, delay / 2)
-                await self.queue.schedule_retry(job_data, delay)
-                await self.queue.ack_job(group_name, message_id)
-            else:
-                await self.queue.send_to_dead_letter(
-                    job_data=job_data,
-                    error_reason=clean_error,
-                    message_id=message_id,
+            async with self.queue.session_mutation(session_id):
+                if await self._discard_if_deleted(session_id, group_name, message_id):
+                    return True
+                clean_error = sanitize_secrets(str(exc))
+                logger.error(
+                    "Evaluation failed (session %s, %s): %s", session_ref(session_id), turn_id, clean_error
                 )
-                await self.queue.ack_job(group_name, message_id)
-                await self.redis_client.sadd(failed_assessments_key(session_id), job_id)
+                retry_count = int(job_data.get("retry_count", 0)) + 1
+                job_data["retry_count"] = retry_count
 
-                if self.state_manager is not None:
-                    try:
-                        state = await self.state_manager.aget(session_id)
-                        if state and state.status == LifecycleStatus.ASSESSING:
-                            await self.state_manager.atransition(
-                                state,
-                                expected_version=state.state_version,
-                                new_status=LifecycleStatus.ASSESSMENT_FAILED,
-                                metadata={
-                                    "failure_code": "ASSESSMENT_EXHAUSTED",
-                                    "failed_job_id": job_id,
-                                },
+                if retry_count < self.max_retries:
+                    delay = self.retry_base_delay_seconds * (2 ** (retry_count - 1))
+                    delay += random.uniform(0, delay / 2)
+                    await self.queue.schedule_retry(job_data, delay)
+                    await self.queue.ack_job(group_name, message_id)
+                else:
+                    await self.queue.send_to_dead_letter(
+                        job_data=job_data,
+                        error_reason=clean_error,
+                        message_id=message_id,
+                    )
+                    await self.queue.ack_job(group_name, message_id)
+                    await self.redis_client.sadd(failed_assessments_key(session_id), job_id)
+
+                    if self.state_manager is not None:
+                        try:
+                            state = await self.state_manager.aget(session_id)
+                            if state and state.status == LifecycleStatus.ASSESSING:
+                                await self.state_manager.atransition(
+                                    state,
+                                    expected_version=state.state_version,
+                                    new_status=LifecycleStatus.ASSESSMENT_FAILED,
+                                    metadata={
+                                        "failure_code": "ASSESSMENT_EXHAUSTED",
+                                        "failed_job_id": job_id,
+                                    },
+                                )
+                        except Exception as trans_err:
+                            logger.warning(
+                                "Failed state transition to ASSESSMENT_FAILED: %s",
+                                sanitize_secrets(str(trans_err)),
                             )
-                    except Exception as trans_err:
-                        logger.warning(
-                            "Failed state transition to ASSESSMENT_FAILED: %s",
-                            sanitize_secrets(str(trans_err)),
-                        )
-            return False
+                return False

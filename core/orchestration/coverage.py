@@ -110,6 +110,10 @@ class CoverageTracker:
                         coverage[cid].insufficient_turns.append(turn_id)
                         continue
                     quotes = [e.get("quote", "") for e in item.get("evidence", []) if e.get("verified")]
+                    # Schema v2 được tổng hợp từ bằng chứng đã xác minh; điểm thiếu trích dẫn không được cộng dồn.
+                    if not quotes:
+                        coverage[cid].insufficient_turns.append(turn_id)
+                        continue
                     coverage[cid].evidence.append(
                         EvidenceItem(
                             turn_id=turn_id,

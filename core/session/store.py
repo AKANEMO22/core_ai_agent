@@ -96,6 +96,7 @@ class RedisSessionStateStore:
         key = self._key(state.session_id)
         async with self.redis.pipeline(transaction=True) as pipe:
             try:
+                # WATCH/MULTI giữ phép đọc-version và ghi state trong cùng một CAS trên Redis.
                 await pipe.watch(key)
                 raw = await pipe.get(key)
                 if raw is None:

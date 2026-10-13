@@ -166,6 +166,7 @@ class ReportSynthesizer:
         Raises:
             AssessmentBarrierError: If barrier conditions are not satisfied.
         """
+        # Chờ đủ kết quả assessment trước khi tạo verdict để báo cáo không phản ánh trạng thái xử lý dở dang.
         is_ready, completed, failed, expected = await self.check_barrier(session_id, expected_assessments)
         if not is_ready:
             if failed > 0:

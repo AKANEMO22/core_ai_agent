@@ -25,7 +25,13 @@ RUBRIC = {
 
 
 def _criterion(cid: str, level: int, confidence: float, primary: Optional[bool] = None) -> Dict[str, Any]:
-    item = {"competency_id": cid, "status": "scored", "level": level, "confidence": confidence, "evidence": []}
+    item = {
+        "competency_id": cid,
+        "status": "scored",
+        "level": level,
+        "confidence": confidence,
+        "evidence": [{"quote": f"verified evidence for {cid}", "verified": True}],
+    }
     if primary is not None:
         item["primary"] = primary
     return item

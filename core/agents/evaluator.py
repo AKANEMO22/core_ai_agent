@@ -204,9 +204,20 @@ class CriterionEvaluator:
                     evidence.append({"quote": quote, "turn_id": turn_id, "verified": True})
                 else:
                     unverified_total += 1
-            confidence = float(item.get("confidence", 0.0))
+            # Không giữ mức điểm nếu mọi trích dẫn đều bị loại; confidence thấp vẫn có thể cộng dồn qua nhiều lượt.
             if not evidence:
-                confidence *= 0.5
+                criteria.append(
+                    {
+                        "competency_id": cid,
+                        "status": "insufficient_evidence",
+                        "level": None,
+                        "confidence": 0.0,
+                        "rationale": item.get("rationale", "no verifiable evidence quote"),
+                        "evidence": [],
+                    }
+                )
+                continue
+            confidence = float(item.get("confidence", 0.0))
             criteria.append(
                 {
                     "competency_id": cid,

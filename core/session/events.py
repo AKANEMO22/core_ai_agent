@@ -156,6 +156,10 @@ class SessionEventStore:
         if event.session_id != session_id:
             event.session_id = session_id
 
+        if self._redis is not None and session_id not in self._events:
+            # Nạp lịch sử Redis trước append để cache sau restart không chỉ chứa sự kiện mới.
+            await self.load_from_redis_async(session_id)
+
         if self._redis is None:
             current_seq = self._sequences[session_id]
             if event.sequence <= 0:
@@ -246,6 +250,7 @@ class SessionEventStore:
 
     async def get_events_async(self, session_id: str) -> List[LoopEvent]:
         """Return events for a session, reloading from Redis when the cache is cold."""
+        # Cache đã được nạp từ Redis trước append; replay lạnh mới cần tải lại lịch sử.
         if session_id not in self._events and self._redis is not None:
             return await self.load_from_redis_async(session_id)
         return self.get_events(session_id)

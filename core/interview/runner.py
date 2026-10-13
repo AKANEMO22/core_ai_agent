@@ -440,6 +440,7 @@ class InteractiveSubagentRunner:
             "vad_metrics": dict(vad_metrics or {}),
             "timestamp": time.time(),
         }
+        # Ghi transcript độc lập với lượt gọi model để câu trả lời vẫn được giữ nếu generation lỗi hoặc bị ngắt.
         persist_task = asyncio.create_task(
             asyncio.to_thread(
                 self.workspace.write_artifact,

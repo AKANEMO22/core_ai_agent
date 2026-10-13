@@ -142,6 +142,7 @@ class StageDirector:
 
         extra = stage_cfg.get("max_extra_turns", self.max_extra_turns)
         hard_limit = int(target_turns) + max(0, int(extra))
+        # Có thể gia hạn stage khi interviewer hỏi tiếp, nhưng hard_limit vẫn chặn vòng hỏi kéo dài vô hạn.
         budget_reached = current_stage_turns >= hard_limit or (
             current_stage_turns >= target_turns and not extend_stage
         )

@@ -1,6 +1,8 @@
 """Integration tests for Phase 0 hardening: recovery, cancellation, backpressure, deletion, config."""
 
 import asyncio
+import threading
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -267,6 +269,157 @@ async def test_delete_purges_redis_and_revokes_tokens(tmp_path: Path) -> None:
 
     refused = await controller.submit_answer(session_id, "m2", ANSWERS[1])
     assert refused.status == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_delete_removes_assessment_payloads_and_pending_entries(tmp_path: Path) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    settings = _settings()
+    app = create_app(workspace_base=str(tmp_path / "ws"), redis_client=redis, llm_client=_llm(), settings=settings)
+    session_id, _ = await _create(app, settings)
+    queue = app.state.assessment_queue
+    await queue.setup_consumer_group("g", "0")
+    job = {"session_id": session_id, "turn_id": "turn_001", "candidate_text": "private answer"}
+    other = {**job, "session_id": "other-session"}
+    await queue.enqueue(job)
+    await queue.read_jobs("g", "c")
+    await queue.enqueue(other)
+    await queue.schedule_retry(job, 3600)
+    await queue.schedule_retry(other, 3600)
+    await queue.send_to_dead_letter(job, "error")
+    await queue.send_to_dead_letter(other, "error")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.delete(f"/api/v1/sessions/{session_id}", headers=_headers(settings))
+    assert response.status_code == 200
+    for stream in (queue.stream_key, queue.dead_letter_stream_key):
+        entries = await redis.xrange(stream)
+        assert len(entries) == 1
+        assert entries[0][1]["session_id"] == "other-session"
+    assert (await redis.xpending(queue.stream_key, "g"))["pending"] == 0
+    delayed = await redis.zrange(queue.delayed_key, 0, -1)
+    assert len(delayed) == 1 and session_id not in delayed[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evaluation_fails", [False, True])
+async def test_delete_fences_inflight_assessment(tmp_path: Path, evaluation_fails: bool) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    settings = _settings()
+    app = create_app(workspace_base=str(tmp_path / "ws"), redis_client=redis, llm_client=_llm(), settings=settings)
+    session_id, _ = await _create(app, settings)
+    workspace_path = app.state.workspace_mgr.get_or_create_workspace(session_id).root_path
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PausedEvaluator:
+        async def evaluate_turn(self, **kwargs):
+            entered.set()
+            await release.wait()
+            if evaluation_fails:
+                raise RuntimeError("provider failed after deletion")
+            return {"content_score": 7}
+
+    queue = app.state.assessment_queue
+    await queue.setup_consumer_group("g", "0")
+    await queue.enqueue({"session_id": session_id, "turn_id": "turn_001", "candidate_text": "private answer"})
+    app.state.assessor_worker.evaluator = PausedEvaluator()
+    task = asyncio.create_task(app.state.assessor_worker.process_next_job("g", "c"))
+    await asyncio.wait_for(entered.wait(), 2)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            response = await client.delete(f"/api/v1/sessions/{session_id}", headers=_headers(settings))
+        assert response.status_code == 200
+    finally:
+        release.set()
+        await task
+    assert not workspace_path.exists()
+    assert [key async for key in redis.scan_iter(match=f"*{session_id}*")] == [f"session:{session_id}:revoked"]
+    assert await redis.xlen(queue.stream_key) == 0
+    assert await redis.zcard(queue.delayed_key) == 0
+    assert await redis.xlen(queue.dead_letter_stream_key) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_worker", [False, True])
+async def test_delete_waits_for_assessment_artifact_commit(tmp_path: Path, monkeypatch, cancel_worker: bool) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    settings = _settings()
+    app = create_app(workspace_base=str(tmp_path / "ws"), redis_client=redis, llm_client=_llm(), settings=settings)
+    session_id, _ = await _create(app, settings)
+    workspace = app.state.workspace_mgr.get_or_create_workspace(session_id)
+    entered, release = threading.Event(), threading.Event()
+    original_write = workspace.write_artifact
+
+    def paused_write(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(workspace, "write_artifact", paused_write)
+    queue = app.state.assessment_queue
+    await queue.setup_consumer_group("g", "0")
+    await queue.enqueue({"session_id": session_id, "turn_id": "turn_001", "candidate_text": "private answer"})
+    worker_task = asyncio.create_task(app.state.assessor_worker.process_next_job("g", "c"))
+    assert await asyncio.to_thread(entered.wait, 2)
+    if cancel_worker:
+        worker_task.cancel()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        delete_task = asyncio.create_task(client.delete(f"/api/v1/sessions/{session_id}", headers=_headers(settings)))
+        try:
+            for _ in range(100):
+                if await redis.exists(f"session:{session_id}:revoked"):
+                    break
+                await asyncio.sleep(0.01)
+            assert await redis.exists(f"session:{session_id}:revoked")
+            await asyncio.sleep(0.05)
+            assert not delete_task.done()
+        finally:
+            release.set()
+            with suppress(asyncio.CancelledError):
+                await worker_task
+            response = await delete_task
+    assert response.status_code == 200
+    assert not workspace.root_path.exists()
+    assert [key async for key in redis.scan_iter(match=f"*{session_id}*")] == [f"session:{session_id}:revoked"]
+
+
+@pytest.mark.asyncio
+async def test_assessment_callback_after_delete_does_not_recreate_report(tmp_path: Path) -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    settings = _settings()
+    app = create_app(workspace_base=str(tmp_path / "ws"), redis_client=redis, llm_client=_llm(), settings=settings)
+    session_id, _ = await _create(app, settings)
+    controller = app.state.controller
+    await controller.start_interview(session_id)
+    for index, answer in enumerate(ANSWERS, 1):
+        await controller.submit_answer(session_id, f"m{index}", answer)
+    await controller.drain()
+    assert (await app.state.state_mgr.aget(session_id)).status == LifecycleStatus.ASSESSING
+    workspace_path = app.state.workspace_mgr.get_or_create_workspace(session_id).root_path
+    queue, worker = app.state.assessment_queue, app.state.assessor_worker
+    await queue.setup_consumer_group("g", "0")
+    await worker.process_next_job("g", "c")
+    await worker.process_next_job("g", "c")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_callback = worker.on_assessment_completed
+
+    async def delayed_callback(session_id):
+        entered.set()
+        await release.wait()
+        await original_callback(session_id)
+
+    worker.on_assessment_completed = delayed_callback
+    task = asyncio.create_task(worker.process_next_job("g", "c"))
+    await asyncio.wait_for(entered.wait(), 2)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+            response = await client.delete(f"/api/v1/sessions/{session_id}", headers=_headers(settings))
+        assert response.status_code == 200
+    finally:
+        release.set()
+        await task
+    assert not workspace_path.exists()
+    assert [key async for key in redis.scan_iter(match=f"*{session_id}*")] == [f"session:{session_id}:revoked"]
 
 
 @pytest.mark.asyncio

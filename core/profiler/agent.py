@@ -338,6 +338,7 @@ class ProfilerAgent:
             )
             wrapped_candidate = wrap_untrusted_candidate_data(combined_candidate)
 
+            # Recon và framework retrieval chạy song song; đầu vào ứng viên được đánh dấu untrusted trước khi vào prompt.
             # Execute safe reconnaissance and knowledge retrieval concurrently
             recon_coro = self._gather_recon(target_company, target_role, workspace=workspace)
             knowledge: Optional[Dict[str, Any]] = None

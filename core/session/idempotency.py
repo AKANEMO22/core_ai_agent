@@ -430,8 +430,9 @@ class MessageLedger:
     """Per-session mapping of client `message_id` to the turn it produced.
 
     Key `session:{id}:messages` is a Redis hash `message_id -> JSON LedgerEntry` with a TTL.
-    Guarantees that a repeated `message_id` never invokes the LLM twice: completed messages
-    are answered by replaying the recorded turn events.
+    Completed messages are answered by replaying the recorded turn events. An in-progress
+    entry outlives its execution lease and must be reconciled under a new session lease
+    after a process crash; its original turn and payload remain authoritative.
     """
 
     def __init__(self, redis_client: Any, ttl_seconds: int = 86400) -> None:
