@@ -1,0 +1,434 @@
+"""Transport-independent interview session controller.
+
+Serializes turns per session, enforces idempotency, backpressure and cancellation, publishes
+every turn event, and schedules post-turn work. The WebSocket gateway and the REST API are
+thin adapters over this class.
+"""
+
+import asyncio
+import contextlib
+import logging
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+from core.interview.director import StageSessionConflictError
+from core.interview.runner import InteractiveSubagentRunner, turn_id_for
+from core.runtime.agent import sanitize_secrets
+from core.runtime.types import LoopEvent, LoopEventType
+from core.session.cancellation import CancellationRegistry
+from core.session.idempotency import (
+    IdempotencyConflictError,
+    MessageLedger,
+    RedisLease,
+    TokenBucket,
+    compute_payload_hash,
+)
+from core.session.state import LifecycleStatus, SessionStateStore
+
+logger = logging.getLogger(__name__)
+
+RunnerFactory = Callable[[str], Awaitable[Optional[InteractiveSubagentRunner]]]
+AfterTurnHook = Callable[[str, int], Awaitable[Any]]
+SessionHook = Callable[[str], Awaitable[Any]]
+
+
+@dataclass
+class TurnRequestResult:
+    """Outcome of a start or answer request.
+
+    status values:
+        completed  - turn finished normally
+        interrupted- turn finished with a cancelled/deadline-cut interviewer response
+        failed     - generation failed; the same message_id may be retried
+        replayed   - duplicate request; `replay_events` holds the recorded events
+        rejected   - request refused (see error_code)
+        busy       - capacity or rate limit; retry after `retry_after_ms`
+    """
+
+    status: str
+    turn_id: Optional[str] = None
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    retry_after_ms: Optional[int] = None
+    replay_events: List[LoopEvent] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """True for statuses that represent a delivered turn."""
+        return self.status in ("completed", "interrupted", "replayed")
+
+    def to_event(self, session_id: str) -> Optional[LoopEvent]:
+        """Ephemeral (unrecorded) event telling the requester why the request was not executed."""
+        if self.status not in ("rejected", "busy", "failed"):
+            return None
+        event_type = LoopEventType.BUSY if self.status == "busy" else LoopEventType.ERROR
+        payload: Dict[str, Any] = {"code": self.error_code, "message": self.message}
+        if self.retry_after_ms is not None:
+            payload["retry_after_ms"] = self.retry_after_ms
+        if self.status == "failed":
+            payload["retryable"] = True
+        return LoopEvent(
+            schema_version="1.0",
+            event_id=f"evt_{uuid.uuid4().hex[:16]}",
+            session_id=session_id,
+            turn_id=self.turn_id or "control",
+            sequence=0,
+            timestamp=time.time(),
+            type=event_type,
+            payload=payload,
+        )
+
+
+class RunnerRegistry:
+    """Bounded LRU cache of per-session runners built by a factory."""
+
+    def __init__(self, factory: RunnerFactory, max_size: int = 500) -> None:
+        self.factory = factory
+        self.max_size = max_size
+        self._runners: "OrderedDict[str, InteractiveSubagentRunner]" = OrderedDict()
+
+    async def get(self, session_id: str) -> Optional[InteractiveSubagentRunner]:
+        runner = self._runners.get(session_id)
+        if runner is not None:
+            self._runners.move_to_end(session_id)
+            return runner
+        runner = await self.factory(session_id)
+        if runner is None:
+            return None
+        self._runners[session_id] = runner
+        while len(self._runners) > self.max_size:
+            self._runners.popitem(last=False)
+        return runner
+
+    def evict(self, session_id: str) -> None:
+        self._runners.pop(session_id, None)
+
+    def __contains__(self, session_id: str) -> bool:
+        return session_id in self._runners
+
+
+class InterviewSessionController:
+    """Coordinates opening and candidate turns for all sessions of this process."""
+
+    def __init__(
+        self,
+        state_store: SessionStateStore,
+        publisher: Any,
+        runners: RunnerRegistry,
+        ledger: MessageLedger,
+        lease: RedisLease,
+        cancellations: CancellationRegistry,
+        generation_slots: asyncio.Semaphore,
+        answer_limiter: Optional[TokenBucket] = None,
+        queue_timeout_ms: int = 1500,
+        busy_retry_after_ms: int = 1000,
+        turn_lock_ttl_ms: int = 60000,
+        metrics: Optional[Any] = None,
+        hot_path_gate: Optional[Any] = None,
+    ) -> None:
+        self.state_store = state_store
+        self.publisher = publisher
+        self.runners = runners
+        self.ledger = ledger
+        self.lease = lease
+        self.cancellations = cancellations
+        self.generation_slots = generation_slots
+        self.answer_limiter = answer_limiter
+        self.queue_timeout_ms = queue_timeout_ms
+        self.busy_retry_after_ms = busy_retry_after_ms
+        self.turn_lock_ttl_ms = turn_lock_ttl_ms
+        self.metrics = metrics
+        self.hot_path_gate = hot_path_gate
+        self.after_turn_hooks: List[AfterTurnHook] = []
+        self.dialogue_completed_hooks: List[SessionHook] = []
+        self._background: set = set()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lock_key(session_id: str) -> str:
+        return f"session:{session_id}:turn_lock"
+
+    def _spawn(self, session_id: str, coro: Awaitable[Any], name: str) -> asyncio.Task:
+        task = asyncio.create_task(coro, name=name)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        self.cancellations.register_task(session_id, task)
+
+        def _log_failure(t: asyncio.Task) -> None:
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("Background task %s failed: %s", name, sanitize_secrets(str(t.exception())))
+
+        task.add_done_callback(_log_failure)
+        return task
+
+    async def drain(self, timeout: float = 10.0) -> None:
+        """Wait for scheduled background work (used by tests and graceful shutdown)."""
+        if self._background:
+            await asyncio.wait(list(self._background), timeout=timeout)
+
+    async def _acquire_slot(self) -> bool:
+        try:
+            await asyncio.wait_for(self.generation_slots.acquire(), timeout=self.queue_timeout_ms / 1000)
+            return True
+        except asyncio.TimeoutError:
+            if self.metrics is not None:
+                self.metrics.inc("busy_total")
+            return False
+
+    def _busy(self, code: str, turn_id: Optional[str] = None) -> TurnRequestResult:
+        return TurnRequestResult(
+            status="busy",
+            turn_id=turn_id,
+            error_code=code,
+            message="Interviewer is at capacity; retry shortly.",
+            retry_after_ms=self.busy_retry_after_ms,
+        )
+
+    async def _stream(
+        self,
+        session_id: str,
+        events: Any,
+        accepted_at: float,
+    ) -> Dict[str, Any]:
+        """Publish a runner event stream and summarize it."""
+        summary: Dict[str, Any] = {"status": "failed", "dialogue_completed": False, "turn_number": None}
+        first_token_seen = False
+        gate = self.hot_path_gate.hot() if self.hot_path_gate is not None else contextlib.nullcontext()
+        async with gate:
+            await self._consume(session_id, events, accepted_at, summary)
+        if self.metrics is not None:
+            self.metrics.observe("turn_duration_seconds", time.perf_counter() - accepted_at)
+        return summary
+
+    async def _consume(self, session_id: str, events: Any, accepted_at: float, summary: Dict[str, Any]) -> None:
+        first_token_seen = False
+        async for event in events:
+            await self.publisher.publish(session_id, event)
+            if event.type == LoopEventType.RESPONSE_TOKEN and not first_token_seen:
+                first_token_seen = True
+                if self.metrics is not None:
+                    self.metrics.observe("ttft_seconds", time.perf_counter() - accepted_at)
+            elif event.type == LoopEventType.STAGE_TRANSITION and event.payload.get("is_curriculum_complete"):
+                summary["dialogue_completed"] = True
+            elif event.type == LoopEventType.TURN_COMPLETE:
+                summary["status"] = "interrupted" if event.payload.get("interrupted") else "completed"
+                summary["turn_number"] = event.payload.get("turn_number")
+
+    async def _replay(self, session_id: str, turn_id: str) -> TurnRequestResult:
+        events = await self.publisher.event_store.get_turn_events(session_id, turn_id)
+        return TurnRequestResult(status="replayed", turn_id=turn_id, replay_events=events)
+
+    # ------------------------------------------------------------------
+    # Opening
+    # ------------------------------------------------------------------
+
+    async def start_interview(self, session_id: str) -> TurnRequestResult:
+        """Start the interview: READY → STAGE_ACTIVE and stream the opening question (turn 0).
+
+        Idempotent: once the opening exists, repeated calls replay its events.
+        """
+        turn_id = turn_id_for(0)
+        if self.cancellations.is_session_cancelled(session_id):
+            return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="SESSION_CANCELLED")
+
+        lock_token = await self.lease.acquire(self._lock_key(session_id), self.turn_lock_ttl_ms)
+        if lock_token is None:
+            return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="TURN_IN_PROGRESS")
+        try:
+            state = await self.state_store.aget(session_id)
+            if state is None:
+                return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="SESSION_NOT_FOUND")
+
+            runner = await self.runners.get(session_id)
+            if runner is None:
+                return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="RUNNER_UNAVAILABLE")
+
+            if state.status == LifecycleStatus.STAGE_ACTIVE and (
+                state.current_turn > 0 or runner.workspace.exists("turns/turn_0_interviewer.json")
+            ):
+                return await self._replay(session_id, turn_id)
+            if state.status == LifecycleStatus.READY:
+                stages = runner.stage_director.stages
+                first_stage = stages[0]["stage_id"] if stages else "warmup"
+                state = await self.state_store.atransition(
+                    state,
+                    expected_version=state.state_version,
+                    new_status=LifecycleStatus.STAGE_ACTIVE,
+                    current_stage_id=first_stage,
+                )
+            elif state.status != LifecycleStatus.STAGE_ACTIVE:
+                code = "PROFILING_IN_PROGRESS" if state.status in (
+                    LifecycleStatus.INITIALIZED,
+                    LifecycleStatus.PROFILING,
+                ) else "INVALID_STATE"
+                return TurnRequestResult(
+                    status="rejected",
+                    turn_id=turn_id,
+                    error_code=code,
+                    message=f"Session status is {state.status.value}",
+                )
+
+            accepted_at = time.perf_counter()  # TTFT includes queue wait
+            if not await self._acquire_slot():
+                return self._busy("GENERATION_BUSY", turn_id)
+            token = self.cancellations.token_for(session_id)
+            try:
+                summary = await self._stream(
+                    session_id, runner.run_opening(session_id, cancellation_token=token), accepted_at
+                )
+            finally:
+                self.generation_slots.release()
+                self.cancellations.finish_generation(session_id, token)
+            if summary["status"] == "failed":
+                return TurnRequestResult(status="failed", turn_id=turn_id, error_code="TURN_FAILED")
+            return TurnRequestResult(status=summary["status"], turn_id=turn_id)
+        except StageSessionConflictError as e:
+            return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="INVALID_STATE", message=str(e))
+        finally:
+            await self.lease.release(self._lock_key(session_id), lock_token)
+
+    # ------------------------------------------------------------------
+    # Candidate answers
+    # ------------------------------------------------------------------
+
+    async def submit_answer(
+        self,
+        session_id: str,
+        message_id: Optional[str],
+        answer_text: str,
+        vad_metrics: Optional[Dict[str, Any]] = None,
+        expected_turn: Optional[int] = None,
+    ) -> TurnRequestResult:
+        """Execute one candidate turn with exactly-once semantics per `message_id`."""
+        if not message_id:
+            return TurnRequestResult(
+                status="rejected", error_code="MISSING_MESSAGE_ID", message="message_id is required"
+            )
+        if not answer_text or not answer_text.strip():
+            return TurnRequestResult(status="rejected", error_code="EMPTY_ANSWER")
+        if self.cancellations.is_session_cancelled(session_id):
+            return TurnRequestResult(status="rejected", error_code="SESSION_CANCELLED")
+
+        payload_hash = compute_payload_hash({"answer": answer_text})
+        try:
+            existing = await self.ledger.get(session_id, message_id)
+            if existing is not None:
+                if existing.payload_hash and existing.payload_hash != payload_hash:
+                    return TurnRequestResult(status="rejected", error_code="MESSAGE_ID_CONFLICT")
+                if existing.status == "completed":
+                    return await self._replay(session_id, existing.turn_id)
+                return TurnRequestResult(
+                    status="rejected", turn_id=existing.turn_id, error_code="TURN_IN_PROGRESS"
+                )
+        except IdempotencyConflictError:
+            return TurnRequestResult(status="rejected", error_code="MESSAGE_ID_CONFLICT")
+
+        if self.answer_limiter is not None and not self.answer_limiter.acquire(session_id):
+            return self._busy("RATE_LIMITED")
+
+        lock_token = await self.lease.acquire(self._lock_key(session_id), self.turn_lock_ttl_ms)
+        if lock_token is None:
+            return TurnRequestResult(status="rejected", error_code="TURN_IN_PROGRESS")
+
+        registered = False
+        turn_id: Optional[str] = None
+        try:
+            state = await self.state_store.aget(session_id)
+            if state is None:
+                return TurnRequestResult(status="rejected", error_code="SESSION_NOT_FOUND")
+            if state.status == LifecycleStatus.READY:
+                return TurnRequestResult(
+                    status="rejected",
+                    error_code="INTERVIEW_NOT_STARTED",
+                    message="Send start_interview before answering",
+                )
+            if state.status != LifecycleStatus.STAGE_ACTIVE:
+                return TurnRequestResult(
+                    status="rejected",
+                    error_code="INVALID_STATE",
+                    message=f"Session status is {state.status.value}",
+                )
+
+            turn_number = state.current_turn + 1
+            turn_id = turn_id_for(turn_number)
+            if expected_turn is not None and expected_turn != turn_number:
+                return TurnRequestResult(
+                    status="rejected",
+                    turn_id=turn_id,
+                    error_code="OUT_OF_ORDER_TURN",
+                    message=f"Expected turn {turn_number}, received {expected_turn}",
+                )
+
+            try:
+                prior = await self.ledger.begin(session_id, message_id, turn_id, payload_hash)
+            except IdempotencyConflictError:
+                return TurnRequestResult(status="rejected", error_code="MESSAGE_ID_CONFLICT")
+            if prior is not None:
+                if prior.status == "completed":
+                    return await self._replay(session_id, prior.turn_id)
+                return TurnRequestResult(status="rejected", turn_id=prior.turn_id, error_code="TURN_IN_PROGRESS")
+            registered = True
+
+            runner = await self.runners.get(session_id)
+            if runner is None:
+                return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="RUNNER_UNAVAILABLE")
+
+            accepted_at = time.perf_counter()  # TTFT includes queue wait
+            if not await self._acquire_slot():
+                return self._busy("GENERATION_BUSY", turn_id)
+
+            token = self.cancellations.token_for(session_id)
+            try:
+                summary = await self._stream(
+                    session_id,
+                    runner.run_turn(
+                        session_id=session_id,
+                        candidate_answer=answer_text,
+                        vad_metrics=vad_metrics,
+                        expected_turn=turn_number,
+                        cancellation_token=token,
+                        message_id=message_id,
+                    ),
+                    accepted_at,
+                )
+            finally:
+                self.generation_slots.release()
+                self.cancellations.finish_generation(session_id, token)
+
+            if summary["status"] == "failed":
+                return TurnRequestResult(status="failed", turn_id=turn_id, error_code="TURN_FAILED")
+
+            await self.ledger.complete(session_id, message_id)
+            registered = False
+            for hook in self.after_turn_hooks:
+                self._spawn(session_id, hook(session_id, turn_number), f"after_turn:{turn_id}")
+            if summary["dialogue_completed"]:
+                self.runners.evict(session_id)
+                for session_hook in self.dialogue_completed_hooks:
+                    self._spawn(session_id, session_hook(session_id), "dialogue_completed")
+            return TurnRequestResult(status=summary["status"], turn_id=turn_id)
+        except StageSessionConflictError as e:
+            return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="INVALID_STATE", message=str(e))
+        finally:
+            if registered:
+                await self.ledger.discard(session_id, message_id)
+            await self.lease.release(self._lock_key(session_id), lock_token)
+
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+
+    def cancel_generation(self, session_id: str) -> bool:
+        """Barge-in: stop the in-flight interviewer generation. Returns True if one was running."""
+        return self.cancellations.cancel_generation(session_id, reason="barge_in")
+
+    def cancel_session(self, session_id: str) -> int:
+        """Stop the generation and all background work of a session."""
+        self.runners.evict(session_id)
+        return self.cancellations.cancel_session(session_id)

@@ -11,6 +11,36 @@ from core.interview.queue import AssessmentJob
 logger = logging.getLogger(__name__)
 
 
+def enqueued_assessments_key(session_id: str) -> str:
+    """Set of job_ids enqueued for a session."""
+    return f"session:{session_id}:enqueued_assessments"
+
+
+def completed_assessments_key(session_id: str) -> str:
+    """Set of job_ids whose evaluation artifact is durably persisted."""
+    return f"session:{session_id}:completed_assessments"
+
+
+def failed_assessments_key(session_id: str) -> str:
+    """Set of job_ids that exhausted their retry budget."""
+    return f"session:{session_id}:failed_assessments"
+
+
+def expected_assessments_key(session_id: str) -> str:
+    """Expected assessment count frozen when the dialogue completes."""
+    return f"session:{session_id}:expected_assessments"
+
+
+def session_assessment_keys(session_id: str) -> List[str]:
+    """Every Redis key holding assessment bookkeeping for a session (used by deletion)."""
+    return [
+        enqueued_assessments_key(session_id),
+        completed_assessments_key(session_id),
+        failed_assessments_key(session_id),
+        expected_assessments_key(session_id),
+    ]
+
+
 class RedisAssessmentQueue:
     """Production-grade Redis Streams assessment queue with consumer groups, ACK, and DLQ.
 
@@ -25,6 +55,7 @@ class RedisAssessmentQueue:
         redis_client: Any,
         stream_key: str = "interview:tasks:assessment",
         dead_letter_stream_key: str = "interview:tasks:assessment:dead_letter",
+        counter_ttl_seconds: int = 7 * 24 * 3600,
     ) -> None:
         """Initialize Redis assessment queue with designated stream keys.
 
@@ -32,10 +63,12 @@ class RedisAssessmentQueue:
             redis_client: Async-compatible Redis client.
             stream_key: Primary Redis stream key for assessment jobs.
             dead_letter_stream_key: Target stream key for dead letter payloads.
+            counter_ttl_seconds: TTL of per-session assessment bookkeeping sets.
         """
         self.redis_client = redis_client
         self.stream_key = stream_key
         self.dead_letter_stream_key = dead_letter_stream_key
+        self.counter_ttl_seconds = counter_ttl_seconds
 
     async def setup_consumer_group(
         self, group_name: str = "assessor_workers", start_id: str = "$"
@@ -101,7 +134,13 @@ class RedisAssessmentQueue:
             "job_id": job_dict["job_id"],
             "session_id": session_id,
         }
-        await self.redis_client.xadd(self.stream_key, fields)
+        # Register the job in the session's enqueued set in the same transaction as XADD,
+        # so the expected-assessment count frozen at dialogue completion is exact.
+        async with self.redis_client.pipeline(transaction=True) as pipe:
+            pipe.xadd(self.stream_key, fields)
+            pipe.sadd(enqueued_assessments_key(session_id), job_dict["job_id"])
+            pipe.expire(enqueued_assessments_key(session_id), self.counter_ttl_seconds)
+            await pipe.execute()
         return job_dict["job_id"]
 
     def _parse_message_fields(self, fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -228,6 +267,52 @@ class RedisAssessmentQueue:
         }
         res = await self.redis_client.xadd(self.dead_letter_stream_key, dlq_entry)
         return str(res)
+
+    @property
+    def delayed_key(self) -> str:
+        """Sorted set of jobs waiting for their retry backoff to elapse."""
+        return f"{self.stream_key}:delayed"
+
+    async def schedule_retry(self, job_data: Dict[str, Any], delay_seconds: float) -> None:
+        """Park a job until `delay_seconds` from now; `promote_due_retries` re-enqueues it."""
+        await self.redis_client.zadd(
+            self.delayed_key, {json.dumps(job_data): time.time() + max(0.0, delay_seconds)}
+        )
+
+    async def promote_due_retries(self, limit: int = 100) -> int:
+        """Move retry jobs whose backoff elapsed back onto the stream. Safe to run concurrently."""
+        due = await self.redis_client.zrangebyscore(
+            self.delayed_key, "-inf", time.time(), start=0, num=limit
+        )
+        promoted = 0
+        for raw in due:
+            # ZREM acts as the claim: only the caller that removes the member re-enqueues it.
+            if await self.redis_client.zrem(self.delayed_key, raw):
+                await self.enqueue(json.loads(raw))
+                promoted += 1
+        return promoted
+
+    async def requeue_dead_letters(self, session_id: str) -> List[str]:
+        """Re-enqueue a session's dead-lettered jobs with a fresh retry budget.
+
+        Idempotent: requeued entries are removed from the dead-letter stream and the failed
+        set, so a repeated call finds nothing to requeue.
+
+        Returns:
+            List[str]: job_ids that were requeued.
+        """
+        requeued: List[str] = []
+        entries = await self.redis_client.xrange(self.dead_letter_stream_key, "-", "+")
+        for entry_id, fields in entries:
+            if fields.get("session_id") != session_id:
+                continue
+            job_data = self._parse_message_fields(fields)
+            job_data["retry_count"] = 0
+            await self.enqueue(job_data)
+            await self.redis_client.xdel(self.dead_letter_stream_key, entry_id)
+            await self.redis_client.srem(failed_assessments_key(session_id), job_data.get("job_id", ""))
+            requeued.append(job_data.get("job_id", ""))
+        return requeued
 
     async def get_queue_size(self) -> int:
         """Return count of items in the primary assessment stream."""

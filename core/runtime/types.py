@@ -24,6 +24,15 @@ class LoopEventType(str, Enum):
     REPORT_READY = "report_ready"
     SESSION_FAILED = "session_failed"
     SESSION_CANCELLED = "session_cancelled"
+    INTERVIEW_STARTED = "interview_started"
+    BUSY = "busy"
+    RESYNC_REQUIRED = "resync_required"
+    GENERATION_CANCELLED = "generation_cancelled"
+    DIRECTIVE_READY = "directive_ready"
+    DELEGATION_STARTED = "delegation_started"
+    DELEGATION_COMPLETED = "delegation_completed"
+    COMPACTION = "compaction"
+    DECISION_READY = "decision_ready"
 
 
 class LoopStatus(str, Enum):

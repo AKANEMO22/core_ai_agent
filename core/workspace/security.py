@@ -1,6 +1,7 @@
 """Security protections for isolated workspaces, path resolution, and file uploads."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional, Set, Union
 
@@ -47,20 +48,32 @@ def validate_path_safety(root_path: Union[str, Path], target_path: Union[str, Pa
     Raises:
         WorkspacePathError: If the target path resolves outside root_path or is malformed.
     """
+    def _inside(path: Path, root: Path) -> bool:
+        path_s = os.path.normcase(str(path))
+        root_s = os.path.normcase(str(root))
+        return path_s == root_s or path_s.startswith(root_s.rstrip("\\/") + os.sep)
+
     try:
         root_resolved = Path(root_path).resolve()
         target = Path(target_path)
 
-        # Resolve target path relative to root_resolved
-        resolved = (root_resolved / target).resolve()
+        # 1. Lexical check: rejects '../' escapes and absolute paths without touching the filesystem.
+        lexical = Path(os.path.normpath(root_resolved / target))
+        if not _inside(lexical, root_resolved):
+            raise ValueError("lexical escape")
 
-        # Enforce that resolved target is inside root_resolved
-        resolved.relative_to(root_resolved)
+        # 2. Symlink check. The parent directory is resolved (directories are never atomically
+        #    replaced); the leaf is resolved only if it is a symlink. Resolving a regular file
+        #    while another task atomically replaces it is unreliable on Windows.
+        resolved = lexical.parent.resolve() / lexical.name if lexical != root_resolved else root_resolved
+        if resolved.is_symlink():
+            resolved = resolved.resolve()
+        if not _inside(resolved, root_resolved):
+            raise ValueError("symlink escape")
         return resolved
-    except (ValueError, TypeError, RuntimeError) as e:
-        raise WorkspacePathError(
-            f"Path traversal detected: '{target_path}' resolves outside workspace root '{root_path}'"
-        ) from e
+    except (ValueError, TypeError, RuntimeError, OSError) as e:
+        # Never echo absolute host paths (they embed session identifiers) into errors or logs.
+        raise WorkspacePathError(f"Path traversal detected: '{target_path}' resolves outside the workspace root") from e
 
 
 def _calculate_json_depth(obj: Any, current_depth: int = 1) -> int:

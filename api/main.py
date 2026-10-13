@@ -1,35 +1,78 @@
-"""FastAPI application factory, CORS configuration, health probes, and runtime service assembly."""
+"""FastAPI application factory: service graph assembly, lifecycle, health and metrics."""
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, AsyncIterator, Dict, Optional, Union
 
 import fakeredis.aioredis
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
+from api.auth import SessionRevocationList, require_service_token
 from api.routes import router as sessions_router
 from api.websocket import ConnectionManager, ws_router
-from config.settings import Settings, get_settings
+from config.settings import Settings, get_settings, validate_settings
+from core.assessor.pipeline import AssessmentPipeline
+from core.assessor.pool import AssessorWorkerPool
 from core.assessor.queue import RedisAssessmentQueue
+from core.agents.narrative import NarrativeWriter
+from core.assessor.decision import DecisionConfig
+from core.assessor.synthesizer import ReportSynthesizer, ReviewService
+from core.assessor.worker import AssessorWorker
 from core.interview.context import ContextAssembler
+from core.interview.controller import InterviewSessionController, RunnerRegistry
 from core.interview.director import StageDirector
 from core.interview.runner import InteractiveSubagentRunner
+from core.interview.speaker import SpeakerContextBuilder
+from core.interview.summary import RollingSummarizer
+from core.agents import CriterionEvaluator, register_subagents
+from core.orchestration.blackboard import Blackboard
+from core.orchestration.brief import InterviewBriefWriter
+from core.orchestration.delegate import DelegationRuntime
+from core.orchestration.orchestrator import InterviewOrchestrator
+from core.runtime.hooks import HookBus
+from core.runtime.policy import ToolPolicy
+from core.runtime.priority import BackgroundLLMClient, HedgedLLMClient, HotPathGate
+from core.runtime.profiles import load_profiles
+from core.runtime.skills import SkillRegistry
+from core.observability import build_default_metrics, configure_logging, correlation_id_var
 from core.profiler.agent import ProfilerAgent
+from core.retrieval.factory import build_knowledge_service
+from core.retrieval.port import RetrievalClient
 from core.runtime.agent import RuntimeAgent, sanitize_secrets
-from core.runtime.client import RuntimeLLMClient
+from core.runtime.client import ProfiledLLMClient, RuntimeLLMClient, verify_capabilities
 from core.runtime.providers.mock import MockLLMClient
 from core.runtime.providers.openai import OpenAIRuntimeLLMClient
+from core.runtime.providers.scripted import ScriptedInterviewLLM
+from core.session.cancellation import CancellationRegistry
 from core.session.events import SessionEventStore
-from core.session.idempotency import IdempotencyManager, TokenBucket
-from core.session.state import LifecycleStatus, SessionStateManager
+from core.session.idempotency import MessageLedger, RedisIdempotencyStore, RedisLease, TokenBucket
+from core.session.store import RedisSessionStateStore
 from core.workspace.cleanup import WorkspaceCleanupManager
-from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
+from core.workspace.retention import RetentionService
+from core.workspace.session import SessionWorkspaceManager
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_STAGES = [
+    {"stage_id": "warmup", "name": "Warmup", "target_turns": 2},
+    {"stage_id": "technical", "name": "Technical Depth", "target_turns": 3},
+]
+
+
+def _default_mock_llm() -> MockLLMClient:
+    """Deterministic scripted provider used when no API key is configured (development only).
+
+    It answers every structured prompt kind, so the whole pipeline runs end to end locally.
+    """
+    return ScriptedInterviewLLM(
+        speaker_tokens=["Hello", " candidate,", " welcome to your", " interview."],
+        stage_plan={"stages": DEFAULT_STAGES},
+    )
 
 
 def create_app(
@@ -38,165 +81,359 @@ def create_app(
     redis_client: Optional[Any] = None,
     llm_client: Optional[RuntimeLLMClient] = None,
     settings: Optional[Settings] = None,
+    retrieval_client: Optional[RetrievalClient] = None,
     **kwargs: Any,
 ) -> FastAPI:
-    """Create and configure a production-ready FastAPI application gateway.
+    """Create the AI runtime application.
 
     Args:
         workspace_base: Base directory path for isolated session workspaces.
-        fake_redis: If True, uses fakeredis aioredis client (ideal for tests).
-        redis_client: Optional pre-configured Redis client.
+        fake_redis: If True, uses an in-process fakeredis client (tests and local runs).
+        redis_client: Optional pre-configured async Redis client.
         llm_client: Optional LLM runtime client adapter.
-        settings: Application settings configuration instance.
-        **kwargs: Additional keyword arguments.
+        settings: Application settings (defaults to environment settings).
+        retrieval_client: Optional retrieval adapter; defaults to `RETRIEVAL_BACKEND`.
 
-    Returns:
-        FastAPI: Fully wired FastAPI application instance.
+    Raises:
+        RuntimeError: If APP_ENV=production and the configuration is unsafe.
     """
     app_settings = settings or get_settings()
+    config_errors = validate_settings(app_settings)
+    if config_errors:
+        raise RuntimeError("Unsafe production configuration: " + "; ".join(config_errors))
 
-    app = FastAPI(
-        title="AI Interview Platform Core Engine",
-        version="1.0.0",
-        description="External Access Gateway, Auth, WebSocket Stream & Connection Manager",
-    )
-
-    # 1. CORS Configuration
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # 2. Workspace Management
-    ws_base_path = Path(workspace_base) if workspace_base else app_settings.WORKSPACE_ROOT_BASE
-    ws_base_path.mkdir(parents=True, exist_ok=True)
-    workspace_mgr = SessionWorkspaceManager(
-        root_base=str(ws_base_path),
-        fsync=app_settings.WORKSPACE_FSYNC,
-    )
-    cleanup_mgr = WorkspaceCleanupManager(root_base=str(ws_base_path))
-
-    # 3. Redis Client & Event Storage
+    # 1. Redis
     active_redis = redis_client
     if active_redis is None:
         if fake_redis:
             active_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
         else:
-            try:
-                import redis.asyncio as aioredis
-                active_redis = aioredis.from_url(
-                    app_settings.REDIS_URL,
-                    decode_responses=True,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Could not initialize connection to Redis URL '%s': %s. Falling back to FakeRedis.",
-                    app_settings.REDIS_URL,
-                    sanitize_secrets(str(e)),
-                )
-                active_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+            import redis.asyncio as aioredis
 
-    event_store = SessionEventStore(redis_client=active_redis)
+            active_redis = aioredis.from_url(app_settings.REDIS_URL, decode_responses=True)
+
+    # 2. Workspace
+    ws_base_path = Path(workspace_base) if workspace_base else Path(app_settings.WORKSPACE_ROOT_BASE)
+    ws_base_path.mkdir(parents=True, exist_ok=True)
+    workspace_mgr = SessionWorkspaceManager(root_base=str(ws_base_path), fsync=app_settings.WORKSPACE_FSYNC)
+    cleanup_mgr = WorkspaceCleanupManager(root_base=str(ws_base_path))
+
+    # 3. Durable session primitives
+    metrics = build_default_metrics()
+    event_store = SessionEventStore(
+        redis_client=active_redis,
+        ttl_seconds=app_settings.EVENT_TTL_SECONDS,
+        max_length=app_settings.EVENT_STREAM_MAX_LENGTH,
+        memory_max_sessions=app_settings.EVENT_MEMORY_MAX_SESSIONS,
+    )
     connection_mgr = ConnectionManager(event_store=event_store)
-
-    # 4. Assessment Queue & State Management
+    state_store = RedisSessionStateStore(active_redis, ttl_seconds=app_settings.SESSION_STATE_TTL_SECONDS)
+    idempotency = RedisIdempotencyStore(active_redis, ttl_seconds=app_settings.IDEMPOTENCY_TTL_SECONDS)
+    ledger = MessageLedger(active_redis, ttl_seconds=app_settings.IDEMPOTENCY_TTL_SECONDS)
+    lease = RedisLease(active_redis)
+    revocations = SessionRevocationList(active_redis, ttl_seconds=app_settings.SESSION_STATE_TTL_SECONDS)
+    cancellations = CancellationRegistry()
     assessment_queue = RedisAssessmentQueue(
         redis_client=active_redis,
         stream_key=app_settings.ASSESSMENT_STREAM_KEY,
-    )
-    state_mgr = SessionStateManager()
-    idempotency_mgr = IdempotencyManager(
-        rate_limiter=TokenBucket(rate=10.0, capacity=20.0),
+        dead_letter_stream_key=f"{app_settings.ASSESSMENT_STREAM_KEY}:dead_letter",
+        counter_ttl_seconds=app_settings.SESSION_STATE_TTL_SECONDS,
     )
 
-    # 5. LLM Client and Profiler Setup
+    # 4. LLM provider, retrieval and profiler
     active_llm = llm_client
     if active_llm is None:
-        if not fake_redis and app_settings.OPENAI_API_KEY:
+        if not fake_redis and app_settings.llm_api_key:
             active_llm = OpenAIRuntimeLLMClient(
-                api_key=app_settings.OPENAI_API_KEY,
-                model=app_settings.DEFAULT_LLM_MODEL,
+                api_key=app_settings.llm_api_key,
+                model=app_settings.llm_model,
+                base_url=app_settings.LLM_API_URL or None,
             )
         else:
-            active_llm = MockLLMClient(
-                canned_tokens=["Hello", " candidate,", " welcome to your", " interview."],
-                canned_json_responses={
-                    "company_intel": {
-                        "company": "Target Company",
-                        "culture": "Engineering Excellence",
-                        "tech_stack": ["Python", "FastAPI", "Redis"],
-                    },
-                    "candidate_profile": {
-                        "strengths": ["Backend Design"],
-                        "gaps": ["Distributed Locks"],
-                        "probes": ["Concurrency"],
-                    },
-                    "interview_spec": {
-                        "interviewer_persona": "Tech Lead",
-                        "tone": "rigorous_challenger",
-                        "knowledge_scope": ["Concurrency", "Systems"],
-                    },
-                    "stage_plan": {
-                        "stages": [
-                            {"stage_id": "warmup", "name": "Warmup", "target_turns": 2},
-                            {"stage_id": "technical", "name": "Technical Depth", "target_turns": 3},
-                        ]
-                    },
-                },
-            )
+            active_llm = _default_mock_llm()
+    verify_capabilities(active_llm)
 
-    profiler_agent = ProfilerAgent(
-        llm_client=active_llm,
-        tools=[] if isinstance(active_llm, MockLLMClient) else None,
+    # Agent profiles: each structured agent calls the provider with its own profile model.
+    profiles = load_profiles(overrides_json=app_settings.AGENT_PROFILES_OVERRIDES, app_env=app_settings.APP_ENV)
+
+    hot_path_gate = HotPathGate()
+    # Hedging targets real network providers; scripted/mock clients have no latency tail.
+    speaker_llm: RuntimeLLMClient = (
+        HedgedLLMClient(active_llm, app_settings.SPEAKER_HEDGE_AFTER_MS / 1000, metrics=metrics)
+        if isinstance(active_llm, OpenAIRuntimeLLMClient) and app_settings.SPEAKER_HEDGE_AFTER_MS > 0
+        else active_llm
     )
 
-    # 6. Concurrency Limiter
+    def llm_for(profile_name: str) -> RuntimeLLMClient:
+        """Client for a background agent: its profile model, yielding to in-flight speaker turns."""
+        profile = profiles.get(profile_name)
+        return BackgroundLLMClient(
+            ProfiledLLMClient(active_llm, profile.model if profile else ""),
+            hot_path_gate,
+            max_wait_seconds=app_settings.BACKGROUND_YIELD_MAX_MS / 1000,
+        )
+
+    knowledge_service = build_knowledge_service(app_settings, client=retrieval_client)
+    profiler_agent = ProfilerAgent(
+        llm_client=llm_for("profiler"),
+        tools=[] if isinstance(active_llm, MockLLMClient) else None,
+        knowledge_service=knowledge_service,
+    )
+
+    # 5. Concurrency governors
     concurrency_semaphore = asyncio.Semaphore(app_settings.MAX_CONCURRENT_SESSIONS)
+    generation_slots = asyncio.Semaphore(app_settings.MAX_INTERACTIVE_GENERATIONS)
+    profiler_semaphore = asyncio.Semaphore(app_settings.MAX_PROFILER_LLM_CALLS)
+    assessor_semaphore = asyncio.Semaphore(app_settings.MAX_ASSESSOR_LLM_CALLS)
 
-    # 7. Runner Registry / Resolver
-    active_runners: Dict[str, InteractiveSubagentRunner] = {}
+    # 6. Assessment pipeline
+    synthesis_semaphore = asyncio.Semaphore(app_settings.MAX_SYNTHESIS_LLM_CALLS)
+    synthesizer = ReportSynthesizer(
+        redis_client=active_redis,
+        workspace_resolver=workspace_mgr,
+        state_manager=state_store,
+        event_store=event_store,
+        llm_client=active_llm,
+        connection_manager=connection_mgr,
+        decision_config=DecisionConfig(
+            min_confidence=app_settings.COVERAGE_MIN_CONFIDENCE,
+            borderline_band=app_settings.DECISION_BORDERLINE_BAND,
+            product_mode=app_settings.PRODUCT_MODE,
+        ),
+        narrative_writer=NarrativeWriter(
+            llm_for("narrative"),
+            deadline_seconds=profiles["narrative"].turn_deadline_ms / 1000,
+            semaphore=synthesis_semaphore,
+        ),
+        extra_versions={"narrative_prompt": "report_narrative@1", "orchestrator_prompt": "orchestrator_decision@1"},
+    )
+    pipeline = AssessmentPipeline(
+        redis_client=active_redis,
+        state_store=state_store,
+        synthesizer=synthesizer,
+        counter_ttl_seconds=app_settings.SESSION_STATE_TTL_SECONDS,
+        synthesis_lock_ttl_seconds=app_settings.SYNTHESIS_LOCK_TTL_SECONDS,
+    )
+    worker = AssessorWorker(
+        redis_client=active_redis,
+        queue=assessment_queue,
+        llm_client=active_llm,
+        workspace_resolver=workspace_mgr,
+        state_manager=state_store,
+        event_store=event_store,
+        connection_manager=connection_mgr,
+        on_assessment_completed=pipeline.maybe_synthesize,
+        llm_semaphore=assessor_semaphore,
+        evaluator=CriterionEvaluator(
+            llm_for("evaluator"),
+            workspace_mgr,
+            deadline_seconds=profiles["evaluator"].turn_deadline_ms / 1000,
+        ),
+    )
+    worker_pool = AssessorWorkerPool(
+        worker=worker,
+        queue=assessment_queue,
+        redis_client=active_redis,
+        size=app_settings.ASSESSOR_POOL_SIZE,
+        group_name=app_settings.ASSESSMENT_CONSUMER_GROUP,
+        block_ms=app_settings.ASSESSOR_BLOCK_MS,
+        lease_ms=app_settings.ASSESSOR_LEASE_MS,
+        recovery_interval_seconds=app_settings.ASSESSOR_RECOVERY_INTERVAL_SECONDS,
+        heartbeat_ttl_seconds=app_settings.ASSESSOR_HEARTBEAT_TTL_SECONDS,
+        sweeper=pipeline.sweep,
+        sweep_interval_seconds=app_settings.REPORT_SWEEP_INTERVAL_SECONDS,
+    )
+    retention = RetentionService(
+        state_store=state_store,
+        workspace_mgr=workspace_mgr,
+        cleanup_mgr=cleanup_mgr,
+        raw_upload_retention_hours=app_settings.RAW_UPLOAD_RETENTION_HOURS,
+        artifact_retention_days=app_settings.SESSION_ARTIFACT_RETENTION_DAYS,
+    )
 
-    async def get_or_create_runner(session_id: str) -> Optional[InteractiveSubagentRunner]:
-        if session_id in active_runners:
-            return active_runners[session_id]
+    # 7. Harness: profiles, hooks, skills
+    hooks = HookBus()
+    skills = SkillRegistry()
+    tool_policy = ToolPolicy()
+    orchestration_semaphore = asyncio.Semaphore(app_settings.MAX_ORCHESTRATOR_LLM_CALLS)
 
+    # 8. Interview runners and controller
+    async def build_runner(session_id: str) -> Optional[InteractiveSubagentRunner]:
         ws = workspace_mgr.get_or_create_workspace(session_id)
         if not ws.root_path.exists():
             return None
-
-        # Load stage plan if generated by profiler
-        stage_plan_file = "context/stage_plan.json"
-        stages = [
-            {"stage_id": "warmup", "name": "Warmup", "target_turns": 2},
-            {"stage_id": "technical", "name": "Technical Depth", "target_turns": 3},
-        ]
-        if ws.exists(stage_plan_file):
+        stages = list(DEFAULT_STAGES)
+        if ws.exists("context/stage_plan.json"):
             try:
-                plan_data = ws.read_json(stage_plan_file)
-                if "stages" in plan_data and isinstance(plan_data["stages"], list):
+                plan_data = ws.read_json("context/stage_plan.json")
+                if isinstance(plan_data.get("stages"), list) and plan_data["stages"]:
                     stages = plan_data["stages"]
             except Exception as e:
-                logger.warning("Could not read stage plan for '%s': %s", session_id, sanitize_secrets(str(e)))
-
-        director = StageDirector(stages=stages, state_mgr=state_mgr)
-        assembler = ContextAssembler(max_tokens=app_settings.MAX_SUBAGENT_PROMPT_TOKENS)
-        agent = RuntimeAgent(client=active_llm, workspace=ws)
-
-        runner = InteractiveSubagentRunner(
+                logger.warning("Could not read stage plan: %s", sanitize_secrets(str(e)))
+        speaker = profiles["speaker"]
+        return InteractiveSubagentRunner(
             workspace=ws,
-            runtime_agent=agent,
-            context_assembler=assembler,
-            stage_director=director,
+            runtime_agent=RuntimeAgent(
+                client=speaker_llm,
+                workspace=ws,
+                profile=speaker,
+                hooks=hooks,
+                policy=tool_policy,
+                metrics=metrics,
+            ),
+            context_assembler=ContextAssembler(max_tokens=app_settings.MAX_SUBAGENT_PROMPT_TOKENS),
+            stage_director=StageDirector(
+                stages=stages, state_mgr=state_store, max_extra_turns=app_settings.STAGE_MAX_EXTRA_TURNS
+            ),
             assessment_queue=assessment_queue,
-            state_mgr=state_mgr,
+            state_mgr=state_store,
+            turn_deadline_seconds=app_settings.TURN_DEADLINE_SECONDS,
+            context_builder=SpeakerContextBuilder(
+                workspace=ws,
+                skills=skills,
+                budget_tokens=speaker.context_budget_tokens,
+                recent_messages=app_settings.SPEAKER_RECENT_MESSAGES,
+            ),
         )
-        active_runners[session_id] = runner
-        return runner
 
-    # Wire state onto application
+    # 9. Control plane: blackboard, delegation, orchestrator, rolling summary, brief
+    blackboard = Blackboard(active_redis, ttl_seconds=app_settings.SESSION_STATE_TTL_SECONDS)
+    delegation = DelegationRuntime(
+        publisher=connection_mgr,
+        cancellations=cancellations,
+        workspace_resolver=workspace_mgr.get_or_create_workspace,
+        metrics=metrics,
+    )
+
+    register_subagents(delegation, llm_for, workspace_mgr, retrieval_client=knowledge_service.client,
+                       profiles=profiles, semaphore=orchestration_semaphore)
+
+    orchestrator = InterviewOrchestrator(
+        llm=llm_for("orchestrator"),
+        state_store=state_store,
+        workspace_resolver=workspace_mgr,
+        delegation=delegation,
+        blackboard=blackboard,
+        publisher=connection_mgr,
+        metrics=metrics,
+        min_confidence=app_settings.COVERAGE_MIN_CONFIDENCE,
+        cycle_deadline_seconds=app_settings.ORCHESTRATOR_DEADLINE_MS / 1000,
+        join_deadline_seconds=app_settings.ORCHESTRATOR_JOIN_MS / 1000,
+        llm_semaphore=orchestration_semaphore,
+        max_extra_turns=app_settings.STAGE_MAX_EXTRA_TURNS,
+    )
+    summarizer = RollingSummarizer(
+        llm=llm_for("summary"),
+        redis_client=active_redis,
+        deadline_seconds=profiles["summary"].turn_deadline_ms / 1000,
+        semaphore=orchestration_semaphore,
+    )
+    brief_writer = InterviewBriefWriter(
+        llm=llm_for("brief"), skills=skills, deadline_seconds=profiles["brief"].turn_deadline_ms / 1000
+    )
+
+    async def after_turn_orchestrate(session_id: str, turn_number: int) -> None:
+        await orchestrator.run_cycle(session_id, turn_number)
+
+    async def after_turn_summarize(session_id: str, turn_number: int) -> None:
+        await summarizer.update(session_id, workspace_mgr.get_or_create_workspace(session_id), turn_number)
+
+    async def persist_blackboard(session_id: str) -> None:
+        await blackboard.persist(session_id, workspace_mgr.get_or_create_workspace(session_id))
+
+    async def write_brief(session_id: str, workspace: Any) -> Dict[str, Any]:
+        return {"brief_status": await brief_writer.write(workspace)}
+
+    runners = RunnerRegistry(build_runner)
+    controller = InterviewSessionController(
+        state_store=state_store,
+        publisher=connection_mgr,
+        runners=runners,
+        ledger=ledger,
+        lease=lease,
+        cancellations=cancellations,
+        generation_slots=generation_slots,
+        answer_limiter=TokenBucket(rate=app_settings.ANSWER_RATE_PER_SECOND, capacity=app_settings.ANSWER_BURST),
+        queue_timeout_ms=app_settings.MAX_INTERACTIVE_QUEUE_MS,
+        busy_retry_after_ms=app_settings.BUSY_RETRY_AFTER_MS,
+        turn_lock_ttl_ms=app_settings.TURN_LOCK_TTL_MS,
+        metrics=metrics,
+        hot_path_gate=hot_path_gate,
+    )
+    if app_settings.ORCHESTRATOR_ENABLED:
+        controller.after_turn_hooks.append(after_turn_orchestrate)
+    if app_settings.ROLLING_SUMMARY_ENABLED:
+        controller.after_turn_hooks.append(after_turn_summarize)
+    controller.dialogue_completed_hooks.append(persist_blackboard)
+    controller.dialogue_completed_hooks.append(pipeline.on_dialogue_completed)
+
+    background_tasks: Dict[str, asyncio.Task] = {}
+
+    async def _retention_loop() -> None:
+        while True:
+            try:
+                await retention.sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Retention sweep failed: %s", sanitize_secrets(str(e)))
+            await asyncio.sleep(app_settings.RETENTION_SWEEP_INTERVAL_SECONDS)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if app_settings.APP_ENV.strip().lower() == "production":
+            configure_logging(json_format=True)
+        if app_settings.ASSESSOR_POOL_SIZE > 0:
+            await worker_pool.start()
+        background_tasks["retention"] = asyncio.create_task(_retention_loop(), name="retention")
+        try:
+            yield
+        finally:
+            for task in background_tasks.values():
+                task.cancel()
+            await asyncio.gather(*background_tasks.values(), return_exceptions=True)
+            background_tasks.clear()
+            await controller.drain(timeout=10.0)
+            await worker_pool.stop(grace_seconds=30.0)
+
+    app = FastAPI(
+        title="AI Interview Platform Core Engine",
+        version="2.0.0",
+        description="AI runtime: profiling, realtime interviewer, assessment and reporting",
+        lifespan=lifespan,
+    )
+
+    if app_settings.CORS_ALLOWED_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=app_settings.CORS_ALLOWED_ORIGINS,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "DELETE"],
+            allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Correlation-ID"],
+        )
+    else:
+        # Development: any origin, never with credentials.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    @app.middleware("http")
+    async def correlation_middleware(request: Request, call_next: Any) -> Response:
+        incoming = request.headers.get("x-correlation-id", "")
+        correlation_id = incoming if 0 < len(incoming) <= 64 and incoming.isascii() else uuid.uuid4().hex[:16]
+        token = correlation_id_var.set(correlation_id)
+        try:
+            response = await call_next(request)
+        finally:
+            correlation_id_var.reset(token)
+        response.headers["X-Correlation-ID"] = correlation_id
+        return response
+
+    # Wire state onto the application (names kept stable for adapters and tests)
     app.state.settings = app_settings
     app.state.workspace_mgr = workspace_mgr
     app.state.cleanup_mgr = cleanup_mgr
@@ -204,39 +441,61 @@ def create_app(
     app.state.event_store = event_store
     app.state.connection_mgr = connection_mgr
     app.state.assessment_queue = assessment_queue
-    app.state.state_mgr = state_mgr
-    app.state.idempotency_mgr = idempotency_mgr
+    app.state.state_mgr = state_store
+    app.state.idempotency_mgr = idempotency
+    app.state.message_ledger = ledger
+    app.state.revocations = revocations
     app.state.llm_client = active_llm
+    app.state.knowledge_service = knowledge_service
     app.state.profiler_agent = profiler_agent
+    app.state.profiler_semaphore = profiler_semaphore
     app.state.concurrency_semaphore = concurrency_semaphore
-    app.state.get_runner = get_or_create_runner
+    app.state.synthesizer = synthesizer
+    app.state.review_service = ReviewService(workspace_mgr)
+    app.state.pipeline = pipeline
+    app.state.assessor_worker = worker
+    app.state.worker_pool = worker_pool
+    app.state.retention = retention
+    app.state.runners = runners
+    app.state.get_runner = runners.get
+    app.state.controller = controller
+    app.state.cancellations = cancellations
+    app.state.metrics = metrics
+    app.state.post_profiling_hooks = [write_brief] if app_settings.BRIEF_ENABLED else []
+    app.state.profiles = profiles
+    app.state.hot_path_gate = hot_path_gate
+    app.state.hooks = hooks
+    app.state.skills = skills
+    app.state.blackboard = blackboard
+    app.state.delegation = delegation
+    app.state.orchestrator = orchestrator
+    app.state.summarizer = summarizer
+    app.state.brief_writer = brief_writer
+    app.state.reconnect_limiter = TokenBucket(
+        rate=app_settings.RECONNECT_RATE_PER_MINUTE / 60.0, capacity=app_settings.RECONNECT_RATE_PER_MINUTE
+    )
+    app.state.session_create_limiter = TokenBucket(
+        rate=app_settings.SESSION_CREATE_RATE_PER_SECOND, capacity=app_settings.SESSION_CREATE_BURST
+    )
 
-    # 8. Health Routes
     @app.get("/health/live", tags=["health"])
     async def health_live() -> Dict[str, Any]:
-        """Liveness probe: verifies process is alive and accepting connections."""
+        """Liveness probe: the process is serving requests."""
         return {"status": "ok", "live": True}
 
     @app.get("/health/ready", tags=["health"])
     async def health_ready() -> Any:
-        """Readiness probe: validates Redis connectivity, workspace disk write, and worker pool."""
+        """Readiness: Redis, workspace write, assessor heartbeat and provider configuration."""
         details: Dict[str, Any] = {}
         is_ready = True
 
-        # Probe Redis
-        if active_redis is not None:
-            try:
-                ping_res = active_redis.ping()
-                if hasattr(ping_res, "__await__"):
-                    await ping_res
-                details["redis"] = "connected"
-            except Exception as e:
-                details["redis"] = f"unreachable: {sanitize_secrets(str(e))}"
-                is_ready = False
-        else:
-            details["redis"] = "not_configured"
+        try:
+            await active_redis.ping()
+            details["redis"] = "connected"
+        except Exception as e:
+            details["redis"] = f"unreachable: {sanitize_secrets(str(e))}"
+            is_ready = False
 
-        # Probe Workspace writable
         try:
             probe_file = ws_base_path / f".health_probe_{uuid.uuid4().hex[:8]}"
             probe_file.write_text("ok", encoding="utf-8")
@@ -246,25 +505,46 @@ def create_app(
             details["workspace"] = f"unwritable: {sanitize_secrets(str(e))}"
             is_ready = False
 
+        if app_settings.ASSESSOR_POOL_SIZE > 0 and worker_pool.status()["running_tasks"] > 0:
+            healthy = details.get("redis") == "connected" and await worker_pool.is_healthy()
+            details["assessor_pool"] = "healthy" if healthy else "stale_heartbeat"
+            is_ready = is_ready and healthy
+        else:
+            details["assessor_pool"] = "not_running"
+            if app_settings.APP_ENV.strip().lower() == "production":
+                is_ready = False
+
+        provider_ok = not isinstance(active_llm, MockLLMClient) or app_settings.APP_ENV != "production"
+        details["provider"] = "configured" if not isinstance(active_llm, MockLLMClient) else "mock"
+        is_ready = is_ready and provider_ok
+        details["retrieval_backend"] = knowledge_service.backend_name
         details["max_concurrent_sessions"] = app_settings.MAX_CONCURRENT_SESSIONS
 
-        if not is_ready:
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={"status": "not_ready", "details": details},
-            )
-
         return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"status": "ready", "details": details},
+            status_code=status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "ready" if is_ready else "not_ready", "details": details},
         )
 
-    # 9. Mount Routers
+    @app.get("/metrics", tags=["health"])
+    async def metrics_endpoint(_: Dict[str, Any] = Depends(require_service_token)) -> PlainTextResponse:
+        """Prometheus metrics (service token required)."""
+        try:
+            metrics.set_gauge("assessment_pending", float(await assessment_queue.get_queue_size()))
+        except Exception:
+            pass
+        metrics.set_gauge("active_connections", float(connection_mgr.active_connection_count()))
+        return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
+
     app.include_router(sessions_router)
     app.include_router(ws_router)
-
     return app
 
 
-# Default ASGI application instance
-app = create_app()
+def build_default_app() -> FastAPI:
+    """Factory for `uvicorn api.main:build_default_app --factory`."""
+    settings = get_settings()
+    return create_app(settings=settings, fake_redis=settings.APP_ENV != "production" and not settings.REDIS_URL)
+
+
+# Default ASGI application instance (development convenience)
+app = build_default_app()

@@ -3,7 +3,7 @@
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Protocol, Set
 
 from core.runtime.agent import sanitize_secrets
 
@@ -27,6 +27,17 @@ class LifecycleStatus(str, Enum):
 
 class InvalidStateTransitionError(ValueError):
     """Raised when an invalid lifecycle transition or CAS version mismatch occurs."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(sanitize_secrets(message))
+
+
+class SessionNotFoundError(InvalidStateTransitionError):
+    """Raised when a transition targets a session that is not registered."""
+
+
+class SessionAlreadyExistsError(ValueError):
+    """Raised when creating a session whose identifier is already registered."""
 
     def __init__(self, message: str) -> None:
         super().__init__(sanitize_secrets(message))
@@ -157,8 +168,113 @@ class SessionState:
         )
 
 
+def build_transition(
+    state: SessionState,
+    expected_version: int,
+    new_status: Optional[LifecycleStatus] = None,
+    **updates: Any,
+) -> SessionState:
+    """Validate CAS version and FSM rules, and return the next immutable state snapshot.
+
+    Pure function shared by every SessionStateStore implementation.
+
+    Args:
+        state: Authoritative current state.
+        expected_version: Version the caller believes is current.
+        new_status: Optional target status, validated against VALID_TRANSITIONS.
+        **updates: Field updates: current_stage_id, is_stage_complete, current_turn, metadata (merged).
+
+    Returns:
+        SessionState: New snapshot with state_version incremented.
+
+    Raises:
+        InvalidStateTransitionError: On version mismatch or disallowed transition.
+    """
+    if state.state_version != expected_version:
+        raise InvalidStateTransitionError(
+            f"CAS mismatch for session '{state.session_id}': expected version "
+            f"{expected_version}, but current version is {state.state_version}"
+        )
+
+    target_status = state.status
+    if new_status is not None and new_status != state.status:
+        if state.status in TERMINAL_STATUSES:
+            raise InvalidStateTransitionError(
+                f"Cannot transition from terminal state {state.status.value} "
+                f"for session '{state.session_id}'"
+            )
+        allowed = VALID_TRANSITIONS.get(state.status, set())
+        if new_status not in allowed:
+            raise InvalidStateTransitionError(
+                f"Invalid transition from {state.status.value} to {new_status.value} "
+                f"for session '{state.session_id}'. Allowed transitions: "
+                f"{[s.value for s in allowed]}"
+            )
+        target_status = new_status
+
+    merged_metadata = dict(state.metadata)
+    if "metadata" in updates and isinstance(updates["metadata"], dict):
+        merged_metadata.update(updates["metadata"])
+
+    return SessionState(
+        session_id=state.session_id,
+        status=target_status,
+        state_version=state.state_version + 1,
+        current_stage_id=updates.get("current_stage_id", state.current_stage_id),
+        is_stage_complete=updates.get("is_stage_complete", state.is_stage_complete),
+        current_turn=updates.get("current_turn", state.current_turn),
+        metadata=merged_metadata,
+        created_at=state.created_at,
+        updated_at=time.time(),
+    )
+
+
+class SessionStateStore(Protocol):
+    """Async contract for session lifecycle persistence with compare-and-set transitions.
+
+    Implementations: `SessionStateManager` (in-memory, tests and single-process dev)
+    and `core.session.store.RedisSessionStateStore` (production).
+    """
+
+    async def acreate(
+        self,
+        session_id: str,
+        initial_status: LifecycleStatus = LifecycleStatus.INITIALIZED,
+        metadata: Optional[Dict[str, Any]] = None,
+        **fields: Any,
+    ) -> SessionState:
+        """Register a new session at version 1. Raises SessionAlreadyExistsError if present."""
+        ...
+
+    async def aget(self, session_id: str) -> Optional[SessionState]:
+        """Return the authoritative state, or None if unknown or expired."""
+        ...
+
+    async def atransition(
+        self,
+        state: SessionState,
+        expected_version: int,
+        new_status: Optional[LifecycleStatus] = None,
+        **updates: Any,
+    ) -> SessionState:
+        """Atomically apply a transition if the stored version equals expected_version."""
+        ...
+
+    async def adelete(self, session_id: str) -> None:
+        """Remove the session state and its index entries (idempotent)."""
+        ...
+
+    async def alist_by_status(self, status: LifecycleStatus) -> List[str]:
+        """Return identifiers of sessions currently in the given status."""
+        ...
+
+
 class SessionStateManager:
-    """Manages session lifecycle states with optimistic concurrency via Compare-And-Set (CAS)."""
+    """In-memory session state store with optimistic concurrency via Compare-And-Set (CAS).
+
+    Provides the synchronous API used by unit tests and the async `SessionStateStore`
+    API used by production code paths.
+    """
 
     def __init__(self) -> None:
         self._states: Dict[str, SessionState] = {}
@@ -209,60 +325,17 @@ class SessionStateManager:
         Raises:
             InvalidStateTransitionError: If version check fails or transition is disallowed.
         """
-        # 1. CAS Check: Verify expected version matches current version
-        if state.state_version != expected_version:
+        registered = self._states.get(state.session_id)
+        if registered is not None and registered.state_version != expected_version:
             raise InvalidStateTransitionError(
                 f"CAS mismatch for session '{state.session_id}': expected version "
-                f"{expected_version}, but current version is {state.state_version}"
+                f"{expected_version}, but current version is {registered.state_version}"
             )
 
-        # 2. FSM Transition Check: Validate lifecycle status change
-        target_status = state.status
-        if new_status is not None and new_status != state.status:
-            # Check terminal state lock
-            if state.status in TERMINAL_STATUSES:
-                raise InvalidStateTransitionError(
-                    f"Cannot transition from terminal state {state.status.value} "
-                    f"for session '{state.session_id}'"
-                )
-
-            # Check allowed transition paths
-            allowed = VALID_TRANSITIONS.get(state.status, set())
-            if new_status not in allowed:
-                raise InvalidStateTransitionError(
-                    f"Invalid transition from {state.status.value} to {new_status.value} "
-                    f"for session '{state.session_id}'. Allowed transitions: "
-                    f"{[s.value for s in allowed]}"
-                )
-            target_status = new_status
-
-        # 3. Construct incremented state version
-        new_version = state.state_version + 1
-        now = time.time()
-
-        # Build new field values
-        new_stage_id = updates.get("current_stage_id", state.current_stage_id)
-        new_is_complete = updates.get("is_stage_complete", state.is_stage_complete)
-        new_turn = updates.get("current_turn", state.current_turn)
-        
-        merged_metadata = dict(state.metadata)
-        if "metadata" in updates and isinstance(updates["metadata"], dict):
-            merged_metadata.update(updates["metadata"])
-
-        updated_state = SessionState(
-            session_id=state.session_id,
-            status=target_status,
-            state_version=new_version,
-            current_stage_id=new_stage_id,
-            is_stage_complete=new_is_complete,
-            current_turn=new_turn,
-            metadata=merged_metadata,
-            created_at=state.created_at,
-            updated_at=now,
-        )
+        updated_state = build_transition(state, expected_version, new_status, **updates)
 
         # Update in-memory registry if this session is tracked
-        if state.session_id in self._states:
+        if registered is not None:
             self._states[state.session_id] = updated_state
 
         return updated_state
@@ -277,7 +350,50 @@ class SessionStateManager:
         """Helper to transition a registered session directly by ID."""
         current = self.get_state(session_id)
         if current is None:
-            raise InvalidStateTransitionError(
+            raise SessionNotFoundError(
                 f"Session '{session_id}' not found in state manager registry"
             )
         return self.transition(current, expected_version, new_status, **updates)
+
+    # ------------------------------------------------------------------
+    # Async SessionStateStore API
+    # ------------------------------------------------------------------
+
+    async def acreate(
+        self,
+        session_id: str,
+        initial_status: LifecycleStatus = LifecycleStatus.INITIALIZED,
+        metadata: Optional[Dict[str, Any]] = None,
+        **fields: Any,
+    ) -> SessionState:
+        """Register a new session; raises SessionAlreadyExistsError if already present."""
+        if session_id in self._states:
+            raise SessionAlreadyExistsError(f"Session '{session_id}' already exists")
+        return self.create_session(session_id, initial_status, metadata, **fields)
+
+    async def aget(self, session_id: str) -> Optional[SessionState]:
+        """Return the registered state or None."""
+        return self.get_state(session_id)
+
+    async def atransition(
+        self,
+        state: SessionState,
+        expected_version: int,
+        new_status: Optional[LifecycleStatus] = None,
+        **updates: Any,
+    ) -> SessionState:
+        """CAS transition against the registered state."""
+        current = self._states.get(state.session_id)
+        if current is None:
+            raise SessionNotFoundError(
+                f"Session '{state.session_id}' not found in state manager registry"
+            )
+        return self.transition(current, expected_version, new_status, **updates)
+
+    async def adelete(self, session_id: str) -> None:
+        """Remove the session from the registry (idempotent)."""
+        self._states.pop(session_id, None)
+
+    async def alist_by_status(self, status: LifecycleStatus) -> List[str]:
+        """Return identifiers of registered sessions in the given status."""
+        return [sid for sid, st in self._states.items() if st.status == status]

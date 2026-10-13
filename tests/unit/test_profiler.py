@@ -6,8 +6,106 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from core.profiler.agent import ProfilerAgent, redact_sensitive_candidate_data
 from core.profiler.tools import MarketIntelTool, SafeWebSearchTool
+from core.retrieval import InterviewKnowledgeService, MockRetrievalClient
 from core.runtime.providers.mock import MockLLMClient
 from core.workspace.session import SessionWorkspace
+
+
+def _blueprint_llm() -> MockLLMClient:
+    """Mock LLM returning a stage plan without criteria, as an ungrounded model would."""
+    return MockLLMClient(
+        canned_json_responses={
+            "company_intel": {"company": "Acme Systems", "culture": "Rigor"},
+            "candidate_profile": {"strengths": ["Python"], "gaps": ["Kafka"]},
+            "interview_spec": {"interviewer_persona": "Tech Lead", "tone": "direct"},
+            "stage_plan": {
+                "stages": [
+                    {"stage_id": "warmup", "name": "Warmup", "turns": 1},
+                    {"stage_id": "technical", "name": "Technical Depth", "turns": 3},
+                    {"stage_id": "design", "name": "System Design", "turns": 2},
+                    {"stage_id": "close", "name": "Q&A and Close", "turns": 1},
+                ]
+            },
+        }
+    )
+
+
+def _write_backend_form(ws: SessionWorkspace) -> None:
+    ws.write_artifact(
+        "inputs/form_input.json",
+        artifact_type="input",
+        payload={
+            "candidate_name": "Nguyen Van A",
+            "experience_years": 6,
+            "target_company": "Acme Systems",
+            "target_role": "Senior Backend Engineer",
+            "skills": ["Python", "Redis"],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_profiler_grounds_stage_plan_with_retrieved_knowledge(tmp_path):
+    """Verify profiler retrieves rubric/questions, grounds the stage plan and writes knowledge artifacts."""
+    ws = SessionWorkspace(session_id="sess_rag1", root_path=tmp_path / "sess_rag1")
+    ws.initialize()
+    _write_backend_form(ws)
+
+    retrieval = MockRetrievalClient()
+    profiler = ProfilerAgent(
+        llm_client=_blueprint_llm(),
+        tools=[],
+        knowledge_service=InterviewKnowledgeService(client=retrieval),
+    )
+    res = await profiler.run_profiling(ws)
+
+    assert res["status"] == "SUCCESS"
+    assert res["retrieval_status"] == "ok"
+    assert {"retrieved_knowledge", "rubric"} <= set(res["artifacts"])
+
+    knowledge = ws.read_json("context/retrieved_knowledge.json")
+    assert knowledge["status"] == "ok"
+    assert knowledge["retrieval_backend"] == "mock"
+
+    rubric = ws.read_json("context/rubric.json")
+    assert rubric["rubric_version"] == "backend_senior_v1"
+    rubric_ids = {c["competency_id"] for c in rubric["competencies"]}
+
+    plan = ws.read_json("context/stage_plan.json")
+    assert [s["stage_id"] for s in plan["stages"]] == ["warmup", "technical", "design", "close"]
+    assert {cid for s in plan["stages"] for cid in s["criteria"]} == rubric_ids
+    assert all(s["question_candidates"] for s in plan["stages"])
+
+    # Retrieval queries never carry candidate identity
+    assert retrieval.queries
+    assert all("Nguyen" not in q.text for q in retrieval.queries)
+
+
+@pytest.mark.asyncio
+async def test_profiler_degrades_when_retrieval_fails(tmp_path):
+    """Verify retrieval failure does not fail profiling and is recorded as degraded."""
+    ws = SessionWorkspace(session_id="sess_rag2", root_path=tmp_path / "sess_rag2")
+    ws.initialize()
+    _write_backend_form(ws)
+
+    profiler = ProfilerAgent(
+        llm_client=_blueprint_llm(),
+        tools=[],
+        knowledge_service=InterviewKnowledgeService(
+            client=MockRetrievalClient(fail_with=RuntimeError("index offline"))
+        ),
+    )
+    res = await profiler.run_profiling(ws)
+
+    assert res["status"] == "SUCCESS"
+    assert res["retrieval_status"] == "degraded"
+    knowledge = ws.read_json("context/retrieved_knowledge.json")
+    assert knowledge["status"] == "degraded"
+    assert "index offline" in knowledge["error"]
+    assert not ws.exists("context/rubric.json")
+
+    plan = ws.read_json("context/stage_plan.json")
+    assert all("criteria" not in s for s in plan["stages"])
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
@@ -24,6 +25,10 @@ class IdempotencyError(Exception):
 
 class IdempotencyConflictError(IdempotencyError):
     """Raised when an idempotency key is reused with a differing payload (HTTP 409 Conflict)."""
+
+
+class IdempotencyInFlightError(IdempotencyError):
+    """Raised when an identical request is still being processed by another caller."""
 
 
 def compute_payload_hash(payload: Any) -> str:
@@ -287,3 +292,234 @@ class IdempotencyManager:
         self._in_flight.clear()
         with self._lock_guard:
             self._session_locks.clear()
+
+    # ------------------------------------------------------------------
+    # Async store API (shared with RedisIdempotencyStore)
+    # ------------------------------------------------------------------
+
+    async def abegin(self, key: str, payload: Optional[Any] = None) -> Tuple[bool, Optional[Any]]:
+        """Claim a key for execution or return the cached result.
+
+        Returns:
+            (True, None) when the caller must execute and then `arecord`;
+            (False, result) when a completed result is cached.
+
+        Raises:
+            IdempotencyConflictError: Key reused with a different payload.
+            IdempotencyInFlightError: Identical request still executing.
+        """
+        cached = self.get(key, payload=payload)
+        if cached is not None:
+            return False, cached
+        if not self.start_operation(key, payload=payload):
+            raise IdempotencyInFlightError(f"Request with idempotency key '{key}' is in progress")
+        return True, None
+
+    async def arecord(
+        self,
+        key: str,
+        result: Any,
+        payload: Optional[Any] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """Store the completed result for a claimed key."""
+        self.record(key, result=result, payload=payload, ttl_seconds=ttl_seconds)
+
+    async def arelease(self, key: str) -> None:
+        """Release a claimed key after a failed execution so it can be retried."""
+        self._in_flight.pop(key, None)
+
+
+class RedisIdempotencyStore:
+    """Redis-backed idempotency records shared across processes and restarts.
+
+    Each key stores JSON {"state": "in_flight" | "done", "payload_hash", "result"} with a TTL.
+    In-flight claims use SET NX with a short lease so a crashed caller does not block retries.
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        ttl_seconds: int = 86400,
+        in_flight_ttl_seconds: int = 120,
+        prefix: str = "idempotency:",
+    ) -> None:
+        self.redis = redis_client
+        self.ttl_seconds = ttl_seconds
+        self.in_flight_ttl_seconds = in_flight_ttl_seconds
+        self.prefix = prefix
+
+    def _key(self, key: str) -> str:
+        return f"{self.prefix}{key}"
+
+    async def abegin(self, key: str, payload: Optional[Any] = None) -> Tuple[bool, Optional[Any]]:
+        """Claim a key for execution or return the cached result (see IdempotencyManager.abegin)."""
+        payload_hash = compute_payload_hash(payload) if payload is not None else None
+        marker = json.dumps({"state": "in_flight", "payload_hash": payload_hash})
+        claimed = await self.redis.set(
+            self._key(key), marker, nx=True, ex=self.in_flight_ttl_seconds
+        )
+        if claimed:
+            return True, None
+
+        raw = await self.redis.get(self._key(key))
+        if raw is None:
+            # Expired between SET NX and GET: retry the claim once.
+            claimed = await self.redis.set(
+                self._key(key), marker, nx=True, ex=self.in_flight_ttl_seconds
+            )
+            if claimed:
+                return True, None
+            raw = await self.redis.get(self._key(key))
+            if raw is None:
+                raise IdempotencyInFlightError(f"Request with idempotency key '{key}' is in progress")
+
+        record = json.loads(raw)
+        stored_hash = record.get("payload_hash")
+        if payload_hash is not None and stored_hash is not None and stored_hash != payload_hash:
+            raise IdempotencyConflictError(
+                f"Idempotency payload mismatch for key '{key}': "
+                f"stored hash {stored_hash[:8]}... != incoming hash {payload_hash[:8]}..."
+            )
+        if record.get("state") == "done":
+            return False, record.get("result")
+        raise IdempotencyInFlightError(f"Request with idempotency key '{key}' is in progress")
+
+    async def arecord(
+        self,
+        key: str,
+        result: Any,
+        payload: Optional[Any] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """Store the completed result for a claimed key."""
+        record = {
+            "state": "done",
+            "payload_hash": compute_payload_hash(payload) if payload is not None else None,
+            "result": result,
+        }
+        await self.redis.set(
+            self._key(key), json.dumps(record, default=str), ex=ttl_seconds or self.ttl_seconds
+        )
+
+    async def arelease(self, key: str) -> None:
+        """Release an in-flight claim after a failed execution (completed records are kept)."""
+        raw = await self.redis.get(self._key(key))
+        if raw is not None and json.loads(raw).get("state") == "in_flight":
+            await self.redis.delete(self._key(key))
+
+    async def apurge_prefix(self, prefix: str) -> int:
+        """Delete every record whose key starts with prefix (used by session deletion)."""
+        deleted = 0
+        async for redis_key in self.redis.scan_iter(match=f"{self._key(prefix)}*"):
+            deleted += int(await self.redis.delete(redis_key))
+        return deleted
+
+
+@dataclass
+class LedgerEntry:
+    """State of one client message in the per-session message ledger."""
+
+    message_id: str
+    turn_id: str
+    status: str  # "in_progress" | "completed"
+    payload_hash: Optional[str] = None
+
+
+class MessageLedger:
+    """Per-session mapping of client `message_id` to the turn it produced.
+
+    Key `session:{id}:messages` is a Redis hash `message_id -> JSON LedgerEntry` with a TTL.
+    Guarantees that a repeated `message_id` never invokes the LLM twice: completed messages
+    are answered by replaying the recorded turn events.
+    """
+
+    def __init__(self, redis_client: Any, ttl_seconds: int = 86400) -> None:
+        self.redis = redis_client
+        self.ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def _key(session_id: str) -> str:
+        return f"session:{session_id}:messages"
+
+    async def get(self, session_id: str, message_id: str) -> Optional[LedgerEntry]:
+        """Return the ledger entry for a message, or None."""
+        raw = await self.redis.hget(self._key(session_id), message_id)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return LedgerEntry(message_id=message_id, **data)
+
+    async def begin(
+        self, session_id: str, message_id: str, turn_id: str, payload_hash: Optional[str]
+    ) -> Optional[LedgerEntry]:
+        """Register a message as in progress; return the existing entry if already registered.
+
+        Raises:
+            IdempotencyConflictError: Existing entry has a different payload hash.
+        """
+        value = json.dumps({"turn_id": turn_id, "status": "in_progress", "payload_hash": payload_hash})
+        created = await self.redis.hsetnx(self._key(session_id), message_id, value)
+        await self.redis.expire(self._key(session_id), self.ttl_seconds)
+        if created:
+            return None
+        existing = await self.get(session_id, message_id)
+        if (
+            existing is not None
+            and existing.payload_hash
+            and payload_hash
+            and existing.payload_hash != payload_hash
+        ):
+            raise IdempotencyConflictError(
+                f"message_id '{message_id}' was reused with a different payload"
+            )
+        return existing
+
+    async def complete(self, session_id: str, message_id: str) -> None:
+        """Mark a message's turn as completed."""
+        entry = await self.get(session_id, message_id)
+        if entry is None:
+            return
+        value = json.dumps(
+            {"turn_id": entry.turn_id, "status": "completed", "payload_hash": entry.payload_hash}
+        )
+        await self.redis.hset(self._key(session_id), message_id, value)
+
+    async def discard(self, session_id: str, message_id: str) -> None:
+        """Forget a message whose turn failed so the client can retry it."""
+        await self.redis.hdel(self._key(session_id), message_id)
+
+    async def purge(self, session_id: str) -> None:
+        """Delete the session's ledger."""
+        await self.redis.delete(self._key(session_id))
+
+
+class RedisLease:
+    """Expiring mutual-exclusion lease stored in Redis (SET NX PX + token-checked release)."""
+
+    def __init__(self, redis_client: Any) -> None:
+        self.redis = redis_client
+
+    async def acquire(self, key: str, ttl_ms: int) -> Optional[str]:
+        """Try to take the lease; return its token or None if held by someone else."""
+        token = uuid.uuid4().hex
+        acquired = await self.redis.set(key, token, nx=True, px=ttl_ms)
+        return token if acquired else None
+
+    async def release(self, key: str, token: str) -> bool:
+        """Release the lease only if it is still held with this token."""
+        async with self.redis.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(key)
+                current = await pipe.get(key)
+                if current is None or (
+                    current.decode("utf-8") if isinstance(current, bytes) else current
+                ) != token:
+                    await pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.delete(key)
+                await pipe.execute()
+                return True
+            except Exception:
+                return False

@@ -13,7 +13,8 @@ class ContextAssembler:
     3. Drop non-critical profile details (claims, secondary skills, metadata, hobbies).
     
     Inviolable Core:
-    Persona, tone, stage goals, and current Q&A are strictly preserved and never dropped.
+    Persona, tone, stage goals (with retrieved competencies and up to 3 key questions),
+    and current Q&A are strictly preserved and never dropped.
     """
 
     def __init__(self, max_tokens: int = 1500) -> None:
@@ -82,6 +83,18 @@ class ContextAssembler:
         else:
             goals_str = str(goals)
 
+        # Retrieval-grounded stage fields (optional): competencies to evidence and key questions
+        criteria_labels = stage.get("criteria_labels")
+        criteria_str = (
+            ", ".join(str(c) for c in criteria_labels) if isinstance(criteria_labels, list) else ""
+        )
+        raw_questions = stage.get("question_candidates")
+        key_questions = [
+            str(q.get("text", ""))[:240]
+            for q in (raw_questions if isinstance(raw_questions, list) else [])
+            if isinstance(q, dict) and q.get("text")
+        ][:3]
+
         # Separate inviolable current Q&A from older turns
         # If 2 or more turns, last 2 represent current Q&A (Interviewer Q + Candidate A)
         # If 1 turn, it represents current Q&A
@@ -113,11 +126,20 @@ class ContextAssembler:
                 f"- Knowledge Scope: {scope_str}"
             )
 
-            # 2. Inviolable Core: Stage Goals
-            sections.append(
-                f"# Current Stage: {stage_name} ({stage_id})\n"
-                f"- Stage Goals: {goals_str}"
-            )
+            # 2. Inviolable Core: Stage Goals, Competencies and Key Questions
+            stage_lines = [
+                f"# Current Stage: {stage_name} ({stage_id})",
+                f"- Stage Goals: {goals_str}",
+            ]
+            if criteria_str:
+                stage_lines.append(f"- Competencies to Evidence: {criteria_str}")
+            if key_questions:
+                stage_lines.append(
+                    "- Key Questions (ask one at a time, adapt to the conversation, "
+                    "follow up when an answer is shallow):"
+                )
+                stage_lines.extend(f"  {idx}. {q}" for idx, q in enumerate(key_questions, 1))
+            sections.append("\n".join(stage_lines))
 
             # 3. Candidate Profile (Droppable Priority 3)
             if p_level >= 2:

@@ -1,29 +1,42 @@
-"""Background assessor worker pool consuming Redis Streams evaluation tasks."""
+"""Background assessor worker consuming Redis Streams evaluation tasks."""
 
+import asyncio
 import hashlib
-import json
 import logging
+import random
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
-from core.assessor.queue import RedisAssessmentQueue
+from core.assessor.queue import (
+    RedisAssessmentQueue,
+    completed_assessments_key,
+    failed_assessments_key,
+)
 from core.assessor.subagent import TurnEvaluator
+from core.observability import session_ref
 from core.runtime.agent import sanitize_secrets
 from core.runtime.client import RuntimeLLMClient
 from core.runtime.types import LoopEvent, LoopEventType
 from core.session.events import SessionEventStore
-from core.session.state import LifecycleStatus, SessionStateManager
+from core.session.state import LifecycleStatus, SessionStateStore
 from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
 
 logger = logging.getLogger(__name__)
 
+AssessmentCompletedCallback = Callable[[str], Awaitable[Any]]
+
 
 class AssessorWorker:
-    """Consumes assessment jobs from Redis Streams, executes rubric evaluations, and persists artifacts.
+    """Consumes assessment jobs, runs the evaluator, and persists evaluation artifacts.
 
-    Enforces at-least-once delivery with idempotency (job_id + input_sha256 + rubric_version),
-    atomic artifact writes, set cardinality tracking, dead-letter routing, and event stream appending.
+    Guarantees:
+        - At-least-once delivery with idempotency on (job_id, input_sha256, rubric_version).
+        - XACK only after the artifact is atomically written and the job_id recorded.
+        - Jobs superseded by a newer answer for the same turn (different `message_id` on the
+          candidate artifact) are acknowledged without evaluation.
+        - Transient failures are retried with exponential backoff and jitter through the
+          queue's delayed set; exhausted jobs go to the dead-letter stream.
     """
 
     def __init__(
@@ -32,11 +45,14 @@ class AssessorWorker:
         queue: RedisAssessmentQueue,
         llm_client: RuntimeLLMClient,
         workspace_resolver: Union[Callable[[str], SessionWorkspace], SessionWorkspaceManager],
-        state_manager: Optional[SessionStateManager] = None,
+        state_manager: Optional[SessionStateStore] = None,
         event_store: Optional[SessionEventStore] = None,
         max_retries: int = 3,
-        evaluator: Optional[TurnEvaluator] = None,
+        evaluator: Optional[Any] = None,
         connection_manager: Optional[Any] = None,
+        on_assessment_completed: Optional[AssessmentCompletedCallback] = None,
+        llm_semaphore: Optional[asyncio.Semaphore] = None,
+        retry_base_delay_seconds: float = 1.0,
     ) -> None:
         """Initialize AssessorWorker.
 
@@ -45,11 +61,14 @@ class AssessorWorker:
             queue: RedisAssessmentQueue managing stream operations.
             llm_client: Runtime LLM provider client.
             workspace_resolver: Resolver returning SessionWorkspace for a session_id.
-            state_manager: Optional SessionStateManager for lifecycle transitions.
+            state_manager: Optional session state store for lifecycle transitions.
             event_store: Optional SessionEventStore for appending replayable events.
             max_retries: Maximum execution attempts before dead-letter routing (default 3).
-            evaluator: Optional TurnEvaluator instance.
-            connection_manager: Optional ConnectionManager for dispatching live events.
+            evaluator: Optional evaluator exposing `evaluate_turn(...)`.
+            connection_manager: Optional ConnectionManager for recording and pushing live events.
+            on_assessment_completed: Optional callback invoked after each persisted evaluation.
+            llm_semaphore: Optional semaphore bounding concurrent evaluator LLM calls.
+            retry_base_delay_seconds: Base of the exponential retry backoff.
         """
         self.redis_client = redis_client
         self.queue = queue
@@ -60,6 +79,9 @@ class AssessorWorker:
         self.max_retries = max_retries
         self.evaluator = evaluator or TurnEvaluator(llm_client=llm_client)
         self.connection_manager = connection_manager
+        self.on_assessment_completed = on_assessment_completed
+        self.llm_semaphore = llm_semaphore
+        self.retry_base_delay_seconds = retry_base_delay_seconds
 
     def _get_workspace(self, session_id: str) -> SessionWorkspace:
         """Resolve SessionWorkspace instance for the given session ID."""
@@ -76,8 +98,7 @@ class AssessorWorker:
         """Fetch and process the next assessment job from the stream consumer group.
 
         Returns:
-            bool: True if a job was successfully processed or verified idempotent,
-                  False if no jobs were available or a fatal failure occurred.
+            bool: True if a job was processed or verified idempotent, False otherwise.
         """
         jobs = await self.queue.read_jobs(
             group_name=group_name,
@@ -85,10 +106,8 @@ class AssessorWorker:
             count=1,
             block_ms=block_ms,
         )
-
         if not jobs:
             return False
-
         message_id, job_data = jobs[0]
         return await self._process_job_data(group_name, message_id, job_data)
 
@@ -99,17 +118,7 @@ class AssessorWorker:
         min_idle_time_ms: int = 0,
         count: int = 10,
     ) -> int:
-        """Claim idle unacknowledged jobs from other workers using XAUTOCLAIM and process them.
-
-        Args:
-            group_name: Consumer group name.
-            consumer_name: Worker consumer identifier claiming the jobs.
-            min_idle_time_ms: Minimum idle duration in milliseconds.
-            count: Maximum number of jobs to reclaim.
-
-        Returns:
-            int: Number of idle jobs successfully claimed and processed.
-        """
+        """Claim idle unacknowledged jobs from crashed consumers (XAUTOCLAIM) and process them."""
         claimed = await self.queue.claim_idle_jobs(
             group_name=group_name,
             consumer_name=consumer_name,
@@ -118,10 +127,52 @@ class AssessorWorker:
         )
         processed_count = 0
         for msg_id, job_data in claimed:
-            success = await self._process_job_data(group_name, msg_id, job_data)
-            if success:
+            if await self._process_job_data(group_name, msg_id, job_data):
                 processed_count += 1
         return processed_count
+
+    def _is_superseded(self, ws: SessionWorkspace, job_data: Dict[str, Any]) -> bool:
+        """True if the turn's candidate artifact now belongs to a different client message."""
+        job_message_id = job_data.get("message_id")
+        turn_id = job_data.get("turn_id", "")
+        if not job_message_id or not turn_id.startswith("turn_"):
+            return False
+        try:
+            turn_number = int(turn_id.split("_", 1)[1])
+        except ValueError:
+            return False
+        rel_path = f"turns/turn_{turn_number}_candidate.json"
+        if not ws.exists(rel_path):
+            return False
+        try:
+            artifact_message_id = ws.read_json(rel_path).get("message_id")
+        except Exception:
+            return False
+        return bool(artifact_message_id) and artifact_message_id != job_message_id
+
+    async def _publish(self, session_id: str, turn_id: str, event_type: LoopEventType, payload: Dict[str, Any]) -> None:
+        """Record a replayable event and push it to the live connection when present."""
+        event = LoopEvent(
+            schema_version="1.0",
+            event_id=f"evt_{uuid.uuid4().hex[:16]}",
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=0,
+            timestamp=time.time(),
+            type=event_type,
+            payload=payload,
+        )
+        if self.connection_manager is not None:
+            recorded = await self.connection_manager.record_event_async(session_id, event)
+            await self.connection_manager.send_event(session_id, recorded)
+        elif self.event_store is not None:
+            await self.event_store.append_async(session_id, event)
+
+    async def _evaluate(self, **kwargs: Any) -> Dict[str, Any]:
+        if self.llm_semaphore is None:
+            return await self.evaluator.evaluate_turn(**kwargs)
+        async with self.llm_semaphore:
+            return await self.evaluator.evaluate_turn(**kwargs)
 
     async def _process_job_data(
         self,
@@ -129,7 +180,7 @@ class AssessorWorker:
         message_id: str,
         job_data: Dict[str, Any],
     ) -> bool:
-        """Process a single assessment job with idempotency, evaluation, persistence, and event dispatch."""
+        """Process a single assessment job with idempotency, evaluation, persistence and events."""
         session_id = job_data.get("session_id", "")
         turn_id = job_data.get("turn_id", "")
         job_id = job_data.get("job_id", "")
@@ -140,16 +191,21 @@ class AssessorWorker:
         rubric_target = job_data.get("rubric_target", [])
         vad_metrics = job_data.get("vad_metrics", {})
 
-        # Compute SHA256 input fingerprint
         input_sha256 = job_data.get("input_sha256")
         if not input_sha256:
-            raw_input = f"{question}:{candidate_text}".encode("utf-8")
-            input_sha256 = hashlib.sha256(raw_input).hexdigest()
+            input_sha256 = hashlib.sha256(f"{question}:{candidate_text}".encode("utf-8")).hexdigest()
 
         ws = self._get_workspace(session_id)
         eval_rel_path = f"evaluations/{turn_id}_eval.json"
 
-        # 1. Idempotency Check: Existing evaluation artifact matching key
+        # 1. Superseded answers are acknowledged without evaluation
+        if self._is_superseded(ws, job_data):
+            # The newer answer shares this job_id, so the enqueued set already counts it once.
+            await self.queue.ack_job(group_name, message_id)
+            logger.info("Skipped superseded assessment job (session %s, %s)", session_ref(session_id), turn_id)
+            return True
+
+        # 2. Idempotency: an existing artifact with the same key is reused
         if ws.exists(eval_rel_path):
             try:
                 existing_doc = ws.read_json(eval_rel_path)
@@ -159,153 +215,117 @@ class AssessorWorker:
                     and existing_payload.get("input_sha256") == input_sha256
                     and existing_payload.get("rubric_version") == rubric_version
                 ):
-                    # Already evaluated: update Redis set and XACK without re-running LLM
-                    await self.redis_client.sadd(
-                        f"session:{session_id}:completed_assessments", job_id
-                    )
+                    await self.redis_client.sadd(completed_assessments_key(session_id), job_id)
                     await self.queue.ack_job(group_name, message_id)
                     logger.info(
-                        f"Idempotent hit for job '{job_id}'; acknowledged without re-evaluation."
+                        "Idempotent assessment hit (session %s, %s); acknowledged without re-evaluation",
+                        session_ref(session_id),
+                        turn_id,
                     )
+                    if self.on_assessment_completed is not None:
+                        await self.on_assessment_completed(session_id)
                     return True
             except Exception as e:
                 logger.warning(
-                    f"Failed checking existing evaluation artifact for idempotency: {e}"
+                    "Failed checking existing evaluation artifact for idempotency: %s",
+                    sanitize_secrets(str(e)),
                 )
 
-        # 2. Execute Evaluation Subagent with Retry Budget
+        # 3. Evaluate
         try:
-            eval_result = await self.evaluator.evaluate_turn(
+            eval_result = await self._evaluate(
                 question=question,
                 candidate_text=candidate_text,
                 rubric_target=rubric_target,
                 rubric_version=rubric_version,
                 vad_metrics=vad_metrics,
+                session_id=session_id,
+                turn_id=turn_id,
             )
 
             artifact_payload = {
-                "schema_version": "1.0",
+                "schema_version": eval_result.get("schema_version", "1.0"),
                 "job_id": job_id,
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "stage_id": stage_id,
+                "message_id": job_data.get("message_id"),
                 "input_sha256": input_sha256,
                 "rubric_version": rubric_version,
                 "rubric_target": rubric_target,
-                "content_score": eval_result["content_score"],
-                "communication_score": eval_result["communication_score"],
-                "strengths": eval_result["strengths"],
-                "improvements": eval_result["improvements"],
-                "delivery_observations": eval_result["delivery_observations"],
                 "evaluated_at": time.time(),
             }
+            for key, value in eval_result.items():
+                if key not in artifact_payload:
+                    artifact_payload[key] = value
 
-            # 3. Atomically write evaluation artifact
-            ws.write_artifact(
+            # 4. Atomically write the artifact, then record completion, then ACK
+            await asyncio.to_thread(
+                ws.write_artifact,
                 eval_rel_path,
                 artifact_type="turn_evaluation",
                 payload=artifact_payload,
+                schema_version=str(artifact_payload["schema_version"]),
             )
-
-            # 4. Atomically record job_id in Redis completed set
-            await self.redis_client.sadd(
-                f"session:{session_id}:completed_assessments", job_id
-            )
-
-            # 5. XACK only after atomic file persistence and Redis set recording
+            await self.redis_client.sadd(completed_assessments_key(session_id), job_id)
             await self.queue.ack_job(group_name, message_id)
 
-            # 6. Append assessment_completed to replayable event store
-            if self.event_store is not None:
-                self.event_store.append_event(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    event_type="assessment_completed",
-                    payload=artifact_payload,
-                )
+            await self._publish(
+                session_id,
+                turn_id,
+                LoopEventType.ASSESSMENT_UPDATE,
+                {
+                    "job_id": job_id,
+                    "turn_id": turn_id,
+                    "stage_id": stage_id,
+                    "content_score": artifact_payload.get("content_score"),
+                    "communication_score": artifact_payload.get("communication_score"),
+                    "status": "COMPLETED",
+                },
+            )
 
-            # Broadcast assessment_update to connection manager if configured
-            if self.connection_manager is not None:
-                update_event = LoopEvent(
-                    schema_version="1.0",
-                    event_id=f"evt_{uuid.uuid4().hex[:16]}",
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    sequence=0,
-                    timestamp=time.time(),
-                    type=LoopEventType.ASSESSMENT_UPDATE,
-                    payload={
-                        "job_id": job_id,
-                        "turn_id": turn_id,
-                        "stage_id": stage_id,
-                        "content_score": artifact_payload["content_score"],
-                        "communication_score": artifact_payload["communication_score"],
-                        "status": "COMPLETED",
-                    },
-                )
-                if hasattr(self.connection_manager, "record_event_async"):
-                    await self.connection_manager.record_event_async(session_id, update_event)
-                else:
-                    self.connection_manager.record_event(session_id, update_event)
-                await self.connection_manager.send_event(session_id, update_event)
-
-            # Synchronize to Redis stream session:{session_id}:events
-            try:
-                redis_stream_key = f"session:{session_id}:events"
-                await self.redis_client.xadd(
-                    redis_stream_key,
-                    {
-                        "type": "assessment_completed",
-                        "turn_id": turn_id,
-                        "payload": json.dumps(artifact_payload),
-                    },
-                )
-            except Exception:
-                pass
-
+            if self.on_assessment_completed is not None:
+                await self.on_assessment_completed(session_id)
             return True
 
         except Exception as exc:
+            clean_error = sanitize_secrets(str(exc))
             logger.error(
-                f"Evaluation failed for job '{job_id}': {sanitize_secrets(str(exc))}"
+                "Evaluation failed (session %s, %s): %s", session_ref(session_id), turn_id, clean_error
             )
             retry_count = int(job_data.get("retry_count", 0)) + 1
             job_data["retry_count"] = retry_count
 
             if retry_count < self.max_retries:
-                # Re-enqueue with incremented retry count and acknowledge current offset
-                await self.queue.enqueue(job_data)
+                delay = self.retry_base_delay_seconds * (2 ** (retry_count - 1))
+                delay += random.uniform(0, delay / 2)
+                await self.queue.schedule_retry(job_data, delay)
                 await self.queue.ack_job(group_name, message_id)
             else:
-                # Exhausted retry budget: forward to dead letter queue
                 await self.queue.send_to_dead_letter(
                     job_data=job_data,
-                    error_reason=sanitize_secrets(str(exc)),
+                    error_reason=clean_error,
                     message_id=message_id,
                 )
                 await self.queue.ack_job(group_name, message_id)
-                await self.redis_client.sadd(
-                    f"session:{session_id}:failed_assessments", job_id
-                )
+                await self.redis_client.sadd(failed_assessments_key(session_id), job_id)
 
-                # Transition session lifecycle to ASSESSMENT_FAILED if state_manager available
                 if self.state_manager is not None:
                     try:
-                        state = self.state_manager.get_state(session_id)
+                        state = await self.state_manager.aget(session_id)
                         if state and state.status == LifecycleStatus.ASSESSING:
-                            self.state_manager.transition(
+                            await self.state_manager.atransition(
                                 state,
                                 expected_version=state.state_version,
                                 new_status=LifecycleStatus.ASSESSMENT_FAILED,
                                 metadata={
                                     "failure_code": "ASSESSMENT_EXHAUSTED",
                                     "failed_job_id": job_id,
-                                    "error": sanitize_secrets(str(exc)),
                                 },
                             )
                     except Exception as trans_err:
                         logger.warning(
-                            f"Failed state transition to ASSESSMENT_FAILED: {trans_err}"
+                            "Failed state transition to ASSESSMENT_FAILED: %s",
+                            sanitize_secrets(str(trans_err)),
                         )
-
             return False

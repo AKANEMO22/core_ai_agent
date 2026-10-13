@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "speaker": {
+      "temperature": 0.6,
+      "turn_deadline_ms": 8000,
+      "context_budget_tokens": 6000
+    },
+    "orchestrator": {
+      "temperature": 0.2,
+      "turn_deadline_ms": 8000
+    },
+    "evaluator": {
+      "temperature": 0.0
+    }
+  }
+}

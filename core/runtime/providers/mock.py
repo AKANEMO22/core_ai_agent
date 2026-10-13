@@ -28,7 +28,11 @@ class MockLLMClient:
         raise_error: Optional[Exception] = None,
         capabilities: Optional[ProviderCapabilities] = None,
         canned_json_responses: Optional[Dict[str, Any]] = None,
+        responder: Optional[Any] = None,
     ) -> None:
+        """`responder(messages) -> Optional[str]` may return a full response computed from the
+        prompt (used by tests that need inputs echoed back, e.g. evidence quotes)."""
+        self.responder = responder
         self.canned_tokens = canned_tokens or []
         self.canned_tool_calls = canned_tool_calls
         self.final_response = final_response
@@ -70,7 +74,13 @@ class MockLLMClient:
                 await asyncio.sleep(self.stream_delay)
             yield IterationChunk(reasoning_summary=summary)
 
-        # 2. Check for canned structured JSON responses
+        # 2. Dynamic responder, then canned structured JSON responses
+        if self.responder is not None:
+            dynamic = self.responder(messages)
+            if dynamic is not None:
+                yield IterationChunk(token=dynamic, finish_reason="stop")
+                return
+
         if self.canned_json_responses:
             matched_payload = None
             user_content = ""

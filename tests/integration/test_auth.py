@@ -240,13 +240,14 @@ async def test_rest_report_flow(tmp_path):
         ws.write_artifact("reports/interview_report.md", artifact_type="report_markdown", payload="### Interview Report\nStrong skills.")
         ws.write_artifact("reports/final_assessment.json", artifact_type="final_assessment", payload={"overall_score": 8.5})
 
-        curr_state = app.state.state_mgr.get_state(sess_id)
+        store = app.state.state_mgr
+        curr_state = await store.aget(sess_id)
         # Advance through valid transitions to REPORT_READY
-        s2 = app.state.state_mgr.transition(curr_state, expected_version=curr_state.state_version, new_status=LifecycleStatus.READY)
-        s3 = app.state.state_mgr.transition(s2, expected_version=s2.state_version, new_status=LifecycleStatus.STAGE_ACTIVE)
-        s4 = app.state.state_mgr.transition(s3, expected_version=s3.state_version, new_status=LifecycleStatus.DIALOGUE_COMPLETED)
-        s5 = app.state.state_mgr.transition(s4, expected_version=s4.state_version, new_status=LifecycleStatus.ASSESSING)
-        app.state.state_mgr.transition(s5, expected_version=s5.state_version, new_status=LifecycleStatus.REPORT_READY)
+        s2 = await store.atransition(curr_state, expected_version=curr_state.state_version, new_status=LifecycleStatus.READY)
+        s3 = await store.atransition(s2, expected_version=s2.state_version, new_status=LifecycleStatus.STAGE_ACTIVE)
+        s4 = await store.atransition(s3, expected_version=s3.state_version, new_status=LifecycleStatus.DIALOGUE_COMPLETED)
+        s5 = await store.atransition(s4, expected_version=s4.state_version, new_status=LifecycleStatus.ASSESSING)
+        await store.atransition(s5, expected_version=s5.state_version, new_status=LifecycleStatus.REPORT_READY)
 
         # Now report should return 200 OK
         ready_rep = await ac.get(f"/api/v1/sessions/{sess_id}/report", headers=headers)

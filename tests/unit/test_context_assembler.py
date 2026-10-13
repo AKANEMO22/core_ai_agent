@@ -226,3 +226,35 @@ def test_context_assembler_truncates_huge_candidate_turn_under_budget():
     assert "Senior Architect" in prompt
     assert "Storage Engine" in prompt
 
+
+
+def test_context_assembler_renders_retrieved_competencies_and_key_questions():
+    """Verify retrieval-grounded stage fields are rendered and survive profile/intel truncation."""
+    assembler = ContextAssembler(max_tokens=300)
+    spec = {"interviewer_persona": "Tech Lead", "tone": "direct", "knowledge_scope": ["Caching"]}
+    stage = {
+        "stage_id": "technical",
+        "name": "Technical Depth",
+        "goals": ["Probe distributed systems depth"],
+        "criteria_labels": ["Concurrency & Distributed Systems", "Data Modeling & Storage"],
+        "question_candidates": [
+            {"question_id": "q1", "text": "How would you prevent a cache stampede?"},
+            {"question_id": "q2", "text": "How do you guarantee exactly-once payments?"},
+            {"question_id": "q3", "text": "How do you diagnose a slow query?"},
+            {"question_id": "q4", "text": "FOURTH QUESTION SHOULD NOT APPEAR"},
+            "not-a-dict",
+        ],
+    }
+    profile = {"claims": ["Long claim " * 40], "strengths": ["Python"]}
+    intel = {"notes": "Research note " * 40}
+
+    prompt = assembler.assemble_prompt(
+        spec=spec, stage=stage, profile=profile, company_intel=intel, recent_turns=[]
+    )
+
+    assert "- Competencies to Evidence: Concurrency & Distributed Systems, Data Modeling & Storage" in prompt
+    assert "1. How would you prevent a cache stampede?" in prompt
+    assert "3. How do you diagnose a slow query?" in prompt
+    assert "FOURTH QUESTION" not in prompt
+    assert "Research note" not in prompt
+    assert assembler.estimate_tokens(prompt) <= 300

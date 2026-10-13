@@ -1,0 +1,1089 @@
+{
+  "schema_version": "1.0",
+  "description": "Fictional fixture corpus for MockRetrievalClient. Not real company or hiring data.",
+  "chunks": [
+    {
+      "chunk_id": "rub_be_system_design",
+      "collection": "rubric",
+      "content": "Ability to design services that meet functional and non-functional requirements at scale.",
+      "source": "mock://rubric/be_system_design",
+      "metadata": {
+        "competency": "be_system_design",
+        "name": "System Design & Scalability",
+        "role_family": "backend",
+        "levels": [
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.25,
+        "must_have": true,
+        "pass_level": 3,
+        "anchors": {
+          "1": "Cannot decompose the problem; no discussion of components, data flow or scale.",
+          "2": "Proposes a basic single-node design; misses bottlenecks, failure modes or capacity estimates.",
+          "3": "Clear component design with capacity estimates, identifies bottlenecks and justifies trade-offs.",
+          "4": "Drives the design end to end, quantifies trade-offs, covers failure modes, evolution and operability."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_be_distributed_systems",
+      "collection": "rubric",
+      "content": "Reasoning about concurrency, idempotency, consistency and partial failure across services.",
+      "source": "mock://rubric/be_distributed_systems",
+      "metadata": {
+        "competency": "be_distributed_systems",
+        "name": "Concurrency & Distributed Systems",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.2,
+        "must_have": true,
+        "pass_level": 3,
+        "anchors": {
+          "1": "Unaware of concurrency hazards such as races, retries or partial failure.",
+          "2": "Names concepts (locks, retries) but applies them incorrectly or without guarantees.",
+          "3": "Correctly reasons about idempotency, ordering, consistency and failure handling for the scenario.",
+          "4": "Explains guarantees precisely, compares alternatives, anticipates edge cases like clock skew and split brain."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_be_data_storage",
+      "collection": "rubric",
+      "content": "Choosing data stores, schemas and indexes from access patterns; diagnosing query performance.",
+      "source": "mock://rubric/be_data_storage",
+      "metadata": {
+        "competency": "be_data_storage",
+        "name": "Data Modeling & Storage",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.15,
+        "must_have": false,
+        "pass_level": 3,
+        "anchors": {
+          "1": "Cannot explain how data is stored or queried beyond CRUD.",
+          "2": "Knows indexes and basic schema design but cannot diagnose performance issues.",
+          "3": "Chooses storage and indexes from access patterns, diagnoses slow queries with evidence.",
+          "4": "Reasons about partitioning, consistency, migrations and cost at scale with concrete examples."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_be_code_quality",
+      "collection": "rubric",
+      "content": "Systematic debugging, test strategy and engineering practices that keep systems reliable.",
+      "source": "mock://rubric/be_code_quality",
+      "metadata": {
+        "competency": "be_code_quality",
+        "name": "Code Quality, Testing & Debugging",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.15,
+        "must_have": false,
+        "pass_level": 3,
+        "anchors": {
+          "1": "No structured approach to testing or debugging.",
+          "2": "Writes tests ad hoc; debugging relies on trial and error.",
+          "3": "Systematic debugging, layered test strategy, prevents regressions after incidents.",
+          "4": "Sets team-level quality practices, designs for testability and observability from the start."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_fe_web_fundamentals",
+      "collection": "rubric",
+      "content": "Understanding of the browser runtime: event loop, rendering pipeline, networking and the DOM.",
+      "source": "mock://rubric/fe_web_fundamentals",
+      "metadata": {
+        "competency": "fe_web_fundamentals",
+        "name": "Web Platform Fundamentals",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.25,
+        "must_have": true,
+        "pass_level": 3,
+        "anchors": {
+          "1": "Cannot explain how the browser executes or renders code.",
+          "2": "Partial understanding of the event loop or rendering pipeline with notable gaps.",
+          "3": "Accurately explains event loop, rendering and networking and applies them to real bugs.",
+          "4": "Deep platform knowledge; predicts performance and correctness consequences precisely."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_fe_ui_architecture",
+      "collection": "rubric",
+      "content": "Structuring components and application state for maintainability and scale.",
+      "source": "mock://rubric/fe_ui_architecture",
+      "metadata": {
+        "competency": "fe_ui_architecture",
+        "name": "UI Architecture & State Management",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.25,
+        "must_have": false,
+        "pass_level": 3,
+        "anchors": {
+          "1": "No reasoning about component boundaries or state ownership.",
+          "2": "Uses a state library but cannot justify where state lives.",
+          "3": "Designs component boundaries and state flow from requirements with clear trade-offs.",
+          "4": "Designs for scale, offline, collaboration and team ownership; anticipates evolution."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_fe_performance",
+      "collection": "rubric",
+      "content": "Measuring and improving runtime performance and building accessible interfaces.",
+      "source": "mock://rubric/fe_performance",
+      "metadata": {
+        "competency": "fe_performance",
+        "name": "Performance & Accessibility",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.2,
+        "must_have": false,
+        "pass_level": 3,
+        "anchors": {
+          "1": "No method for finding performance or accessibility problems.",
+          "2": "Knows common tips but lacks a measurement-driven approach.",
+          "3": "Measures first, fixes root causes, and covers keyboard and screen-reader access.",
+          "4": "Builds performance budgets and accessibility checks into the delivery process."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_beh_communication",
+      "collection": "rubric",
+      "content": "Clarity, structure and audience awareness when explaining work and reasoning.",
+      "source": "mock://rubric/beh_communication",
+      "metadata": {
+        "competency": "beh_communication",
+        "name": "Communication & Structured Thinking",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.1,
+        "must_have": false,
+        "pass_level": 3,
+        "anchors": {
+          "1": "Answers are disorganized or do not address the question.",
+          "2": "Understandable but rambling; key points must be extracted by the interviewer.",
+          "3": "Structured, concise answers that state context, approach and outcome.",
+          "4": "Adapts explanation to the audience, checks understanding, and makes complex ideas simple."
+        }
+      }
+    },
+    {
+      "chunk_id": "rub_beh_ownership",
+      "collection": "rubric",
+      "content": "Taking responsibility, collaborating through disagreement and learning from setbacks (STAR evidence).",
+      "source": "mock://rubric/beh_ownership",
+      "metadata": {
+        "competency": "beh_ownership",
+        "name": "Ownership & Collaboration",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "weight": 0.15,
+        "must_have": false,
+        "pass_level": 3,
+        "anchors": {
+          "1": "Cannot give a concrete example or deflects responsibility.",
+          "2": "Gives an example but personal contribution and outcome are vague.",
+          "3": "Concrete STAR example with clear personal actions, measurable outcome and reflection.",
+          "4": "Shows ownership beyond own scope, handles conflict constructively, and generalizes lessons."
+        }
+      }
+    },
+    {
+      "chunk_id": "rp_backend_junior",
+      "collection": "role_profile",
+      "content": "Junior backend engineers implement well-scoped features with guidance, write tested code and learn the service landscape.",
+      "source": "mock://role_profile/backend/junior",
+      "metadata": {
+        "role_family": "backend",
+        "level": "junior",
+        "competencies": [
+          "be_code_quality",
+          "be_data_storage",
+          "be_distributed_systems",
+          "beh_communication",
+          "beh_ownership"
+        ],
+        "pass_threshold": 2.5,
+        "rubric_version": "backend_junior_v1"
+      }
+    },
+    {
+      "chunk_id": "rp_backend_mid",
+      "collection": "role_profile",
+      "content": "Mid-level backend engineers own features end to end, make sound local design decisions and handle production issues.",
+      "source": "mock://role_profile/backend/mid",
+      "metadata": {
+        "role_family": "backend",
+        "level": "mid",
+        "competencies": [
+          "be_system_design",
+          "be_distributed_systems",
+          "be_data_storage",
+          "be_code_quality",
+          "beh_communication",
+          "beh_ownership"
+        ],
+        "pass_threshold": 2.75,
+        "rubric_version": "backend_mid_v1"
+      }
+    },
+    {
+      "chunk_id": "rp_backend_senior",
+      "collection": "role_profile",
+      "content": "Senior backend engineers design services, lead technical decisions across a team and raise the quality bar.",
+      "source": "mock://role_profile/backend/senior",
+      "metadata": {
+        "role_family": "backend",
+        "level": "senior",
+        "competencies": [
+          "be_system_design",
+          "be_distributed_systems",
+          "be_data_storage",
+          "be_code_quality",
+          "beh_communication",
+          "beh_ownership"
+        ],
+        "pass_threshold": 3.0,
+        "rubric_version": "backend_senior_v1"
+      }
+    },
+    {
+      "chunk_id": "rp_backend_staff",
+      "collection": "role_profile",
+      "content": "Staff backend engineers shape architecture across teams, resolve ambiguous problems and mentor senior engineers.",
+      "source": "mock://role_profile/backend/staff",
+      "metadata": {
+        "role_family": "backend",
+        "level": "staff",
+        "competencies": [
+          "be_system_design",
+          "be_distributed_systems",
+          "be_data_storage",
+          "be_code_quality",
+          "beh_communication",
+          "beh_ownership"
+        ],
+        "pass_threshold": 3.25,
+        "rubric_version": "backend_staff_v1"
+      }
+    },
+    {
+      "chunk_id": "rp_frontend_mid",
+      "collection": "role_profile",
+      "content": "Mid-level frontend engineers deliver complex UI features, reason about state and performance and collaborate with design.",
+      "source": "mock://role_profile/frontend/mid",
+      "metadata": {
+        "role_family": "frontend",
+        "level": "mid",
+        "competencies": [
+          "fe_web_fundamentals",
+          "fe_ui_architecture",
+          "fe_performance",
+          "beh_communication",
+          "beh_ownership"
+        ],
+        "pass_threshold": 2.75,
+        "rubric_version": "frontend_mid_v1"
+      }
+    },
+    {
+      "chunk_id": "rp_frontend_senior",
+      "collection": "role_profile",
+      "content": "Senior frontend engineers own application architecture, performance budgets and accessibility standards.",
+      "source": "mock://role_profile/frontend/senior",
+      "metadata": {
+        "role_family": "frontend",
+        "level": "senior",
+        "competencies": [
+          "fe_web_fundamentals",
+          "fe_ui_architecture",
+          "fe_performance",
+          "beh_communication",
+          "beh_ownership"
+        ],
+        "pass_threshold": 3.0,
+        "rubric_version": "frontend_senior_v1"
+      }
+    },
+    {
+      "chunk_id": "q_warmup_project",
+      "collection": "question_bank",
+      "content": "Walk me through a recent project you are proud of: the problem, your role, and the key technical decisions.",
+      "source": "mock://question_bank/q_warmup_project",
+      "metadata": {
+        "question_id": "q_warmup_project",
+        "competency": "beh_communication",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "warmup",
+        "difficulty": 1,
+        "expected_points": [
+          "Clear problem statement",
+          "Explicit personal role",
+          "One or two key decisions with rationale",
+          "Outcome or impact"
+        ],
+        "follow_ups": [
+          "What would you do differently if you started again?",
+          "Which decision was the hardest and why?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_warmup_stack",
+      "collection": "question_bank",
+      "content": "Describe the architecture of the system you work on today and where your code sits in it.",
+      "source": "mock://question_bank/q_warmup_stack",
+      "metadata": {
+        "question_id": "q_warmup_stack",
+        "competency": "beh_communication",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "warmup",
+        "difficulty": 1,
+        "expected_points": [
+          "Main components and data flow",
+          "Own area of ownership",
+          "Key dependencies"
+        ],
+        "follow_ups": [
+          "What is the biggest bottleneck in that system?",
+          "How is it deployed and monitored?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_warmup_frontend",
+      "collection": "question_bank",
+      "content": "Describe the frontend application you work on today: its stack, its users, and the part you own.",
+      "source": "mock://question_bank/q_warmup_frontend",
+      "metadata": {
+        "question_id": "q_warmup_frontend",
+        "competency": "beh_communication",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "warmup",
+        "difficulty": 1,
+        "expected_points": [
+          "Stack and architecture",
+          "Users and constraints",
+          "Own area of ownership"
+        ],
+        "follow_ups": [
+          "What is the most painful part of that codebase?",
+          "How do you release changes?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_sd_url_shortener",
+      "collection": "question_bank",
+      "content": "Design a URL shortening service that handles 10 thousand writes and 1 million reads per second. Walk me through the APIs, storage and scaling.",
+      "source": "mock://question_bank/q_be_sd_url_shortener",
+      "metadata": {
+        "question_id": "q_be_sd_url_shortener",
+        "competency": "be_system_design",
+        "role_family": "backend",
+        "levels": [
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "system_design",
+        "difficulty": 3,
+        "expected_points": [
+          "Capacity estimates",
+          "Key generation strategy and collisions",
+          "Read-heavy caching strategy",
+          "Storage choice and partitioning",
+          "Failure handling"
+        ],
+        "follow_ups": [
+          "How do you generate unique keys without a single point of failure?",
+          "What changes if links must expire?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_sd_notifications",
+      "collection": "question_bank",
+      "content": "Design a notification system that fans out to email, push and SMS with per-user rate limits and delivery guarantees.",
+      "source": "mock://question_bank/q_be_sd_notifications",
+      "metadata": {
+        "question_id": "q_be_sd_notifications",
+        "competency": "be_system_design",
+        "role_family": "backend",
+        "levels": [
+          "senior",
+          "staff"
+        ],
+        "stage_type": "system_design",
+        "difficulty": 4,
+        "expected_points": [
+          "Queue-based fan-out",
+          "Per-channel workers and retries",
+          "Rate limiting per user",
+          "Idempotent delivery and deduplication",
+          "Observability"
+        ],
+        "follow_ups": [
+          "How do you avoid sending duplicates after a worker crash?",
+          "How would you prioritize urgent notifications?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_sd_tradeoff",
+      "collection": "question_bank",
+      "content": "Tell me about an architecture trade-off you made in production. Which alternatives did you reject and why?",
+      "source": "mock://question_bank/q_be_sd_tradeoff",
+      "metadata": {
+        "question_id": "q_be_sd_tradeoff",
+        "competency": "be_system_design",
+        "role_family": "backend",
+        "levels": [
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 3,
+        "expected_points": [
+          "Concrete context and constraints",
+          "At least two alternatives compared",
+          "Explicit decision criteria",
+          "Outcome and hindsight"
+        ],
+        "follow_ups": [
+          "How did you validate the decision after launch?",
+          "What would make you revisit it?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_dist_cache_stampede",
+      "collection": "question_bank",
+      "content": "How would you prevent a cache stampede when a hot key expires under heavy traffic?",
+      "source": "mock://question_bank/q_be_dist_cache_stampede",
+      "metadata": {
+        "question_id": "q_be_dist_cache_stampede",
+        "competency": "be_distributed_systems",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 3,
+        "expected_points": [
+          "Request coalescing or single-flight",
+          "Probabilistic early expiration or jitter",
+          "Stale-while-revalidate",
+          "Lock with timeout and fallback"
+        ],
+        "follow_ups": [
+          "What happens if the process holding the lock dies?",
+          "How would you detect a stampede in production?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_dist_idempotency",
+      "collection": "question_bank",
+      "content": "A payment API is called with retries over an unreliable network. How do you guarantee each payment is processed exactly once?",
+      "source": "mock://question_bank/q_be_dist_idempotency",
+      "metadata": {
+        "question_id": "q_be_dist_idempotency",
+        "competency": "be_distributed_systems",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 3,
+        "expected_points": [
+          "Idempotency keys",
+          "Atomic check-and-record",
+          "Handling in-flight duplicates",
+          "At-least-once delivery plus deduplication"
+        ],
+        "follow_ups": [
+          "Where do you store idempotency keys and for how long?",
+          "What if the downstream provider is not idempotent?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_dist_locks",
+      "collection": "question_bank",
+      "content": "When is a distributed lock the wrong tool, and how would you coordinate workers without one?",
+      "source": "mock://question_bank/q_be_dist_locks",
+      "metadata": {
+        "question_id": "q_be_dist_locks",
+        "competency": "be_distributed_systems",
+        "role_family": "backend",
+        "levels": [
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 4,
+        "expected_points": [
+          "Lock pitfalls: expiry, GC pauses, clock skew",
+          "Fencing tokens",
+          "Partitioning or ownership by key",
+          "Optimistic concurrency"
+        ],
+        "follow_ups": [
+          "How do fencing tokens protect the resource?",
+          "How would you rebalance ownership when workers join or leave?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_data_indexing",
+      "collection": "question_bank",
+      "content": "A query on a 200 million row orders table became slow. How do you diagnose it and which indexing options would you consider?",
+      "source": "mock://question_bank/q_be_data_indexing",
+      "metadata": {
+        "question_id": "q_be_data_indexing",
+        "competency": "be_data_storage",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 2,
+        "expected_points": [
+          "Query plan inspection",
+          "Composite index column order",
+          "Covering indexes",
+          "Write amplification trade-off"
+        ],
+        "follow_ups": [
+          "How would you add the index without downtime?",
+          "When would you partition the table instead?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_data_sql_nosql",
+      "collection": "question_bank",
+      "content": "How do you decide between a relational database and a document store for a new service? Give a concrete example.",
+      "source": "mock://question_bank/q_be_data_sql_nosql",
+      "metadata": {
+        "question_id": "q_be_data_sql_nosql",
+        "competency": "be_data_storage",
+        "role_family": "backend",
+        "levels": [
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 3,
+        "expected_points": [
+          "Access patterns drive the choice",
+          "Consistency and transaction needs",
+          "Schema evolution",
+          "Operational cost"
+        ],
+        "follow_ups": [
+          "How would you migrate if the choice turned out wrong?",
+          "How do you handle reporting queries?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_cq_debugging",
+      "collection": "question_bank",
+      "content": "Tell me about the hardest production bug you debugged. How did you narrow it down and what did you change afterwards?",
+      "source": "mock://question_bank/q_be_cq_debugging",
+      "metadata": {
+        "question_id": "q_be_cq_debugging",
+        "competency": "be_code_quality",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 2,
+        "expected_points": [
+          "Hypothesis-driven investigation",
+          "Use of logs, metrics or traces",
+          "Root cause, not symptom",
+          "Regression prevention"
+        ],
+        "follow_ups": [
+          "What signal would have caught it earlier?",
+          "How did you verify the fix?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_be_cq_testing",
+      "collection": "question_bank",
+      "content": "How do you structure tests for a service that depends on a database and two external APIs?",
+      "source": "mock://question_bank/q_be_cq_testing",
+      "metadata": {
+        "question_id": "q_be_cq_testing",
+        "competency": "be_code_quality",
+        "role_family": "backend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 2,
+        "expected_points": [
+          "Test pyramid with clear layers",
+          "Real database in integration tests",
+          "Contract tests or fakes for external APIs",
+          "Deterministic, fast feedback"
+        ],
+        "follow_ups": [
+          "How do you keep integration tests from becoming flaky?",
+          "What do you deliberately not test?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_fe_event_loop",
+      "collection": "question_bank",
+      "content": "Explain how the browser event loop handles a click handler that triggers a fetch and a setTimeout.",
+      "source": "mock://question_bank/q_fe_event_loop",
+      "metadata": {
+        "question_id": "q_fe_event_loop",
+        "competency": "fe_web_fundamentals",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 3,
+        "expected_points": [
+          "Call stack and task queue",
+          "Microtasks versus macrotasks",
+          "Promise resolution ordering",
+          "Rendering opportunities"
+        ],
+        "follow_ups": [
+          "Where does requestAnimationFrame fit?",
+          "How can a long task hurt input responsiveness?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_fe_first_paint",
+      "collection": "question_bank",
+      "content": "What happens between typing a URL and the first paint, and where can a frontend engineer influence it?",
+      "source": "mock://question_bank/q_fe_first_paint",
+      "metadata": {
+        "question_id": "q_fe_first_paint",
+        "competency": "fe_web_fundamentals",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 2,
+        "expected_points": [
+          "DNS, TLS and HTTP",
+          "Critical rendering path",
+          "Render-blocking resources",
+          "Caching and preloading"
+        ],
+        "follow_ups": [
+          "How would you measure it for real users?",
+          "What changes with server-side rendering?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_fe_collab_state",
+      "collection": "question_bank",
+      "content": "Design the state management for a collaborative document editor with offline support.",
+      "source": "mock://question_bank/q_fe_collab_state",
+      "metadata": {
+        "question_id": "q_fe_collab_state",
+        "competency": "fe_ui_architecture",
+        "role_family": "frontend",
+        "levels": [
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "system_design",
+        "difficulty": 4,
+        "expected_points": [
+          "Local-first state model",
+          "Conflict resolution strategy (OT or CRDT)",
+          "Sync protocol and persistence",
+          "UI consistency during sync"
+        ],
+        "follow_ups": [
+          "How do you show conflicting edits to the user?",
+          "How do you test sync edge cases?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_fe_component_boundaries",
+      "collection": "question_bank",
+      "content": "How do you decide component boundaries and where state lives in a large React application?",
+      "source": "mock://question_bank/q_fe_component_boundaries",
+      "metadata": {
+        "question_id": "q_fe_component_boundaries",
+        "competency": "fe_ui_architecture",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 2,
+        "expected_points": [
+          "Colocate state with usage",
+          "Lift state only when shared",
+          "Server state versus client state",
+          "Composition over configuration"
+        ],
+        "follow_ups": [
+          "When would you introduce a global store?",
+          "How do you prevent unnecessary re-renders?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_fe_interaction_delay",
+      "collection": "question_bank",
+      "content": "A page has a four second interaction delay on low-end phones. How do you find and fix the cause?",
+      "source": "mock://question_bank/q_fe_interaction_delay",
+      "metadata": {
+        "question_id": "q_fe_interaction_delay",
+        "competency": "fe_performance",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 3,
+        "expected_points": [
+          "Profile on a representative device",
+          "Identify long tasks",
+          "Code splitting or deferring work",
+          "Verify with field metrics"
+        ],
+        "follow_ups": [
+          "Which metric would you track after the fix?",
+          "How do you stop it from regressing?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_fe_accessible_dropdown",
+      "collection": "question_bank",
+      "content": "How do you make a custom dropdown component accessible to keyboard and screen-reader users?",
+      "source": "mock://question_bank/q_fe_accessible_dropdown",
+      "metadata": {
+        "question_id": "q_fe_accessible_dropdown",
+        "competency": "fe_performance",
+        "role_family": "frontend",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "technical",
+        "difficulty": 2,
+        "expected_points": [
+          "Native element first",
+          "ARIA roles and states",
+          "Keyboard interaction model",
+          "Focus management"
+        ],
+        "follow_ups": [
+          "How would you test it?",
+          "What are common ARIA mistakes?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_beh_disagreement",
+      "collection": "question_bank",
+      "content": "Tell me about a time you disagreed with a teammate or manager on a technical decision. What happened?",
+      "source": "mock://question_bank/q_beh_disagreement",
+      "metadata": {
+        "question_id": "q_beh_disagreement",
+        "competency": "beh_ownership",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "behavioral",
+        "difficulty": 2,
+        "expected_points": [
+          "Situation and stakes",
+          "How the disagreement was raised",
+          "Personal actions",
+          "Outcome and relationship afterwards"
+        ],
+        "follow_ups": [
+          "What would you do if the decision went against you?",
+          "What did you learn about influencing others?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_beh_setback",
+      "collection": "question_bank",
+      "content": "Describe a project that did not go as planned. What was your part in it and what did you learn?",
+      "source": "mock://question_bank/q_beh_setback",
+      "metadata": {
+        "question_id": "q_beh_setback",
+        "competency": "beh_ownership",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "behavioral",
+        "difficulty": 2,
+        "expected_points": [
+          "Honest account of what went wrong",
+          "Own contribution acknowledged",
+          "Corrective actions",
+          "Lesson applied later"
+        ],
+        "follow_ups": [
+          "How did you communicate the problem to stakeholders?",
+          "What early signal did you miss?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_beh_explain_concept",
+      "collection": "question_bank",
+      "content": "Explain a complex technical concept from your work as if I were a new product manager on the team.",
+      "source": "mock://question_bank/q_beh_explain_concept",
+      "metadata": {
+        "question_id": "q_beh_explain_concept",
+        "competency": "beh_communication",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "behavioral",
+        "difficulty": 2,
+        "expected_points": [
+          "Avoids jargon",
+          "Uses analogy or example",
+          "Connects to user or business impact",
+          "Checks understanding"
+        ],
+        "follow_ups": [
+          "How would you explain the risks of that approach?",
+          "What question would a PM likely ask next?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "q_wrapup_questions",
+      "collection": "question_bank",
+      "content": "What questions do you have for me about the team, the role, or how we work?",
+      "source": "mock://question_bank/q_wrapup_questions",
+      "metadata": {
+        "question_id": "q_wrapup_questions",
+        "competency": "beh_communication",
+        "role_family": "any",
+        "levels": [
+          "junior",
+          "mid",
+          "senior",
+          "staff"
+        ],
+        "stage_type": "wrapup",
+        "difficulty": 1,
+        "expected_points": [
+          "Thoughtful, role-specific questions",
+          "Signals what matters to the candidate"
+        ],
+        "follow_ups": [
+          "What would make this role a great fit for you?"
+        ]
+      }
+    },
+    {
+      "chunk_id": "ck_acme_culture",
+      "collection": "company_knowledge",
+      "content": "Acme Systems values engineering rigor, written design reviews and blameless postmortems. Teams own services end to end, including on-call.",
+      "source": "mock://company_knowledge/ck_acme_culture",
+      "metadata": {
+        "company": "acme systems",
+        "topic": "culture",
+        "confidence": 0.8
+      }
+    },
+    {
+      "chunk_id": "ck_acme_stack",
+      "collection": "company_knowledge",
+      "content": "Acme Systems runs Python and Go services on Kubernetes, with PostgreSQL, Redis and Kafka as core infrastructure.",
+      "source": "mock://company_knowledge/ck_acme_stack",
+      "metadata": {
+        "company": "acme systems",
+        "topic": "tech_stack",
+        "confidence": 0.75
+      }
+    },
+    {
+      "chunk_id": "ck_acme_interview",
+      "collection": "company_knowledge",
+      "content": "Acme Systems interviews emphasize distributed systems reasoning, incident handling and clear trade-off communication.",
+      "source": "mock://company_knowledge/ck_acme_interview",
+      "metadata": {
+        "company": "acme systems",
+        "topic": "interview_style",
+        "confidence": 0.6
+      }
+    },
+    {
+      "chunk_id": "ck_techcorp_culture",
+      "collection": "company_knowledge",
+      "content": "TechCorp emphasizes pragmatic engineering, strong testing discipline and incremental delivery.",
+      "source": "mock://company_knowledge/ck_techcorp_culture",
+      "metadata": {
+        "company": "techcorp",
+        "topic": "culture",
+        "confidence": 0.8
+      }
+    },
+    {
+      "chunk_id": "ck_techcorp_stack",
+      "collection": "company_knowledge",
+      "content": "TechCorp builds event-driven systems with Python, Go, Kafka, PostgreSQL and Redis, deployed with Docker.",
+      "source": "mock://company_knowledge/ck_techcorp_stack",
+      "metadata": {
+        "company": "techcorp",
+        "topic": "tech_stack",
+        "confidence": 0.75
+      }
+    },
+    {
+      "chunk_id": "ck_generic_interview",
+      "collection": "company_knowledge",
+      "content": "Typical software engineering interviews combine a background walkthrough, technical deep dives, a design exercise and behavioral questions.",
+      "source": "mock://company_knowledge/ck_generic_interview",
+      "metadata": {
+        "company": "generic",
+        "topic": "interview_style",
+        "confidence": 0.5
+      }
+    },
+    {
+      "chunk_id": "ck_generic_expectations",
+      "collection": "company_knowledge",
+      "content": "Hiring teams generally look for clear reasoning, ownership of outcomes and the ability to explain trade-offs.",
+      "source": "mock://company_knowledge/ck_generic_expectations",
+      "metadata": {
+        "company": "generic",
+        "topic": "culture",
+        "confidence": 0.5
+      }
+    }
+  ]
+}

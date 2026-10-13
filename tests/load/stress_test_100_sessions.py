@@ -34,7 +34,7 @@ from api.auth import create_service_token
 from api.main import create_app
 from config.settings import get_settings
 from core.assessor.worker import AssessorWorker
-from core.runtime.providers.mock import MockLLMClient
+from core.runtime.providers.scripted import ScriptedInterviewLLM
 from core.session.state import LifecycleStatus
 
 logger = logging.getLogger(__name__)
@@ -155,7 +155,7 @@ async def prepare_session(
         # Wait for background profiling to reach READY
         state_mgr = app.state.state_mgr
         for _ in range(100):
-            st = state_mgr.get_state(session_id)
+            st = await state_mgr.aget(session_id)
             if st and st.status == LifecycleStatus.READY:
                 break
             await asyncio.sleep(0.01)
@@ -168,10 +168,14 @@ async def prepare_session(
         )
         await ws.connect(timeout=10.0)
 
-        # Pre-warm session runner in registry
-        get_runner = getattr(app.state, "get_runner", None)
-        if get_runner is not None:
-            await get_runner(session_id)
+        # Start the interview (opening question, turn 0) before the measured turn
+        await ws.send_json({"type": "start_interview"})
+        for _ in range(50):
+            frame = await ws.receive_json(timeout=10.0)
+            if frame.get("type") in ("turn_complete", "error", "busy"):
+                if frame.get("type") != "turn_complete":
+                    return None, None, f"Opening failed: {frame.get('payload')}"
+                break
 
         return session_id, ws, None
     except Exception as e:
@@ -202,6 +206,7 @@ async def execute_session_turn(
         turn_start = time.perf_counter()
         await ws.send_json({
             "type": "candidate_answer",
+            "message_id": f"load-{session_index}-1",
             "candidate_answer": (
                 f"Candidate {session_index} answering: in distributed systems, "
                 "we handle consensus via Raft and use Redis for fast atomic locking."
@@ -229,8 +234,8 @@ async def execute_session_turn(
                     tokens_received += 1
                 elif frame_type in ("complete", "turn_complete"):
                     break
-                elif frame_type == "error":
-                    result["error"] = f"Turn error frame: {frame.get('payload')}"
+                elif frame_type in ("error", "busy"):
+                    result["error"] = f"Turn {frame_type} frame: {frame.get('payload')}"
                     break
             except (asyncio.TimeoutError, ConnectionResetError) as e:
                 result["error"] = f"WebSocket receive error: {e}"
@@ -281,20 +286,11 @@ async def run_benchmark(
 
     fake_r = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
-    mock_llm = MockLLMClient(
-        canned_tokens=["Concurrency", " test", " response", " verified."],
-        canned_json_responses={
-            "company_intel": {"company": "Scale Systems"},
-            "candidate_profile": {"strengths": ["Scalability"]},
-            "interview_spec": {"interviewer_persona": "Interviewer"},
-            "stage_plan": {"stages": [{"stage_id": "warmup", "name": "Warmup", "target_turns": 1}]},
-            "assessment": {
-                "content_score": 9,
-                "communication_score": 8,
-                "strengths": ["Clear latency reasoning"],
-                "improvements": [],
-            },
-        },
+    # Scripted provider: answers every structured prompt (orchestrator, evaluator v2, subagents),
+    # so the control plane and evaluator fan-out run during the benchmark.
+    mock_llm = ScriptedInterviewLLM(
+        speaker_tokens=["Concurrency", " test", " response", " verified."],
+        stage_plan={"stages": [{"stage_id": "warmup", "name": "Warmup", "target_turns": 1}]},
     )
 
     app = create_app(
@@ -419,7 +415,19 @@ async def run_benchmark(
     drop_rate = (len(failed) / concurrency) * 100.0
     assessor_throughput = total_processed / assessor_duration if assessor_duration > 0 else 0
 
+    metrics = app.state.metrics
+    directive_on_time = sum(
+        metrics.counter_value("directive_ready_total", {"source": src, "on_time": "true"})
+        for src in ("orchestrator", "fallback")
+    )
+    directive_total = directive_on_time + sum(
+        metrics.counter_value("directive_ready_total", {"source": src, "on_time": "false"})
+        for src in ("orchestrator", "fallback")
+    )
     report = {
+        "directive_ready_total": directive_total,
+        "directive_on_time_ratio": round(directive_on_time / directive_total, 4) if directive_total else None,
+        "server_ttft_p95_sec": metrics.quantile("ttft_seconds", 0.95),
         "concurrency": concurrency,
         "total_sessions": concurrency,
         "successful_sessions": len(successful),
@@ -461,6 +469,7 @@ async def run_benchmark(
     print(f" Turn Streaming Phase:      {report['turn_phase_duration_sec']} s")
     print(f" Assessor Queue Drained:    {report['assessor_jobs_processed']} jobs in {report['assessor_duration_sec']} s")
     print(f" Assessor Throughput:       {report['assessor_throughput_jobs_per_sec']} jobs/s")
+    print(f" Directives (on time):      {report['directive_ready_total']} ({report['directive_on_time_ratio']})")
     print(f" Memory Delta:              +{report['memory_delta_mb']} MB (Peak: {report['memory_peak_mb']} MB)")
     print(f" Total Benchmark Time:      {report['total_benchmark_duration_sec']} s")
     print("=" * 70 + "\n")

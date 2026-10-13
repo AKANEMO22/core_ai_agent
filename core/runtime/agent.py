@@ -9,40 +9,17 @@ import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from core.runtime.client import RuntimeLLMClient
+from core.runtime.compaction import ContextCompactor, strip_private_keys
+from core.runtime.hooks import HookBus, HookContext, HookEvent
+from core.runtime.policy import ToolPolicy
+from core.runtime.profiles import AgentProfile
+from core.runtime.sanitize import sanitize_secrets  # noqa: F401  (re-exported)
 from core.runtime.tooling import RuntimeTool
 from core.runtime.types import IterationChunk, LoopEvent, LoopEventType, LoopStatus
 from core.workspace.session import SessionWorkspace
 from core.workspace.spill import WorkspaceSpillManager
 
 logger = logging.getLogger(__name__)
-
-
-def sanitize_secrets(text: str) -> str:
-    """Mask API keys, bearer tokens, and secrets from user-visible errors and metrics.
-
-    Args:
-        text: Raw input message or error text.
-
-    Returns:
-        str: Scrubbed text with sensitive credentials redacted.
-    """
-    if not isinstance(text, str):
-        return text
-
-    sanitized = re.sub(r"sk-[a-zA-Z0-9_\-]{10,}", "[REDACTED_API_KEY]", text)
-    sanitized = re.sub(
-        r"(Bearer\s+)[a-zA-Z0-9_\-\.]{10,}",
-        r"\1[REDACTED_TOKEN]",
-        sanitized,
-        flags=re.IGNORECASE,
-    )
-    sanitized = re.sub(
-        r"(api[_-]?key|secret|password|token)\s*[:=]\s*['\"]?([a-zA-Z0-9_\-]{8,})['\"]?",
-        r"\1=[REDACTED]",
-        sanitized,
-        flags=re.IGNORECASE,
-    )
-    return sanitized
 
 
 class RuntimeAgent:
@@ -62,6 +39,12 @@ class RuntimeAgent:
         max_iterations: Hard upper bound on tool execution iterations per turn.
         schema_repair_budget: Max retry attempts allowed for model schema violations.
         transient_retry_budget: Max transient retry attempts for failing tools.
+        profile: Optional agent profile (model, tool allowlist, deadline, compaction).
+        hooks: Optional hook bus receiving lifecycle events.
+        policy: Tool policy enforcing the profile allowlist.
+        compactor: Optional context compactor applied before model calls.
+        metrics: Optional metrics registry.
+        turn_deadline_seconds: Wall-clock deadline of one loop run (overrides the profile).
     """
 
     def __init__(
@@ -69,18 +52,58 @@ class RuntimeAgent:
         client: RuntimeLLMClient,
         tools: Optional[List[RuntimeTool]] = None,
         workspace: Optional[SessionWorkspace] = None,
-        max_iterations: int = 5,
+        max_iterations: Optional[int] = None,
         schema_repair_budget: int = 1,
         transient_retry_budget: int = 1,
+        profile: Optional[AgentProfile] = None,
+        hooks: Optional[HookBus] = None,
+        policy: Optional[ToolPolicy] = None,
+        compactor: Optional[ContextCompactor] = None,
+        metrics: Optional[Any] = None,
+        turn_deadline_seconds: Optional[float] = None,
     ) -> None:
         self.client = client
         self.tools = tools or []
         self.tools_map: Dict[str, RuntimeTool] = {t.name: t for t in self.tools}
         self.workspace = workspace
-        self.max_iterations = max_iterations
+        self.profile = profile
+        self.max_iterations = (
+            max_iterations if max_iterations is not None else (profile.max_iterations if profile else 5)
+        )
         self.schema_repair_budget = schema_repair_budget
         self.transient_retry_budget = transient_retry_budget
+        self.hooks = hooks
+        self.policy = policy or ToolPolicy()
+        self.compactor = compactor
+        self.metrics = metrics
+        if turn_deadline_seconds is not None:
+            self.turn_deadline_seconds: Optional[float] = turn_deadline_seconds
+        elif profile is not None:
+            self.turn_deadline_seconds = profile.turn_deadline_ms / 1000
+        else:
+            self.turn_deadline_seconds = None
         self.status = LoopStatus.IDLE
+
+    @property
+    def agent_name(self) -> str:
+        """Profile name used for hooks and metrics."""
+        return self.profile.name if self.profile else "agent"
+
+    async def _emit_hook(self, event: HookEvent, session_id: str, turn_id: str, **data: Any) -> Any:
+        if self.hooks is None:
+            return None
+        return await self.hooks.emit(
+            event,
+            HookContext(event=event, session_id=session_id, turn_id=turn_id, agent=self.agent_name, data=data),
+        )
+
+    def _record_usage(self, usage: Dict[str, Any]) -> None:
+        if self.metrics is None or not usage:
+            return
+        for kind in ("prompt_tokens", "completion_tokens"):
+            value = usage.get(kind)
+            if isinstance(value, (int, float)):
+                self.metrics.inc("llm_tokens_total", float(value), {"agent": self.agent_name, "kind": kind})
 
     async def run_loop_streaming(
         self,
@@ -123,15 +146,53 @@ class RuntimeAgent:
             )
 
         working_messages = list(messages)
-        formatted_tools = [t.to_openai_format() for t in self.tools] if self.tools else None
+        visible_tools = self.policy.visible_tools(self.profile, self.tools)
+        formatted_tools = [t.to_openai_format() for t in visible_tools] if visible_tools else None
         schema_repairs_used = 0
         iteration = 0
         full_response_text = ""
         accumulated_usage: Dict[str, Any] = {}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.turn_deadline_seconds if self.turn_deadline_seconds else None
+        if self.profile is not None:
+            if self.profile.model and "model" not in kwargs:
+                kwargs["model"] = self.profile.model
+            kwargs.setdefault("temperature", self.profile.temperature)
+
+        await self._emit_hook(HookEvent.TURN_START, session_id, turn_id, message_count=len(working_messages))
 
         try:
             while iteration < self.max_iterations:
                 iteration += 1
+
+                # Compact the working context before each model call when the profile asks for it
+                if (
+                    self.compactor is not None
+                    and self.profile is not None
+                    and self.compactor.needs_compaction(
+                        working_messages, self.profile.context_budget_tokens, self.profile.compaction
+                    )
+                ):
+                    await self._emit_hook(HookEvent.BEFORE_COMPACTION, session_id, turn_id)
+                    compaction = await self.compactor.maybe_compact(
+                        working_messages,
+                        self.profile.context_budget_tokens,
+                        self.profile.compaction,
+                        agent=self.agent_name,
+                    )
+                    if compaction.compacted:
+                        working_messages = compaction.messages
+                        if self.metrics is not None:
+                            self.metrics.inc("compactions_total", 1.0, {"agent": self.agent_name})
+                        yield create_event(
+                            LoopEventType.COMPACTION,
+                            {
+                                "steps": compaction.steps,
+                                "tokens_before": compaction.tokens_before,
+                                "tokens_after": compaction.tokens_after,
+                            },
+                        )
+                    await self._emit_hook(HookEvent.AFTER_COMPACTION, session_id, turn_id, steps=compaction.steps)
 
                 # Check cancellation token at iteration start
                 if cancellation_token and cancellation_token.is_set():
@@ -150,14 +211,27 @@ class RuntimeAgent:
 
                 turn_tokens: List[str] = []
                 turn_tool_calls: List[Dict[str, Any]] = []
+                await self._emit_hook(HookEvent.BEFORE_MODEL, session_id, turn_id, iteration=iteration)
 
-                # Stream from LLM provider
+                # Stream from LLM provider under the turn deadline
+                stream = self.client.stream_chat(
+                    messages=strip_private_keys(working_messages),
+                    tools=formatted_tools,
+                    **kwargs,
+                )
+                iterator = stream.__aiter__()
                 try:
-                    async for chunk in self.client.stream_chat(
-                        messages=working_messages,
-                        tools=formatted_tools,
-                        **kwargs,
-                    ):
+                    while True:
+                        remaining = None if deadline is None else deadline - loop.time()
+                        if remaining is not None and remaining <= 0:
+                            raise asyncio.TimeoutError()
+                        try:
+                            if remaining is None:
+                                chunk = await iterator.__anext__()
+                            else:
+                                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+                        except StopAsyncIteration:
+                            break
                         if cancellation_token and cancellation_token.is_set():
                             self.status = LoopStatus.CANCELLED
                             yield create_event(
@@ -188,6 +262,18 @@ class RuntimeAgent:
                         if chunk.usage:
                             accumulated_usage.update(chunk.usage)
 
+                except asyncio.TimeoutError:
+                    self.status = LoopStatus.FAILED
+                    full_response_text += "".join(turn_tokens)
+                    yield create_event(
+                        LoopEventType.ERROR,
+                        {
+                            "error": f"Turn deadline of {self.turn_deadline_seconds}s exceeded",
+                            "code": "TURN_DEADLINE",
+                            "final_response": full_response_text,
+                        },
+                    )
+                    return
                 except asyncio.CancelledError:
                     self.status = LoopStatus.CANCELLED
                     yield create_event(
@@ -197,6 +283,8 @@ class RuntimeAgent:
                     return
                 except Exception as provider_err:
                     self.status = LoopStatus.FAILED
+                    if self.metrics is not None:
+                        self.metrics.inc("provider_errors_total", 1.0, {"agent": self.agent_name})
                     clean_msg = sanitize_secrets(str(provider_err))
                     yield create_event(
                         LoopEventType.ERROR,
@@ -206,13 +294,30 @@ class RuntimeAgent:
                         },
                     )
                     return
+                finally:
+                    aclose = getattr(iterator, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
 
                 turn_text = "".join(turn_tokens)
                 full_response_text += turn_text
+                self._record_usage(accumulated_usage)
+                await self._emit_hook(
+                    HookEvent.AFTER_MODEL,
+                    session_id,
+                    turn_id,
+                    iteration=iteration,
+                    tool_calls=[tc.get("name") for tc in turn_tool_calls],
+                    usage=dict(accumulated_usage),
+                )
 
                 # Case 1: No tool calls emitted -> Generation completed
                 if not turn_tool_calls:
                     self.status = LoopStatus.COMPLETED
+                    await self._emit_hook(HookEvent.TURN_END, session_id, turn_id, status="completed")
                     yield create_event(
                         LoopEventType.COMPLETE,
                         {
@@ -300,6 +405,26 @@ class RuntimeAgent:
                                 "name": tool_name,
                                 "content": error_res,
                             }
+                        )
+                        continue
+
+                    # Policy (profile allowlist) and blocking BEFORE_TOOL hooks may deny execution
+                    decision = self.policy.check(self.profile, tool_name)
+                    deny_reason = None if decision.allowed else decision.reason
+                    if deny_reason is None:
+                        hook_outcome = await self._emit_hook(
+                            HookEvent.BEFORE_TOOL, session_id, turn_id, tool_name=tool_name, arguments=parsed_args
+                        )
+                        if hook_outcome is not None and hook_outcome.denied:
+                            deny_reason = "; ".join(hook_outcome.reasons) or "denied by hook"
+                    if deny_reason is not None:
+                        denied_msg = f"Error: tool call denied ({deny_reason})."
+                        yield create_event(
+                            LoopEventType.TOOL_CALL_RESULT,
+                            {"tool_name": tool_name, "call_id": call_id, "result": denied_msg, "code": "TOOL_DENIED"},
+                        )
+                        working_messages.append(
+                            {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": denied_msg}
                         )
                         continue
 
@@ -428,6 +553,13 @@ class RuntimeAgent:
                             "name": tool_name,
                             "content": tool_content,
                         }
+                    )
+                    await self._emit_hook(
+                        HookEvent.AFTER_TOOL,
+                        session_id,
+                        turn_id,
+                        tool_name=tool_name,
+                        is_spilled=bool(event_payload.get("is_spilled")),
                     )
 
                 # Schema repair budget nudge: if budget exhausted, instruct model to answer directly

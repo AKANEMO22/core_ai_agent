@@ -233,6 +233,26 @@ def verify_session_token(
     return claims
 
 
+class SessionRevocationList:
+    """Redis-backed list of revoked sessions; tokens scoped to them are refused everywhere."""
+
+    def __init__(self, redis_client: Any, ttl_seconds: int = 7 * 24 * 3600) -> None:
+        self.redis = redis_client
+        self.ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def _key(session_id: str) -> str:
+        return f"session:{session_id}:revoked"
+
+    async def revoke(self, session_id: str) -> None:
+        """Revoke every token scoped to a session (kept until tokens can no longer be valid)."""
+        await self.redis.set(self._key(session_id), "1", ex=self.ttl_seconds)
+
+    async def is_revoked(self, session_id: str) -> bool:
+        """True if the session was revoked."""
+        return bool(await self.redis.exists(self._key(session_id)))
+
+
 async def require_service_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme),
 ) -> Dict[str, Any]:

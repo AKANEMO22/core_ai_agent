@@ -192,15 +192,6 @@ def test_websocket_stream_turn_and_envelope_structure(tmp_path):
     sess_id = create_res.json()["session_id"]
     sess_token = create_res.json()["session_token"]
 
-    # Transition state to STAGE_ACTIVE to accept turns
-    curr_state = app.state.state_mgr.get_state(sess_id)
-    app.state.state_mgr.transition(
-        curr_state,
-        expected_version=curr_state.state_version,
-        new_status=LifecycleStatus.STAGE_ACTIVE,
-        current_stage_id="warmup",
-    )
-
     # Connect WebSocket using Authorization header
     with client.websocket_connect(
         f"/ws/sessions/{sess_id}/stream",
@@ -211,9 +202,17 @@ def test_websocket_stream_turn_and_envelope_structure(tmp_path):
         pong = ws.receive_json()
         assert pong["type"] == "pong"
 
-        # 2. Submit candidate answer turn
+        # 2. Start the interview (opening question, turn 0)
+        ws.send_json({"type": "start_interview"})
+        opening = _drain_until(ws, ("turn_complete", "error"))
+        assert opening[0]["type"] == "interview_started"
+        assert opening[-1]["type"] == "turn_complete"
+        assert opening[-1]["turn_id"] == "turn_000"
+
+        # 3. Submit candidate answer turn
         ws.send_json({
             "type": "candidate_answer",
+            "message_id": "msg-envelope-1",
             "candidate_answer": "I have extensive experience with FastAPI, Redis, and event streaming.",
             "vad_metrics": {"wpm": 130},
         })
@@ -298,9 +297,13 @@ def test_websocket_multi_turn_monotonic_sequence(tmp_path):
         f"/ws/sessions/{sess_id}/stream",
         headers={"Authorization": f"Bearer {sess_token}"},
     ) as ws:
+        ws.send_json({"type": "start_interview"})
+        _drain_until(ws, ("turn_complete", "error"))
+
         # Turn 1
         ws.send_json({
             "type": "candidate_answer",
+            "message_id": "msg-multi-1",
             "candidate_answer": "Turn 1: I have experience in distributed systems.",
         })
         turn1_sequences = []
@@ -319,6 +322,7 @@ def test_websocket_multi_turn_monotonic_sequence(tmp_path):
         # Turn 2: RuntimeAgent resets sequence to 1, but ConnectionManager must ensure monotonic increment
         ws.send_json({
             "type": "candidate_answer",
+            "message_id": "msg-multi-2",
             "candidate_answer": "Turn 2: We used Redis for distributed locking.",
         })
         turn2_sequences = []
@@ -337,12 +341,11 @@ def test_websocket_multi_turn_monotonic_sequence(tmp_path):
             assert seq > max_turn1_seq
 
 
-def test_websocket_ready_session_auto_transition_and_turn(tmp_path):
-    """Verify session in READY status automatically transitions to STAGE_ACTIVE on first candidate turn."""
+def test_websocket_start_interview_gates_answers_and_is_idempotent(tmp_path):
+    """Answers before start are rejected; start moves READY to STAGE_ACTIVE once; duplicates replay."""
     from fastapi.testclient import TestClient
     from api.main import create_app
     from api.auth import create_service_token
-    from core.session.state import LifecycleStatus
     from config.settings import get_settings
 
     settings = get_settings()
@@ -350,48 +353,44 @@ def test_websocket_ready_session_auto_transition_and_turn(tmp_path):
     client = TestClient(app)
 
     service_token = create_service_token(secret=settings.JWT_SECRET)
+    service_headers = {"Authorization": f"Bearer {service_token}"}
     create_res = client.post(
         "/api/v1/sessions",
         json={"candidate_name": "Ready State Candidate"},
-        headers={"Authorization": f"Bearer {service_token}"},
+        headers=service_headers,
     )
     sess_id = create_res.json()["session_id"]
     sess_token = create_res.json()["session_token"]
+    assert client.get(f"/api/v1/sessions/{sess_id}", headers=service_headers).json()["status"] == "READY"
 
-    # Explicitly set session to READY (simulating profiling completion)
-    curr_state = app.state.state_mgr.get_state(sess_id)
-    app.state.state_mgr.transition(
-        curr_state,
-        expected_version=curr_state.state_version,
-        new_status=LifecycleStatus.READY,
-    )
-    assert app.state.state_mgr.get_state(sess_id).status == LifecycleStatus.READY
-
-    # Connect WebSocket and send candidate_answer without manual STAGE_ACTIVE transition
     with client.websocket_connect(
         f"/ws/sessions/{sess_id}/stream",
         headers={"Authorization": f"Bearer {sess_token}"},
     ) as ws:
-        ws.send_json({
-            "type": "candidate_answer",
-            "candidate_answer": "Hello, I am ready for the technical interview.",
-        })
-        events = []
-        for _ in range(20):
-            try:
-                frame = ws.receive_json()
-                events.append(frame)
-                if frame["type"] in ("complete", "turn_complete", "error"):
-                    break
-            except Exception:
-                break
+        # Answer before start -> typed rejection, nothing executed
+        ws.send_json({"type": "candidate_answer", "message_id": "early", "candidate_answer": "Hi"})
+        early = ws.receive_json()
+        assert early["type"] == "error"
+        assert early["payload"]["code"] == "INTERVIEW_NOT_STARTED"
 
-        assert len(events) > 0
-        # No error events emitted
+        # Missing message_id -> rejected
+        ws.send_json({"type": "candidate_answer", "candidate_answer": "Hi"})
+        assert ws.receive_json()["payload"]["code"] == "MISSING_MESSAGE_ID"
+
+        ws.send_json({"type": "start_interview"})
+        events = _drain_until(ws, ("turn_complete", "error"))
         assert not any(e["type"] == "error" for e in events)
-        # Session state must now be STAGE_ACTIVE
-        updated_state = app.state.state_mgr.get_state(sess_id)
-        assert updated_state.status == LifecycleStatus.STAGE_ACTIVE
+        first_opening = [e for e in events if e["type"] == "turn_complete"][0]
+
+        # Starting again replays the recorded opening instead of regenerating it
+        calls_before = app.state.llm_client.call_count
+        ws.send_json({"type": "start_interview"})
+        replayed = _drain_until(ws, ("turn_complete", "error"))
+        assert app.state.llm_client.call_count == calls_before
+        assert replayed[-1]["event_id"] == first_opening["event_id"]
+
+    status_res = client.get(f"/api/v1/sessions/{sess_id}", headers=service_headers)
+    assert status_res.json()["status"] == "STAGE_ACTIVE"
 
 
 def test_websocket_concurrency_ceiling_enforced(tmp_path):
@@ -438,3 +437,12 @@ def test_websocket_concurrency_ceiling_enforced(tmp_path):
         assert ws2.receive_json()["type"] == "pong"
 
 
+def _drain_until(ws, terminal_types, limit=60):
+    """Receive frames until one of terminal_types (inclusive) or the limit is reached."""
+    frames = []
+    for _ in range(limit):
+        frame = ws.receive_json()
+        frames.append(frame)
+        if frame.get("type") in terminal_types:
+            break
+    return frames

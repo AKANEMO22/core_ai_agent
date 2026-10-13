@@ -4,10 +4,9 @@ from typing import Any, Dict, List, Optional
 
 from core.runtime.agent import sanitize_secrets
 from core.session.state import (
-    InvalidStateTransitionError,
     LifecycleStatus,
     SessionState,
-    SessionStateManager,
+    SessionStateStore,
 )
 
 
@@ -29,16 +28,20 @@ class StageDirector:
     def __init__(
         self,
         stages: List[Dict[str, Any]],
-        state_mgr: SessionStateManager,
+        state_mgr: SessionStateStore,
+        max_extra_turns: int = 1,
     ) -> None:
         """Initialize the stage director.
 
         Args:
             stages: Ordered list of stage configuration dictionaries.
-            state_mgr: The SessionStateManager controlling FSM and CAS validation.
+            state_mgr: Session state store controlling FSM and CAS validation.
+            max_extra_turns: Turns a stage may run past its budget when the orchestrator extends it
+                (a must-have criterion still lacks evidence). A stage's own `max_extra_turns` wins.
         """
         self.stages = stages
         self.state_mgr = state_mgr
+        self.max_extra_turns = max(0, int(max_extra_turns))
         self._stages_by_id: Dict[str, Dict[str, Any]] = {
             s["stage_id"]: s for s in stages if "stage_id" in s
         }
@@ -76,11 +79,12 @@ class StageDirector:
         curr_idx = self._find_stage_index(state.current_stage_id)
         return curr_idx >= len(self.stages) - 1
 
-    def record_turn(
+    async def record_turn(
         self,
         state: SessionState,
         complete_stage: bool = False,
         tool_calls: Optional[List[Dict[str, Any]]] = None,
+        extend_stage: bool = False,
     ) -> SessionState:
         """Record an executed dialogue turn, advancing counters and checking budget or triggers.
 
@@ -88,6 +92,8 @@ class StageDirector:
             state: The current SessionState snapshot.
             complete_stage: Explicit boolean flag requesting immediate stage completion.
             tool_calls: Optional list of tool calls emitted during turn for trigger checks.
+            extend_stage: The turn's directive keeps the stage open past its budget (bounded by
+                max_extra_turns), because the response asked another question of this stage.
 
         Returns:
             SessionState: Updated session state snapshot reflecting new turn and completion flag.
@@ -134,22 +140,15 @@ class StageDirector:
                     tool_triggered = True
                     break
 
-        is_complete = bool(
-            complete_stage or tool_triggered or (current_stage_turns >= target_turns)
+        extra = stage_cfg.get("max_extra_turns", self.max_extra_turns)
+        hard_limit = int(target_turns) + max(0, int(extra))
+        budget_reached = current_stage_turns >= hard_limit or (
+            current_stage_turns >= target_turns and not extend_stage
         )
+        is_complete = bool(complete_stage or tool_triggered or budget_reached)
 
-        # 4. Atomically transition state via SessionStateManager CAS
-        if state.session_id not in self.state_mgr._states:
-            self.state_mgr._states[state.session_id] = state
-
-        registered = self.state_mgr.get_state(state.session_id)
-        if registered is not None and state.state_version != registered.state_version:
-            raise InvalidStateTransitionError(
-                f"CAS mismatch for session '{state.session_id}': expected version "
-                f"{registered.state_version}, but provided state has version {state.state_version}"
-            )
-
-        return self.state_mgr.transition(
+        # 4. Atomically transition state via the store's CAS
+        return await self.state_mgr.atransition(
             state=state,
             expected_version=state.state_version,
             current_stage_id=curr_stage_id,
@@ -158,7 +157,7 @@ class StageDirector:
             metadata=metadata,
         )
 
-    def advance_stage(self, state: SessionState) -> SessionState:
+    async def advance_stage(self, state: SessionState) -> SessionState:
         """Advance session to the subsequent stage or mark dialogue completed if at end.
 
         Args:
@@ -177,20 +176,13 @@ class StageDirector:
                 f"expected {LifecycleStatus.STAGE_ACTIVE.value}"
             )
 
-        registered = self.state_mgr.get_state(state.session_id)
-        if registered is not None and state.state_version != registered.state_version:
-            raise InvalidStateTransitionError(
-                f"CAS mismatch for session '{state.session_id}': expected version "
-                f"{registered.state_version}, but provided state has version {state.state_version}"
-            )
-
         curr_idx = self._find_stage_index(state.current_stage_id)
         next_idx = curr_idx + 1
 
         if next_idx < len(self.stages):
             next_stage = self.stages[next_idx]
             next_stage_id = next_stage["stage_id"]
-            return self.state_mgr.transition(
+            return await self.state_mgr.atransition(
                 state=state,
                 expected_version=state.state_version,
                 current_stage_id=next_stage_id,
@@ -198,14 +190,14 @@ class StageDirector:
             )
         else:
             # Reached curriculum completion -> transition to DIALOGUE_COMPLETED
-            return self.state_mgr.transition(
+            return await self.state_mgr.atransition(
                 state=state,
                 expected_version=state.state_version,
                 new_status=LifecycleStatus.DIALOGUE_COMPLETED,
                 is_stage_complete=True,
             )
 
-    def complete_current_stage(self, state: SessionState) -> SessionState:
+    async def complete_current_stage(self, state: SessionState) -> SessionState:
         """Mark active stage complete via CAS transition without incrementing turn counters.
 
         Args:
@@ -224,14 +216,7 @@ class StageDirector:
                 f"expected {LifecycleStatus.STAGE_ACTIVE.value}"
             )
 
-        registered = self.state_mgr.get_state(state.session_id)
-        if registered is not None and state.state_version != registered.state_version:
-            raise InvalidStateTransitionError(
-                f"CAS mismatch for session '{state.session_id}': expected version "
-                f"{registered.state_version}, but provided state has version {state.state_version}"
-            )
-
-        return self.state_mgr.transition(
+        return await self.state_mgr.atransition(
             state=state,
             expected_version=state.state_version,
             is_stage_complete=True,

@@ -1,10 +1,10 @@
-"""Session event store and replay primitives with monotonic sequence validation."""
+"""Session event store and replay primitives with monotonic sequences and bounded retention."""
 
-import json
+import asyncio
 import logging
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
 
 from core.runtime.agent import sanitize_secrets
@@ -29,112 +29,174 @@ class SequenceOrderingError(SessionEventError, ValueError):
 
 
 class SessionEventStore:
-    """In-memory and Redis-compatible append-only event log with monotonic sequence numbers.
+    """Append-only session event log with monotonic sequences, Redis persistence and retention.
+
+    Redis layout (when a client is configured):
+        {prefix}{session_id}        LIST of serialized LoopEvents (newest last), trimmed to max_length.
+        {prefix}{session_id}:seq    INCR counter assigning monotonic sequences per session,
+                                    so ordering survives process restarts.
+    Both keys carry `ttl_seconds` and are refreshed on every append.
+
+    The in-memory cache keeps at most `memory_max_sessions` sessions (LRU) and `max_length`
+    events per session. With Redis, evicted sessions reload on demand through the async
+    readers; without Redis the cache is the only copy and sessions are never evicted.
 
     Attributes:
-        redis_client: Optional redis-compatible client providing lpush/rpush/lrange.
-        redis_key_prefix: Prefix used for Redis keys (default 'session:events:').
+        ttl_seconds: Retention for replayable events.
+        max_length: Maximum retained events per session.
     """
 
     def __init__(
         self,
         redis_client: Optional[Any] = None,
         redis_key_prefix: str = "session:events:",
+        ttl_seconds: int = 86400,
+        max_length: int = 20000,
+        memory_max_sessions: int = 1000,
     ) -> None:
         self._redis = redis_client
         self._prefix = redis_key_prefix
-        self._events: Dict[str, List[LoopEvent]] = defaultdict(list)
+        self.ttl_seconds = ttl_seconds
+        self.max_length = max_length
+        self.memory_max_sessions = memory_max_sessions
+        self._events: "OrderedDict[str, List[LoopEvent]]" = OrderedDict()
         self._sequences: Dict[str, int] = defaultdict(int)
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _list_key(self, session_id: str) -> str:
+        return f"{self._prefix}{session_id}"
+
+    def _seq_key(self, session_id: str) -> str:
+        return f"{self._prefix}{session_id}:seq"
+
+    def _cache_append(self, session_id: str, event: LoopEvent) -> None:
+        bucket = self._events.get(session_id)
+        if bucket is None:
+            bucket = []
+            self._events[session_id] = bucket
+        bucket.append(event)
+        if len(bucket) > self.max_length:
+            del bucket[: len(bucket) - self.max_length]
+        self._events.move_to_end(session_id)
+        self._sequences[session_id] = max(self._sequences[session_id], event.sequence)
+        if self._redis is not None:
+            while len(self._events) > self.memory_max_sessions:
+                evicted, _ = self._events.popitem(last=False)
+                self._sequences.pop(evicted, None)
+
+    @staticmethod
+    def _check_explicit_sequence(session_id: str, sequence: int, current: int) -> None:
+        if sequence <= current:
+            raise SequenceOrderingError(
+                f"Event sequence {sequence} is non-monotonic for session "
+                f"'{session_id}'; current sequence is {current}"
+            )
+
+    @staticmethod
+    def _build(
+        session_id: str,
+        turn_id: str,
+        event_type: Union[str, LoopEventType],
+        payload: Optional[Dict[str, Any]],
+        event_id: Optional[str],
+    ) -> LoopEvent:
+        typed_event_type = LoopEventType(event_type) if isinstance(event_type, str) else event_type
+        return LoopEvent(
+            schema_version="1.0",
+            event_id=event_id or f"evt_{uuid.uuid4().hex[:16]}",
+            session_id=session_id,
+            turn_id=turn_id,
+            sequence=0,
+            timestamp=time.time(),
+            type=typed_event_type,
+            payload=payload or {},
+        )
+
+    # ------------------------------------------------------------------
+    # Writers
+    # ------------------------------------------------------------------
+
     def append(self, session_id: str, event: LoopEvent) -> LoopEvent:
-        """Append an event to the session event log, enforcing strictly monotonic sequence numbers.
+        """Synchronously append an event to the in-memory log (tests and Redis-less mode).
 
-        Args:
-            session_id: Target session identifier.
-            event: LoopEvent envelope to append.
-
-        Returns:
-            LoopEvent: The persisted LoopEvent with validated monotonic sequence.
+        A non-positive sequence is auto-assigned; an explicit one must be strictly greater
+        than the current sequence. With Redis configured, production code must use
+        `append_async`, which assigns sequences atomically in Redis; this method then
+        persists best-effort only.
 
         Raises:
-            SequenceOrderingError: If explicit sequence <= current sequence for session.
+            SequenceOrderingError: If an explicit sequence is not monotonic.
         """
         current_seq = self._sequences[session_id]
-
         if event.sequence <= 0:
-            # Auto-assign next monotonic sequence number
-            next_seq = current_seq + 1
-            event.sequence = next_seq
+            event.sequence = current_seq + 1
         else:
-            # Explicit sequence provided: must be strictly greater than current_seq
-            if event.sequence <= current_seq:
-                raise SequenceOrderingError(
-                    f"Event sequence {event.sequence} is non-monotonic for session "
-                    f"'{session_id}'; current sequence is {current_seq}"
-                )
-
-        # Ensure session_id is consistent
+            self._check_explicit_sequence(session_id, event.sequence, current_seq)
         if event.session_id != session_id:
             event.session_id = session_id
+        self._cache_append(session_id, event)
 
-        # Update in-memory sequence counter and append
-        self._sequences[session_id] = event.sequence
-        self._events[session_id].append(event)
-
-        # Synchronize with Redis if client configured
         if self._redis is not None:
             try:
-                redis_key = f"{self._prefix}{session_id}"
-                serialized = event.model_dump_json()
-                if hasattr(self._redis, "rpush"):
-                    res = self._redis.rpush(redis_key, serialized)
-                    if hasattr(res, "__await__"):
-                        try:
-                            import asyncio
-                            loop = asyncio.get_running_loop()
-                            loop.create_task(res)
-                        except RuntimeError:
-                            pass
-            except Exception as e:
-                logger.warning(
-                    f"Failed to persist event to Redis: {sanitize_secrets(str(e))}"
-                )
-
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._persist(session_id, event, set_sequence=True))
+            except RuntimeError:
+                pass
         return event
 
     async def append_async(self, session_id: str, event: LoopEvent) -> LoopEvent:
-        """Asynchronously append an event to the session event log, awaiting Redis persistence."""
-        current_seq = self._sequences[session_id]
+        """Append an event, assigning its sequence atomically in Redis when configured.
 
-        if event.sequence <= 0:
-            next_seq = current_seq + 1
-            event.sequence = next_seq
-        else:
-            if event.sequence <= current_seq:
-                raise SequenceOrderingError(
-                    f"Event sequence {event.sequence} is non-monotonic for session "
-                    f"'{session_id}'; current sequence is {current_seq}"
-                )
-
+        Raises:
+            SequenceOrderingError: If an explicit sequence is not monotonic.
+        """
         if event.session_id != session_id:
             event.session_id = session_id
 
-        self._sequences[session_id] = event.sequence
-        self._events[session_id].append(event)
+        if self._redis is None:
+            current_seq = self._sequences[session_id]
+            if event.sequence <= 0:
+                event.sequence = current_seq + 1
+            else:
+                self._check_explicit_sequence(session_id, event.sequence, current_seq)
+        elif event.sequence <= 0:
+            event.sequence = int(await self._redis.incr(self._seq_key(session_id)))
+        else:
+            current = int(await self._redis.get(self._seq_key(session_id)) or 0)
+            self._check_explicit_sequence(session_id, event.sequence, current)
+            await self._redis.set(self._seq_key(session_id), event.sequence, ex=self.ttl_seconds)
+
         serialized = event.model_dump_json()
         object.__setattr__(event, "_cached_json", serialized)
-
-        if self._redis is not None and hasattr(self._redis, "rpush"):
-            try:
-                redis_key = f"{self._prefix}{session_id}"
-                res = self._redis.rpush(redis_key, serialized)
-                if hasattr(res, "__await__"):
-                    await res
-            except Exception as e:
-                logger.warning(
-                    f"Failed to persist event to Redis: {sanitize_secrets(str(e))}"
-                )
+        self._cache_append(session_id, event)
+        if self._redis is not None:
+            await self._persist(session_id, event, serialized=serialized)
         return event
+
+    async def _persist(
+        self,
+        session_id: str,
+        event: LoopEvent,
+        serialized: Optional[str] = None,
+        set_sequence: bool = False,
+    ) -> None:
+        """Push the event to the Redis list, trim it and refresh retention TTLs."""
+        try:
+            payload = serialized or event.model_dump_json()
+            async with self._redis.pipeline(transaction=True) as pipe:
+                pipe.rpush(self._list_key(session_id), payload)
+                pipe.ltrim(self._list_key(session_id), -self.max_length, -1)
+                pipe.expire(self._list_key(session_id), self.ttl_seconds)
+                if set_sequence:
+                    pipe.set(self._seq_key(session_id), event.sequence, ex=self.ttl_seconds)
+                else:
+                    pipe.expire(self._seq_key(session_id), self.ttl_seconds)
+                await pipe.execute()
+        except Exception as e:
+            logger.warning("Failed to persist event to Redis: %s", sanitize_secrets(str(e)))
 
     def append_event(
         self,
@@ -144,93 +206,87 @@ class SessionEventStore:
         payload: Optional[Dict[str, Any]] = None,
         event_id: Optional[str] = None,
     ) -> LoopEvent:
-        """Construct and append a new LoopEvent with auto-assigned sequence and timestamp.
+        """Construct and synchronously append a LoopEvent with an auto-assigned sequence."""
+        return self.append(session_id, self._build(session_id, turn_id, event_type, payload, event_id))
 
-        Args:
-            session_id: Target session identifier.
-            turn_id: Current turn identifier.
-            event_type: Classifier from LoopEventType or string.
-            payload: Structured event payload dictionary.
-            event_id: Optional custom event identifier.
-
-        Returns:
-            LoopEvent: The newly appended LoopEvent.
-        """
-        typed_event_type = (
-            LoopEventType(event_type)
-            if isinstance(event_type, str)
-            else event_type
+    async def append_event_async(
+        self,
+        session_id: str,
+        turn_id: str,
+        event_type: Union[str, LoopEventType],
+        payload: Optional[Dict[str, Any]] = None,
+        event_id: Optional[str] = None,
+    ) -> LoopEvent:
+        """Construct and asynchronously append a LoopEvent with an auto-assigned sequence."""
+        return await self.append_async(
+            session_id, self._build(session_id, turn_id, event_type, payload, event_id)
         )
-        eid = event_id or f"evt_{uuid.uuid4().hex[:16]}"
-        next_seq = self._sequences[session_id] + 1
 
-        event = LoopEvent(
-            schema_version="1.0",
-            event_id=eid,
-            session_id=session_id,
-            turn_id=turn_id,
-            sequence=next_seq,
-            timestamp=time.time(),
-            type=typed_event_type,
-            payload=payload or {},
-        )
-        return self.append(session_id, event)
+    # ------------------------------------------------------------------
+    # Readers
+    # ------------------------------------------------------------------
 
     async def load_from_redis_async(self, session_id: str) -> List[LoopEvent]:
-        """Asynchronously load historical events from Redis into in-memory store."""
-        if self._redis is not None and hasattr(self._redis, "lrange"):
+        """Reload a session's retained events from Redis into the cache."""
+        if self._redis is not None:
             try:
-                redis_key = f"{self._prefix}{session_id}"
-                res = self._redis.lrange(redis_key, 0, -1)
-                raw_items = await res if hasattr(res, "__await__") else res
+                raw_items = await self._redis.lrange(self._list_key(session_id), 0, -1)
                 loaded = [LoopEvent.model_validate_json(item) for item in raw_items]
-                self._events[session_id] = loaded
+                self._events[session_id] = loaded[-self.max_length :]
+                self._events.move_to_end(session_id)
                 if loaded:
                     self._sequences[session_id] = max(e.sequence for e in loaded)
             except Exception as e:
-                logger.warning(
-                    f"Failed to load events from Redis: {sanitize_secrets(str(e))}"
-                )
+                logger.warning("Failed to load events from Redis: %s", sanitize_secrets(str(e)))
         return list(self._events.get(session_id, []))
 
     def get_events(self, session_id: str) -> List[LoopEvent]:
-        """Retrieve all recorded events for a session in sequence order."""
-        if self._redis is not None and not self._events.get(session_id):
-            try:
-                redis_key = f"{self._prefix}{session_id}"
-                if hasattr(self._redis, "lrange"):
-                    raw_items = self._redis.lrange(redis_key, 0, -1)
-                    if not hasattr(raw_items, "__await__"):
-                        loaded = [LoopEvent.model_validate_json(item) for item in raw_items]
-                        self._events[session_id] = loaded
-                        if loaded:
-                            self._sequences[session_id] = max(e.sequence for e in loaded)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to read events from Redis: {sanitize_secrets(str(e))}"
-                )
-
+        """Return cached events for a session in sequence order."""
         return list(self._events.get(session_id, []))
 
+    async def get_events_async(self, session_id: str) -> List[LoopEvent]:
+        """Return events for a session, reloading from Redis when the cache is cold."""
+        if session_id not in self._events and self._redis is not None:
+            return await self.load_from_redis_async(session_id)
+        return self.get_events(session_id)
+
+    async def get_turn_events(self, session_id: str, turn_id: str) -> List[LoopEvent]:
+        """Return the retained events recorded for one turn."""
+        return [e for e in await self.get_events_async(session_id) if e.turn_id == turn_id]
+
     def get_event_by_id(self, session_id: str, event_id: str) -> Optional[LoopEvent]:
-        """Find a single event by event_id within a session."""
+        """Find a single cached event by event_id within a session."""
         for evt in self._events.get(session_id, []):
             if evt.event_id == event_id:
                 return evt
         return None
 
     def get_latest_sequence(self, session_id: str) -> int:
-        """Return the highest recorded sequence number for a session (0 if empty)."""
+        """Return the highest cached sequence number for a session (0 if empty)."""
         return self._sequences.get(session_id, 0)
 
+    async def get_latest_sequence_async(self, session_id: str) -> int:
+        """Return the highest assigned sequence, consulting Redis when configured."""
+        if self._redis is not None:
+            raw = await self._redis.get(self._seq_key(session_id))
+            if raw is not None:
+                return int(raw)
+        return self.get_latest_sequence(session_id)
+
     def clear(self, session_id: Optional[str] = None) -> None:
-        """Clear recorded events for a specific session or all sessions."""
+        """Clear cached events for a specific session or all sessions."""
         if session_id:
             self._events.pop(session_id, None)
             self._sequences.pop(session_id, None)
         else:
             self._events.clear()
             self._sequences.clear()
+
+    async def purge(self, session_id: str) -> None:
+        """Delete a session's events from the cache and Redis (retention deletion)."""
+        self.clear(session_id)
+        if self._redis is not None:
+            await self._redis.delete(self._list_key(session_id), self._seq_key(session_id))
 
 
 class EventReplayer:

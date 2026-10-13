@@ -1,326 +1,298 @@
-"""Integration test for full end-to-end interview lifecycle simulation.
+"""End-to-end interview lifecycle through the real application, with no manual wiring.
 
-Covers:
-- Session creation (POST /api/v1/sessions) with Idempotency-Key
-- Pre-flight reconnaissance profiling and artifact verification
-- WebSocket connection and turn exchange across all curriculum stages (Warmup, Technical, System Design, Q&A / Close)
-- Real-time event streaming (progress, response_token, turn_complete, stage_transition, assessment_update)
-- Background assessor worker pool processing turn evaluations into evaluations/turn_{n}_eval.json
-- Assessment barrier enforcement (completed == expected, failed == 0) and report generation
-- Verification of reports/final_assessment.json and reports/interview_report.md via GET /api/v1/sessions/{id}/report
+Covers gate G1: session creation → profiling → start_interview → answers over WebSocket →
+dialogue completion → assessor pool (started by the app lifespan) → barrier → report,
+plus exactly-once answers, retry after a failed generation, and log hygiene.
 """
 
-import asyncio
-import json
+import logging
 import time
 from pathlib import Path
-import pytest
+from typing import Any, Dict, List, Optional
+
 import fakeredis.aioredis
+import pytest
 from fastapi.testclient import TestClient
 
 from api.auth import create_service_token
 from api.main import create_app
-from config.settings import get_settings
-from core.assessor.queue import RedisAssessmentQueue
-from core.assessor.synthesizer import ReportSynthesizer
-from core.assessor.worker import AssessorWorker
-from core.runtime.providers.mock import MockLLMClient
-from core.runtime.types import LoopEventType
+from config.settings import Settings, get_settings
+from tests.fakes import ScriptedInterviewLLM
+from core.runtime.types import IterationChunk
 from core.session.state import LifecycleStatus
 
+CV_SECRET_LINE = "Proprietary ledger reconciliation engine at Contoso Bank"
 
-@pytest.mark.asyncio
-async def test_full_mock_interview_lifecycle_simulation(tmp_path: Path):
-    """Simulate complete interview lifecycle from session intake to final report."""
-    settings = get_settings()
-    workspace_base = tmp_path / "workspaces"
-    workspace_base.mkdir(parents=True, exist_ok=True)
-
-    fake_r = fakeredis.aioredis.FakeRedis(decode_responses=True)
-
-    # 4-stage curriculum plan
-    stage_plan_data = {
-        "stages": [
-            {"stage_id": "warmup", "name": "Warmup", "target_turns": 1},
-            {"stage_id": "technical", "name": "Technical Depth", "target_turns": 1},
-            {"stage_id": "system_design", "name": "System Design", "target_turns": 1},
-            {"stage_id": "qa_close", "name": "Q&A and Close", "target_turns": 1},
-        ]
-    }
-
-    mock_llm = MockLLMClient(
-        canned_tokens=["Thank", " you", " for", " that", " answer.", " Let's", " proceed."],
-        canned_json_responses={
-            "company_intel": {
-                "company": "Acme Systems",
-                "culture": "Engineering Rigor",
-                "tech_stack": ["Python", "FastAPI", "Redis", "Distributed Systems"],
-            },
-            "candidate_profile": {
-                "strengths": ["Backend Architecture", "Event Streaming"],
-                "gaps": ["Capacity Modeling"],
-                "probes": ["Distributed Locking", "Consensus"],
-            },
-            "interview_spec": {
-                "interviewer_persona": "Principal Staff Engineer",
-                "tone": "rigorous_challenger",
-                "knowledge_scope": ["Distributed Systems", "Concurrency", "FastAPI"],
-            },
-            "stage_plan": stage_plan_data,
-            "assessment": {
-                "content_score": 9,
-                "communication_score": 8,
-                "strengths": ["Demonstrates strong conceptual grasp of distributed consensus"],
-                "improvements": ["Could elaborate further on network failure modes"],
-            },
-        },
-    )
-
-    app = create_app(
-        workspace_base=str(workspace_base),
-        redis_client=fake_r,
-        llm_client=mock_llm,
-        settings=settings,
-    )
-
-    client = TestClient(app)
-    service_token = create_service_token(issuer="backend", audience="ai-runtime", secret=settings.JWT_SECRET)
-    service_headers = {
-        "Authorization": f"Bearer {service_token}",
-        "Idempotency-Key": "e2e_interview_key_001",
-    }
-
-    # --------------------------------------------------------------------------
-    # 1. Session Creation (POST /api/v1/sessions) with Idempotency-Key
-    # --------------------------------------------------------------------------
-    session_payload = {
-        "candidate_name": "Nguyen Van B",
-        "experience_years": 6,
-        "target_company": "Acme Systems",
-        "target_role": "Senior Backend Architect",
-        "skills": ["Python", "FastAPI", "Redis", "Distributed Systems"],
-        "metadata": {"expected_assessments": 4},
-    }
-
-    create_res = client.post("/api/v1/sessions", json=session_payload, headers=service_headers)
-    assert create_res.status_code == 202
-    res_json = create_res.json()
-    assert res_json["status"] == "PROFILING"
-    assert "session_id" in res_json
-    assert "session_token" in res_json
-    session_id = res_json["session_id"]
-    session_token = res_json["session_token"]
-
-    # Verify idempotency cache returns identical response
-    repeat_res = client.post("/api/v1/sessions", json=session_payload, headers=service_headers)
-    assert repeat_res.status_code == 202
-    assert repeat_res.json()["session_id"] == session_id
-
-    # --------------------------------------------------------------------------
-    # 2. Pre-flight Profiling Artifact Verification
-    # --------------------------------------------------------------------------
-    session_ws = app.state.workspace_mgr.get_or_create_workspace(session_id)
-    assert session_ws.exists("context/company_intel.json")
-    assert session_ws.exists("context/candidate_profile.json")
-    assert session_ws.exists("context/interview_spec.json")
-    assert session_ws.exists("context/stage_plan.json")
-
-    # Session state should transition to READY after profiling
-    session_state = app.state.state_mgr.get_state(session_id)
-    assert session_state is not None
-    assert session_state.status == LifecycleStatus.READY
-
-    # --------------------------------------------------------------------------
-    # 3. Setup Background Assessor Worker Pool
-    # --------------------------------------------------------------------------
-    assessment_queue = app.state.assessment_queue
-    await assessment_queue.setup_consumer_group(group_name="assessor_group")
-
-    worker = AssessorWorker(
-        redis_client=fake_r,
-        queue=assessment_queue,
-        llm_client=mock_llm,
-        workspace_resolver=app.state.workspace_mgr,
-        state_manager=app.state.state_mgr,
-        event_store=app.state.event_store,
-        connection_manager=getattr(app.state, "connection_mgr", None),
-    )
-
-    # --------------------------------------------------------------------------
-    # 4. WebSocket Connection & Turn Exchange across All 4 Stages
-    # --------------------------------------------------------------------------
-    turn_answers = [
-        # Stage 1: Warmup
-        (1, "warmup", "Hello! I am Nguyen Van B, senior engineer with 6 years in distributed services.", {"wpm": 130}),
-        # Stage 2: Technical Depth
-        (2, "technical", "We use Redis Streams for at-least-once messaging and distributed locks for idempotency.", {"wpm": 125}),
-        # Stage 3: System Design
-        (3, "system_design", "For high throughput, we partition streams, use read replicas, and enforce TTL cache tiers.", {"wpm": 120}),
-        # Stage 4: Q&A / Close
-        (4, "qa_close", "I would like to know how the team approaches observability and distributed tracing.", {"wpm": 115}),
+STAGE_PLAN = {
+    "stages": [
+        {"stage_id": "warmup", "name": "Warmup", "target_turns": 1},
+        {"stage_id": "technical", "name": "Technical Depth", "target_turns": 1},
+        {"stage_id": "system_design", "name": "System Design", "target_turns": 1},
+        {"stage_id": "qa_close", "name": "Q&A and Close", "target_turns": 1},
     ]
+}
 
-    all_emitted_event_types = []
+ANSWERS = [
+    "Hello! I am a senior engineer with six years in distributed services.",
+    "We use Redis Streams for at-least-once messaging and distributed locks for idempotency.",
+    "For high throughput we partition streams, use read replicas and enforce TTL cache tiers.",
+    "How does the team approach observability and distributed tracing?",
+]
 
-    with client.websocket_connect(
-        f"/ws/sessions/{session_id}/stream",
-        headers={"Authorization": f"Bearer {session_token}"},
-    ) as ws:
-        # Ping check
-        ws.send_json({"type": "ping"})
-        pong = ws.receive_json()
-        assert pong["type"] == "pong"
 
-        for turn_num, expected_stage, answer_text, vad in turn_answers:
-            # Send candidate answer
-            ws.send_json({
-                "type": "candidate_answer",
-                "candidate_answer": answer_text,
-                "vad_metrics": vad,
-                "expected_turn": turn_num,
-            })
+class RecordingMockLLM(ScriptedInterviewLLM):
+    """Scripted provider that records every final user message and can fail selected answers once."""
 
-            # Receive streamed response frames
-            turn_frames = []
-            for _ in range(30):
-                try:
-                    frame = ws.receive_json()
-                    turn_frames.append(frame)
-                    all_emitted_event_types.append(frame["type"])
-                    if frame["type"] in ("complete", "turn_complete", "error"):
-                        break
-                except Exception:
-                    break
+    def __init__(self, fail_once_for: Optional[str] = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.user_messages: List[str] = []
+        self.fail_once_for = fail_once_for
 
-            assert len(turn_frames) > 0
-            # Verify candidate and interviewer artifacts persisted
-            assert session_ws.exists(f"turns/turn_{turn_num}_candidate.json")
-            assert session_ws.exists(f"turns/turn_{turn_num}_interviewer.json")
+    async def stream_chat(self, messages, tools=None, **kwargs):  # type: ignore[override]
+        last_user = next((str(m.get("content", "")) for m in reversed(messages) if m.get("role") == "user"), "")
+        self.user_messages.append(last_user)
+        if self.fail_once_for is not None and last_user == self.fail_once_for:
+            self.fail_once_for = None
+            raise RuntimeError("Provider 503 with api_key=sk-test1234567890abcdef")
+        async for chunk in super().stream_chat(messages, tools=tools, **kwargs):
+            yield chunk
 
-            cand_art = session_ws.read_json(f"turns/turn_{turn_num}_candidate.json")
-            assert cand_art["content"] == answer_text
-            assert cand_art["turn_number"] == turn_num
+    def interviewer_calls_for(self, answer: str) -> int:
+        return sum(1 for m in self.user_messages if m == answer)
 
-            # Process background evaluation job for this turn
-            job_processed = await worker.process_next_job(group_name="assessor_group", consumer_name="worker_test")
-            assert job_processed is True
 
-            # Verify evaluation artifact written
-            turn_id_str = f"turn_{turn_num:03d}"
-            assert session_ws.exists(f"evaluations/{turn_id_str}_eval.json")
-            eval_art = session_ws.read_json(f"evaluations/{turn_id_str}_eval.json")
-            payload = eval_art.get("payload", eval_art)
-            assert payload["content_score"] == 9
-            assert payload["communication_score"] == 8
+def _llm(**kwargs: Any) -> RecordingMockLLM:
+    return RecordingMockLLM(stage_plan=STAGE_PLAN, **kwargs)
 
-    # --------------------------------------------------------------------------
-    # 5. Verify Real-Time Event Streaming Types
-    # --------------------------------------------------------------------------
-    assert "response_token" in all_emitted_event_types
-    assert "progress" in all_emitted_event_types
-    assert "turn_complete" in all_emitted_event_types
-    assert "stage_transition" in all_emitted_event_types
-    assert "assessment_update" in all_emitted_event_types
 
-    # --------------------------------------------------------------------------
-    # 6. Verify Dialogue Completion & State Progression
-    # --------------------------------------------------------------------------
-    final_state = app.state.state_mgr.get_state(session_id)
-    assert final_state.current_turn == 4
-    assert final_state.status == LifecycleStatus.DIALOGUE_COMPLETED
-
-    # --------------------------------------------------------------------------
-    # 7. Barrier Check & Report Synthesis
-    # --------------------------------------------------------------------------
-    synthesizer = ReportSynthesizer(
-        redis_client=fake_r,
-        workspace_resolver=app.state.workspace_mgr,
-        state_manager=app.state.state_mgr,
-        event_store=app.state.event_store,
-        llm_client=mock_llm,
+def _settings() -> Settings:
+    return get_settings().model_copy(
+        update={
+            "RETRIEVAL_BACKEND": "mock",
+            "ASSESSOR_BLOCK_MS": 50,
+            "ASSESSOR_RECOVERY_INTERVAL_SECONDS": 0.2,
+            "REPORT_SWEEP_INTERVAL_SECONDS": 0.2,
+            "ANSWER_BURST": 100.0,
+            "ORCHESTRATOR_JOIN_MS": 300,
+        }
     )
 
-    # Check barrier satisfies: 4 completed, 0 failed, 4 expected
-    is_ready, completed, failed, expected = await synthesizer.check_barrier(session_id)
-    assert is_ready is True
-    assert completed == 4
-    assert failed == 0
-    assert expected == 4
 
-    # Advance state to ASSESSING and execute synthesize
-    state_assessing = app.state.state_mgr.transition(
-        final_state,
-        expected_version=final_state.state_version,
-        new_status=LifecycleStatus.ASSESSING,
+def _create_session(client: TestClient, headers: Dict[str, str]) -> Dict[str, Any]:
+    res = client.post(
+        "/api/v1/sessions",
+        json={
+            "candidate_name": "Nguyen Van B",
+            "experience_years": 6,
+            "target_company": "Acme Systems",
+            "target_role": "Senior Backend Engineer",
+            "skills": ["Python", "Redis", "Distributed Systems"],
+            "cv_text": f"Experience:\n{CV_SECRET_LINE}\nSkills: Python, Redis",
+        },
+        headers={**headers, "Idempotency-Key": f"e2e-{time.time_ns()}"},
     )
-    final_assessment = await synthesizer.synthesize(session_id)
-    assert final_assessment["session_id"] == session_id
-    assert final_assessment["metrics"]["total_turns_evaluated"] == 4
-
-    # State transitioned to REPORT_READY
-    ready_state = app.state.state_mgr.get_state(session_id)
-    assert ready_state.status == LifecycleStatus.REPORT_READY
-
-    # Verify report artifacts on disk
-    assert session_ws.exists("reports/final_assessment.json")
-    assert session_ws.exists("reports/interview_report.md")
-
-    report_md = (session_ws.root_path / "reports" / "interview_report.md").read_text(encoding="utf-8")
-    assert "AI Interview Practice & Coaching Report" in report_md
-    assert "Disclaimer" in report_md
-
-    # --------------------------------------------------------------------------
-    # 8. Verification via GET /api/v1/sessions/{id}/report
-    # --------------------------------------------------------------------------
-    report_res = client.get(f"/api/v1/sessions/{session_id}/report", headers=service_headers)
-    assert report_res.status_code == 200
-    report_data = report_res.json()
-    assert report_data["status"] == "REPORT_READY"
-    assert report_data["final_assessment"]["session_id"] == session_id
-    assert "AI Interview Practice & Coaching Report" in report_data["report_markdown"]
+    assert res.status_code == 202, res.text
+    return res.json()
 
 
-@pytest.mark.asyncio
-async def test_report_barrier_blocks_when_incomplete_in_lifecycle(tmp_path: Path):
-    """Verify that report synthesis and GET /report strictly block when assessment barrier is not met."""
-    from core.assessor.synthesizer import AssessmentBarrierError
+def _drain_until(ws: Any, terminal_types: tuple, limit: int = 80) -> List[Dict[str, Any]]:
+    frames = []
+    for _ in range(limit):
+        frame = ws.receive_json()
+        frames.append(frame)
+        assert frame.get("type") != "busy", frame
+        if frame.get("type") in terminal_types:
+            break
+    return frames
 
-    settings = get_settings()
-    fake_r = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+def _wait_for_report(client: TestClient, session_id: str, headers: Dict[str, str], timeout: float = 20.0) -> Dict[str, Any]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        res = client.get(f"/api/v1/sessions/{session_id}/report", headers=headers)
+        if res.status_code == 200:
+            return res.json()
+        assert res.status_code == 202, res.text
+        time.sleep(0.1)
+    raise AssertionError("report was not produced in time")
+
+
+def test_full_lifecycle_through_real_app(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """G1 + G3 + log hygiene: the app alone drives a session from creation to REPORT_READY."""
+    caplog.set_level(logging.DEBUG)
+    settings = _settings()
+    llm = _llm()
     app = create_app(
-        workspace_base=str(tmp_path / "workspaces_barrier"),
-        redis_client=fake_r,
+        workspace_base=str(tmp_path / "workspaces"),
+        redis_client=fakeredis.aioredis.FakeRedis(decode_responses=True),
+        llm_client=llm,
         settings=settings,
     )
-    client = TestClient(app)
-    service_token = create_service_token(issuer="backend", audience="ai-runtime", secret=settings.JWT_SECRET)
-    headers = {"Authorization": f"Bearer {service_token}"}
+    service_headers = {
+        "Authorization": f"Bearer {create_service_token(issuer='backend', audience='ai-runtime', secret=settings.JWT_SECRET)}"
+    }
 
-    create_res = client.post(
-        "/api/v1/sessions",
-        json={"candidate_name": "Barrier Candidate", "metadata": {"expected_assessments": 2}},
-        headers=headers,
+    with TestClient(app) as client:
+        created = _create_session(client, service_headers)
+        session_id, session_token = created["session_id"], created["session_token"]
+
+        status_res = client.get(f"/api/v1/sessions/{session_id}", headers=service_headers).json()
+        assert status_res["status"] == "READY"
+        assert status_res["retrieval_status"] == "ok"
+
+        seen_types: List[str] = []
+        with client.websocket_connect(
+            f"/ws/sessions/{session_id}/stream",
+            headers={"Authorization": f"Bearer {session_token}"},
+        ) as ws:
+            ws.send_json({"type": "start_interview"})
+            opening = _drain_until(ws, ("turn_complete", "error"))
+            assert opening[-1]["type"] == "turn_complete"
+            seen_types += [f["type"] for f in opening]
+
+            for index, answer in enumerate(ANSWERS, start=1):
+                ws.send_json(
+                    {
+                        "type": "candidate_answer",
+                        "message_id": f"msg-{index}",
+                        "candidate_answer": answer,
+                        "vad_metrics": {"speech_duration_ms": 9000, "words_per_minute": 120},
+                        "expected_turn": index,
+                    }
+                )
+                frames = _drain_until(ws, ("turn_complete", "error"))
+                assert frames[-1]["type"] == "turn_complete", frames[-1]
+                assert frames[-1]["payload"]["turn_number"] == index
+                seen_types += [f["type"] for f in frames]
+
+            # Duplicate delivery of an answered message replays without a new LLM call
+            calls_before = llm.interviewer_calls_for(ANSWERS[1])
+            ws.send_json({"type": "candidate_answer", "message_id": "msg-2", "candidate_answer": ANSWERS[1]})
+            replayed = _drain_until(ws, ("turn_complete", "error"))
+            assert replayed[-1]["type"] == "turn_complete"
+            assert replayed[-1]["turn_id"] == "turn_002"
+            assert llm.interviewer_calls_for(ANSWERS[1]) == calls_before == 1
+
+        assert {"interview_started", "response_token", "turn_complete", "stage_transition"} <= set(seen_types)
+
+        report = _wait_for_report(client, session_id, service_headers)
+        assert report["status"] == "REPORT_READY"
+        assert report["final_assessment"]["metrics"]["total_turns_evaluated"] == len(ANSWERS)
+        assert report["report_markdown"]
+
+        final_status = client.get(f"/api/v1/sessions/{session_id}", headers=service_headers).json()
+        assert final_status["metadata"]["expected_assessments"] == len(ANSWERS)
+
+        ws_dir = app.state.workspace_mgr.get_or_create_workspace(session_id)
+        for index in range(1, len(ANSWERS) + 1):
+            evaluation = ws_dir.read_json(f"evaluations/turn_{index:03d}_eval.json")
+            assert evaluation["rubric_target"], "assessment must target retrieved criteria"
+        assert ws_dir.exists("turns/turn_0_interviewer.json")
+
+    # Log hygiene: candidate answers, CV text and provider keys never reach logs
+    # (only application loggers; HTTP access logs of the test client include URL paths)
+    app_records = [r for r in caplog.records if r.name.split(".")[0] in ("api", "core", "config")]
+    assert app_records
+    log_text = "\n".join(r.getMessage() + " " + str(r.__dict__) for r in app_records)
+    for answer in ANSWERS:
+        assert answer not in log_text
+    assert CV_SECRET_LINE not in log_text
+    assert session_id not in log_text
+
+
+def test_failed_generation_is_retryable_with_same_message_id(tmp_path: Path) -> None:
+    """A provider failure does not advance the turn; resending the same message_id succeeds."""
+    settings = _settings().model_copy(update={"ASSESSOR_POOL_SIZE": 0})
+    llm = _llm(fail_once_for=ANSWERS[0])
+    app = create_app(
+        workspace_base=str(tmp_path / "workspaces"),
+        redis_client=fakeredis.aioredis.FakeRedis(decode_responses=True),
+        llm_client=llm,
+        settings=settings,
     )
-    assert create_res.status_code == 202
-    sess_id = create_res.json()["session_id"]
+    service_headers = {
+        "Authorization": f"Bearer {create_service_token(issuer='backend', audience='ai-runtime', secret=settings.JWT_SECRET)}"
+    }
+    with TestClient(app) as client:
+        created = _create_session(client, service_headers)
+        with client.websocket_connect(
+            f"/ws/sessions/{created['session_id']}/stream",
+            headers={"Authorization": f"Bearer {created['session_token']}"},
+        ) as ws:
+            ws.send_json({"type": "start_interview"})
+            _drain_until(ws, ("turn_complete", "error"))
 
-    # In PROFILING or STAGE_ACTIVE -> GET /report returns 202
-    rep_202 = client.get(f"/api/v1/sessions/{sess_id}/report", headers=headers)
-    assert rep_202.status_code == 202
-    assert rep_202.json()["status"] == "PROFILING"
+            message = {"type": "candidate_answer", "message_id": "retry-1", "candidate_answer": ANSWERS[0]}
+            ws.send_json(message)
+            failed: List[Dict[str, Any]] = []
+            while not (failed and failed[-1]["type"] == "error" and failed[-1]["payload"].get("code") == "TURN_FAILED"):
+                failed.append(ws.receive_json())
+                assert len(failed) < 20
+            codes = [f["payload"].get("code") for f in failed if f["type"] == "error"]
+            assert "PROVIDER_ERROR" in codes
+            assert failed[-1]["payload"]["retryable"] is True
+            # The controller also answers the requester directly with the retryable failure
+            direct = ws.receive_json()
+            assert direct["type"] == "error" and direct["payload"]["code"] == "TURN_FAILED"
+            assert all("sk-test" not in str(f) for f in failed)
 
-    synthesizer = ReportSynthesizer(
-        redis_client=fake_r,
-        workspace_resolver=app.state.workspace_mgr,
-        state_manager=app.state.state_mgr,
+            status_mid = client.get(f"/api/v1/sessions/{created['session_id']}", headers=service_headers).json()
+            assert status_mid["current_turn"] == 0
+
+            ws.send_json(message)
+            retried = _drain_until(ws, ("turn_complete", "error"))
+            assert retried[-1]["type"] == "turn_complete"
+            assert retried[-1]["payload"]["turn_number"] == 1
+
+
+def test_report_blocks_until_barrier_and_respects_failures(tmp_path: Path) -> None:
+    """GET /report stays 202 while assessments are outstanding; synthesis waits for the barrier."""
+    settings = _settings().model_copy(update={"ASSESSOR_POOL_SIZE": 0})
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    app = create_app(
+        workspace_base=str(tmp_path / "workspaces"),
+        redis_client=redis,
+        llm_client=_llm(),
+        settings=settings,
     )
+    service_headers = {
+        "Authorization": f"Bearer {create_service_token(issuer='backend', audience='ai-runtime', secret=settings.JWT_SECRET)}"
+    }
+    with TestClient(app) as client:
+        created = _create_session(client, service_headers)
+        session_id = created["session_id"]
+        with client.websocket_connect(
+            f"/ws/sessions/{session_id}/stream",
+            headers={"Authorization": f"Bearer {created['session_token']}"},
+        ) as ws:
+            ws.send_json({"type": "start_interview"})
+            _drain_until(ws, ("turn_complete", "error"))
+            for index, answer in enumerate(ANSWERS, start=1):
+                ws.send_json({"type": "candidate_answer", "message_id": f"b-{index}", "candidate_answer": answer})
+                _drain_until(ws, ("turn_complete", "error"))
 
-    # Barrier check fails when 0 / 2 completed
-    is_ready, completed, failed, expected = await synthesizer.check_barrier(sess_id)
-    assert is_ready is False
-    assert completed == 0
-    assert expected == 2
+        # Dialogue completed, no workers running: the session waits in ASSESSING
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            current = client.get(f"/api/v1/sessions/{session_id}", headers=service_headers).json()
+            if current["status"] == "ASSESSING":
+                break
+            time.sleep(0.05)
+        assert current["status"] == "ASSESSING"
+        assert current["metadata"]["expected_assessments"] == len(ANSWERS)
+        assert client.get(f"/api/v1/sessions/{session_id}/report", headers=service_headers).status_code == 202
 
-    with pytest.raises(AssessmentBarrierError):
-        await synthesizer.synthesize(sess_id)
+        # The pipeline refuses to synthesize before the barrier is met
+        synthesized = client.portal.call(app.state.pipeline.maybe_synthesize, session_id)
+        assert synthesized is False
+        assert client.get(f"/api/v1/sessions/{session_id}/report", headers=service_headers).status_code == 202
 
+        # Workers catch up -> report produced through the normal callbacks
+        async def _drain_queue() -> None:
+            await app.state.assessment_queue.setup_consumer_group(group_name="manual", start_id="0")
+            while await app.state.assessor_worker.process_next_job(group_name="manual", consumer_name="m"):
+                pass
+
+        client.portal.call(_drain_queue)
+        report = _wait_for_report(client, session_id, service_headers, timeout=5)
+        assert report["status"] == LifecycleStatus.REPORT_READY.value

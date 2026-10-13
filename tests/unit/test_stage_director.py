@@ -19,7 +19,8 @@ from core.session.state import (
 from core.workspace.session import SessionWorkspace
 
 
-def test_stage_progression_on_budget():
+@pytest.mark.asyncio
+async def test_stage_progression_on_budget():
     """Verify turn recording advances turn counters and flags stage completion on budget."""
     state_mgr = SessionStateManager()
     stages = [
@@ -27,23 +28,22 @@ def test_stage_progression_on_budget():
         {"stage_id": "s2", "target_turns": 2},
     ]
     director = StageDirector(stages=stages, state_mgr=state_mgr)
-    state = SessionState(
-        session_id="sess_1", status=LifecycleStatus.STAGE_ACTIVE, state_version=1
-    )
+    state = state_mgr.create_session("sess_1", initial_status=LifecycleStatus.STAGE_ACTIVE)
 
     # Turn 1 in s1
-    res1 = director.record_turn(state)
+    res1 = await director.record_turn(state)
     assert res1.current_stage_id == "s1"
     assert res1.is_stage_complete is False
 
     # Turn 2 in s1 -> triggers stage transition
-    res2 = director.record_turn(res1)
+    res2 = await director.record_turn(res1)
     assert res2.is_stage_complete is True
-    next_state = director.advance_stage(res2)
+    next_state = await director.advance_stage(res2)
     assert next_state.current_stage_id == "s2"
 
 
-def test_stage_progression_complete_stage_flag():
+@pytest.mark.asyncio
+async def test_stage_progression_complete_stage_flag():
     """Verify complete_stage flag prematurely triggers stage completion before budget."""
     state_mgr = SessionStateManager()
     stages = [
@@ -51,53 +51,50 @@ def test_stage_progression_complete_stage_flag():
         {"stage_id": "s2", "target_turns": 3},
     ]
     director = StageDirector(stages=stages, state_mgr=state_mgr)
-    state = SessionState(
-        session_id="sess_2", status=LifecycleStatus.STAGE_ACTIVE, state_version=1
-    )
+    state = state_mgr.create_session("sess_2", initial_status=LifecycleStatus.STAGE_ACTIVE)
 
     # Turn 1 with explicit complete_stage
-    res1 = director.record_turn(state, complete_stage=True)
+    res1 = await director.record_turn(state, complete_stage=True)
     assert res1.current_stage_id == "s1"
     assert res1.is_stage_complete is True
 
-    next_state = director.advance_stage(res1)
+    next_state = await director.advance_stage(res1)
     assert next_state.current_stage_id == "s2"
     assert next_state.is_stage_complete is False
 
 
-def test_stage_advance_to_dialogue_completed():
+@pytest.mark.asyncio
+async def test_stage_advance_to_dialogue_completed():
     """Verify that advancing past the final stage transitions session to DIALOGUE_COMPLETED."""
     state_mgr = SessionStateManager()
     stages = [
         {"stage_id": "final_stage", "target_turns": 1},
     ]
     director = StageDirector(stages=stages, state_mgr=state_mgr)
-    state = SessionState(
-        session_id="sess_final", status=LifecycleStatus.STAGE_ACTIVE, state_version=1
-    )
+    state = state_mgr.create_session("sess_final", initial_status=LifecycleStatus.STAGE_ACTIVE)
 
-    res1 = director.record_turn(state)
+    res1 = await director.record_turn(state)
     assert res1.is_stage_complete is True
 
-    final_state = director.advance_stage(res1)
+    final_state = await director.advance_stage(res1)
     assert final_state.status == LifecycleStatus.DIALOGUE_COMPLETED
     assert final_state.is_stage_complete is True
 
 
-def test_stage_director_rejects_non_stage_active_status():
+@pytest.mark.asyncio
+async def test_stage_director_rejects_non_stage_active_status():
     """Verify recording turns in non-STAGE_ACTIVE states raises StageSessionConflictError."""
     state_mgr = SessionStateManager()
     stages = [{"stage_id": "s1", "target_turns": 2}]
     director = StageDirector(stages=stages, state_mgr=state_mgr)
 
-    invalid_state = SessionState(
-        session_id="sess_err", status=LifecycleStatus.INITIALIZED, state_version=1
-    )
+    invalid_state = state_mgr.create_session("sess_err", initial_status=LifecycleStatus.INITIALIZED)
     with pytest.raises(StageSessionConflictError):
-        director.record_turn(invalid_state)
+        await director.record_turn(invalid_state)
 
 
-def test_stage_director_cas_protection():
+@pytest.mark.asyncio
+async def test_stage_director_cas_protection():
     """Verify CAS version mismatch during advance_stage raises InvalidStateTransitionError."""
     state_mgr = SessionStateManager()
     stages = [
@@ -105,11 +102,9 @@ def test_stage_director_cas_protection():
         {"stage_id": "s2", "target_turns": 1},
     ]
     director = StageDirector(stages=stages, state_mgr=state_mgr)
-    state = SessionState(
-        session_id="sess_cas", status=LifecycleStatus.STAGE_ACTIVE, state_version=1
-    )
+    state = state_mgr.create_session("sess_cas", initial_status=LifecycleStatus.STAGE_ACTIVE)
 
-    res1 = director.record_turn(state)
+    res1 = await director.record_turn(state)
     assert res1.state_version == 2
 
     # Stale snapshot with version 1
@@ -121,7 +116,7 @@ def test_stage_director_cas_protection():
         is_stage_complete=True,
     )
     with pytest.raises(InvalidStateTransitionError):
-        director.advance_stage(stale_state)
+        await director.advance_stage(stale_state)
 
 
 @pytest.mark.asyncio
@@ -541,3 +536,76 @@ async def test_runner_loads_prior_interviewer_response_in_turn_2(tmp_path: Path)
     assert turn1_question in system_prompt
     assert "Atomicity, Consistency, Isolation" in turn2_messages[1]["content"]
 
+
+
+@pytest.mark.asyncio
+async def test_runner_derives_rubric_target_and_version_from_retrieved_rubric(tmp_path: Path):
+    """Verify assessment jobs carry the active stage's retrieved criteria and rubric version."""
+    ws = SessionWorkspace(session_id="sess_rubric", root_path=tmp_path / "sess_rubric")
+    ws.initialize()
+    ws.write_artifact(
+        "context/rubric.json",
+        artifact_type="rubric",
+        payload={"rubric_version": "backend_senior_v1", "competencies": []},
+    )
+
+    state_mgr = SessionStateManager()
+    stages = [
+        {
+            "stage_id": "technical",
+            "target_turns": 2,
+            "criteria": ["be_distributed_systems", "be_data_storage"],
+        }
+    ]
+    director = StageDirector(stages=stages, state_mgr=state_mgr)
+    state_mgr.create_session(
+        session_id="sess_rubric",
+        initial_status=LifecycleStatus.STAGE_ACTIVE,
+        current_stage_id="technical",
+    )
+    queue = InMemoryAssessmentQueue()
+    runner = InteractiveSubagentRunner(
+        workspace=ws,
+        runtime_agent=RuntimeAgent(client=MockLLMClient(canned_tokens=["Next."]), workspace=ws),
+        context_assembler=ContextAssembler(max_tokens=1500),
+        stage_director=director,
+        assessment_queue=queue,
+        state_mgr=state_mgr,
+    )
+
+    async for _ in runner.run_turn(session_id="sess_rubric", candidate_answer="Use idempotency keys."):
+        pass
+    async for _ in runner.run_turn(
+        session_id="sess_rubric",
+        candidate_answer="Add a composite index.",
+        rubric_target=["explicit_target"],
+        rubric_version="rubric_v9",
+    ):
+        pass
+
+    derived, explicit = await queue.dequeue(), await queue.dequeue()
+    assert derived["rubric_target"] == ["be_distributed_systems", "be_data_storage"]
+    assert derived["rubric_version"] == "backend_senior_v1"
+    assert derived["job_id"] == "sess_rubric:turn_001:backend_senior_v1"
+    assert explicit["rubric_target"] == ["explicit_target"]
+    assert explicit["rubric_version"] == "rubric_v9"
+
+
+@pytest.mark.asyncio
+async def test_runner_treats_empty_completion_as_retryable_failure(tmp_path: Path):
+    ws = SessionWorkspace(session_id="sess_empty", root_path=tmp_path / "sess_empty")
+    ws.initialize()
+    state_mgr = SessionStateManager()
+    director = StageDirector(stages=[{"stage_id": "s1", "target_turns": 3}], state_mgr=state_mgr)
+    state_mgr.create_session("sess_empty", initial_status=LifecycleStatus.STAGE_ACTIVE, current_stage_id="s1")
+    runner = InteractiveSubagentRunner(
+        workspace=ws,
+        runtime_agent=RuntimeAgent(client=MockLLMClient(canned_tokens=["   "]), workspace=ws),
+        context_assembler=ContextAssembler(),
+        stage_director=director,
+        state_mgr=state_mgr,
+    )
+    events = [e async for e in runner.run_turn(session_id="sess_empty", candidate_answer="hello there")]
+    assert events[-1].payload.get("code") == "TURN_FAILED" and events[-1].payload["cause"] == "EMPTY_COMPLETION"
+    assert state_mgr.get_state("sess_empty").current_turn == 0
+    assert not ws.exists("turns/turn_1_interviewer.json")

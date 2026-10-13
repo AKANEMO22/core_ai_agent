@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Security Delimiters for Untrusted Data Boundaries
 UNTRUSTED_CANDIDATE_DATA_OPEN = "<untrusted_candidate_data>"
@@ -221,8 +221,29 @@ def build_stage_plan_prompt(
     interview_spec: Dict[str, Any],
     candidate_profile: Dict[str, Any],
     total_turns: int = 10,
+    competencies: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Construct prompt requesting the stage_plan JSON artifact."""
+    """Construct prompt requesting the stage_plan JSON artifact.
+
+    When retrieved rubric competencies are supplied, the model is asked to assign a stage_type and
+    the competency ids each stage must gather evidence for.
+    """
+    rubric_section = ""
+    if competencies:
+        comp_lines = "\n".join(
+            f"- {sanitize_prompt_field(c.get('competency_id'), max_length=60)}: "
+            f"{sanitize_prompt_field(c.get('name'), max_length=80)} (weight {c.get('weight')})"
+            for c in competencies
+        )
+        rubric_section = f"""
+Competency Rubric (retrieved):
+{comp_lines}
+
+Assign every stage a `stage_type` (warmup | technical | system_design | behavioral | wrapup) and
+`criteria`: the competency ids above that the stage must gather evidence for.
+Every competency must appear in at least one stage.
+"""
+
     return f"""Interview Spec:
 {json.dumps(interview_spec, indent=2)}
 
@@ -230,7 +251,7 @@ Candidate Profile:
 {json.dumps(candidate_profile, indent=2)}
 
 Total Target Turns: {total_turns}
-
+{rubric_section}
 Task: Create a multi-stage interview progression blueprint in valid JSON format.
 Expected JSON Schema for `stage_plan`:
 {{
@@ -238,20 +259,26 @@ Expected JSON Schema for `stage_plan`:
     {{
       "stage_id": "stage_1",
       "name": "Warmup & Background Verification",
+      "stage_type": "warmup",
       "turns": 2,
-      "goals": ["Verify candidate project claims", "Assess communication baseline"]
+      "goals": ["Verify candidate project claims", "Assess communication baseline"],
+      "criteria": ["competency_id"]
     }},
     {{
       "stage_id": "stage_2",
       "name": "Technical Deep Dive",
+      "stage_type": "technical",
       "turns": 5,
-      "goals": ["Probe identified gap areas", "Evaluate problem-solving under constraints"]
+      "goals": ["Probe identified gap areas", "Evaluate problem-solving under constraints"],
+      "criteria": ["competency_id"]
     }},
     {{
       "stage_id": "stage_3",
       "name": "System Architecture & Wrapup",
+      "stage_type": "system_design",
       "turns": 3,
-      "goals": ["Architecture tradeoffs", "Candidate questions"]
+      "goals": ["Architecture tradeoffs", "Candidate questions"],
+      "criteria": ["competency_id"]
     }}
   ]
 }}

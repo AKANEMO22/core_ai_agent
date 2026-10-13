@@ -91,8 +91,9 @@ class TurnEvaluator:
         rubric_target: Optional[List[str]] = None,
         rubric_version: str = "rubric_v1",
         vad_metrics: Optional[Dict[str, Any]] = None,
+        **_: Any,
     ) -> Dict[str, Any]:
-        """Evaluate a single interview turn using the LLM provider.
+        """Evaluate a single interview turn using the LLM provider (legacy two-score mode).
 
         Args:
             question: Interviewer prompt / question.

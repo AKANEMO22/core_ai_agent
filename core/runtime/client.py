@@ -1,6 +1,6 @@
 """Protocol definitions and capability declarations for LLM providers."""
 
-from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 from pydantic import BaseModel, Field
 
 from core.runtime.types import IterationChunk
@@ -24,6 +24,48 @@ class ProviderCapabilities(BaseModel):
     safe_reasoning_summary: bool = Field(
         default=False, description="Supports safe reasoning preview/summary"
     )
+    json_mode: bool = Field(default=False, description="Supports constrained JSON object output")
+
+
+class ProfiledLLMClient:
+    """Wraps a client so every call defaults to one agent profile's model.
+
+    Components that call the provider directly (structured agents) get the model configured for
+    their profile without threading model ids through every call site.
+    """
+
+    def __init__(self, inner: Any, model: str = "") -> None:
+        self.inner = inner
+        self.model = model or getattr(inner, "model", "")
+        self._override = model
+        self.capabilities = inner.capabilities
+
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[IterationChunk]:
+        if self._override:
+            kwargs.setdefault("model", self._override)
+        return self.inner.stream_chat(messages=messages, tools=tools, **kwargs)
+
+
+class ProviderCapabilityError(RuntimeError):
+    """Raised at startup when a provider lacks a capability the runtime requires."""
+
+
+REQUIRED_CAPABILITIES = ("streaming", "usage_events", "cancellation")
+
+
+def verify_capabilities(client: Any, required: Tuple[str, ...] = REQUIRED_CAPABILITIES) -> None:
+    """Fail fast if the configured provider cannot serve the runtime's contract."""
+    capabilities = getattr(client, "capabilities", None)
+    if capabilities is None:
+        raise ProviderCapabilityError("provider does not declare capabilities")
+    missing = [name for name in required if not getattr(capabilities, name, False)]
+    if missing:
+        raise ProviderCapabilityError(f"provider lacks required capabilities: {missing}")
 
 
 @runtime_checkable

@@ -18,7 +18,14 @@ dependencies = [
     "httpx>=0.27.0",
     "jsonschema>=4.20.0",
     "websockets>=12.0",
+    "numpy>=2.1.0",
+    "scipy>=1.14.1",
+    "rank-bm25>=0.2.2",
+    "pypdf>=5.0.0",
 ]
+
+[project.optional-dependencies]
+rag-neural = ["sentence-transformers>=5.0.0"]
 
 [dependency-groups]
 dev = [
@@ -33,9 +40,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["api", "config", "core"]
+packages = ["api", "config", "core", "rag"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "skills"
+"config/agent_profiles.json" = "config/agent_profiles.json"
+"data/interview_frameworks.json" = "data/interview_frameworks.json"

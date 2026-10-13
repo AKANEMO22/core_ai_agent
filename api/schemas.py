@@ -51,8 +51,41 @@ class SessionStatusResponse(BaseModel):
     is_stage_complete: bool = False
     current_turn: int = 0
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    failure_code: Optional[str] = None
+    failure_message: Optional[str] = None
+    retrieval_status: Optional[str] = None
+    brief_status: Optional[str] = None
+    coverage: Optional[Dict[str, Any]] = None
     created_at: float
     updated_at: float
+
+
+class StartInterviewResponse(BaseModel):
+    """Result of starting the interview over REST (backend-driven flows)."""
+
+    session_id: str
+    status: str
+    turn_id: Optional[str] = None
+    interviewer_response: Optional[str] = None
+    error_code: Optional[str] = None
+
+
+class RequeueAssessmentsResponse(BaseModel):
+    """Result of an operator requeue of dead-lettered assessments."""
+
+    session_id: str
+    requeued_jobs: int
+    status: LifecycleStatus
+
+
+class ReviewRequest(BaseModel):
+    """Human reviewer decision for a report that requires review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_id: str = Field(..., min_length=1, max_length=128)
+    final_verdict: str = Field(..., pattern="^(PASS|FAIL)$")
+    notes: Optional[str] = Field(default=None, max_length=4000)
 
 
 class SessionReportResponse(BaseModel):
@@ -62,6 +95,8 @@ class SessionReportResponse(BaseModel):
     status: LifecycleStatus
     report_markdown: Optional[str] = None
     final_assessment: Optional[Dict[str, Any]] = None
+    decision: Optional[Dict[str, Any]] = None
+    verdict: Optional[str] = None
     created_at: Optional[float] = None
     completed_at: Optional[float] = None
     message: Optional[str] = None
@@ -149,6 +184,7 @@ class CandidateAnswerMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     type: str = "candidate_answer"
+    message_id: Optional[str] = None
     candidate_answer: Optional[str] = None
     answer: Optional[str] = None
     vad_metrics: Optional[Dict[str, Any]] = Field(default_factory=dict)
@@ -170,6 +206,14 @@ class CandidateAnswerMessage(BaseModel):
                 or ""
             )
         return ""
+
+    def get_message_id(self) -> Optional[str]:
+        """Extract the client message UUID used for exactly-once turn processing."""
+        if self.message_id:
+            return str(self.message_id)
+        if self.payload and isinstance(self.payload, dict) and self.payload.get("message_id"):
+            return str(self.payload["message_id"])
+        return None
 
     def get_vad_metrics(self) -> Dict[str, Any]:
         """Extract VAD delivery metrics dictionary."""

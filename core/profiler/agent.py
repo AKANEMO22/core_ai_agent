@@ -1,5 +1,6 @@
 """Pre-flight Reconnaissance Profiler Agent coordinating inputs, research tools, and blueprint synthesis."""
 
+import asyncio
 import json
 import logging
 import re
@@ -16,63 +17,18 @@ from core.profiler.prompts import (
     wrap_untrusted_candidate_data,
 )
 from core.profiler.tools import MarketIntelTool, SafeWebSearchTool
+from core.retrieval.knowledge import InterviewKnowledgeService, ground_stage_plan
 from core.runtime.agent import sanitize_secrets
 from core.runtime.client import RuntimeLLMClient
+from core.runtime.structured import (  # noqa: F401  (extract_json_payload re-exported)
+    StructuredOutputError,
+    extract_json_payload,
+    run_structured,
+)
 from core.runtime.tooling import RuntimeTool
 from core.workspace.session import SessionWorkspace
 
 logger = logging.getLogger(__name__)
-
-
-def extract_json_payload(text: str) -> Dict[str, Any]:
-    """Robustly parse JSON payload from LLM response text.
-
-    Handles clean JSON, markdown fenced blocks, and extracts outer JSON objects.
-    Ensures no raw prompt or candidate fragments leak in raised exceptions.
-
-    Args:
-        text: Raw response string from LLM provider.
-
-    Returns:
-        Dict[str, Any]: Extracted and parsed dictionary.
-
-    Raises:
-        ValueError: If valid JSON dictionary cannot be parsed from text.
-    """
-    clean_text = text.strip()
-
-    # 1. Direct JSON parse
-    try:
-        parsed = json.loads(clean_text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    # 2. Markdown fenced code block ```json ... ```
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean_text)
-    if match:
-        block = match.group(1).strip()
-        try:
-            parsed = json.loads(block)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    # 3. Outer curly braces extraction
-    start = clean_text.find("{")
-    end = clean_text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        slice_text = clean_text[start : end + 1]
-        try:
-            parsed = json.loads(slice_text)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError("Could not parse valid JSON object from model output")
 
 
 def redact_sensitive_candidate_data(
@@ -142,37 +98,42 @@ class ProfilerAgent:
     3. context/interview_spec.json
     4. context/stage_plan.json
 
+    When a knowledge service is configured, it also retrieves the rubric, question bank and
+    company knowledge, grounds the stage plan in them, and writes:
+    5. context/retrieved_knowledge.json (status "ok" or "degraded")
+    6. context/rubric.json (only when retrieval succeeded)
+
     Attributes:
         llm_client: Runtime LLM provider adapter.
         tools: Registered research and intelligence tools.
+        knowledge_service: Optional retrieval-backed knowledge service.
     """
 
     def __init__(
         self,
         llm_client: RuntimeLLMClient,
         tools: Optional[List[RuntimeTool]] = None,
+        knowledge_service: Optional[InterviewKnowledgeService] = None,
     ) -> None:
         self.llm_client = llm_client
         self.tools = tools if tools is not None else [SafeWebSearchTool(), MarketIntelTool()]
         self.tools_map: Dict[str, RuntimeTool] = {t.name: t for t in self.tools}
+        self.knowledge_service = knowledge_service
 
     async def _query_model(
         self,
         user_prompt: str,
         system_prompt: str = PROFILER_SYSTEM_PROMPT,
     ) -> Dict[str, Any]:
-        """Stream completion from LLM client and parse structured JSON dictionary."""
+        """Request a JSON object (provider JSON mode when available) with one repair round."""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        tokens: List[str] = []
-        async for chunk in self.llm_client.stream_chat(messages=messages):
-            if chunk.token:
-                tokens.append(chunk.token)
-
-        full_output = "".join(tokens)
-        return extract_json_payload(full_output)
+        try:
+            return await run_structured(self.llm_client, messages, {"type": "object"}, max_repairs=1)
+        except StructuredOutputError as e:
+            raise ValueError("Could not parse valid JSON object from model output") from e
 
     async def _gather_recon(
         self,
@@ -207,6 +168,69 @@ class ProfilerAgent:
                 logger.warning("Safe web search tool execution error (skipped): %s", sanitize_secrets(str(e)))
 
         return recon_data if recon_data else None
+
+    async def _retrieve_knowledge(
+        self,
+        target_company: str,
+        target_role: str,
+        form_data: Optional[Dict[str, Any]],
+        cv_text: Optional[str],
+    ) -> Dict[str, Any]:
+        """Retrieve the interview knowledge pack, degrading to an error record on failure.
+
+        Only role, skills, experience, company and job description reach the retrieval backend.
+
+        Returns:
+            Dict[str, Any]: The pack with status "ok", or {"status": "degraded", "error": ...}.
+        """
+        if self.knowledge_service is None:
+            return {"status": "disabled"}
+        skills: List[str] = []
+        experience_years: Optional[int] = None
+        job_description: Optional[str] = None
+
+        if form_data:
+            raw_skills = form_data.get("skills")
+            if isinstance(raw_skills, list):
+                skills = [sanitize_prompt_field(str(s), max_length=60) for s in raw_skills if s]
+            try:
+                raw_years = form_data.get("experience_years")
+                experience_years = int(raw_years) if raw_years is not None else None
+            except (TypeError, ValueError):
+                experience_years = None
+            raw_jd = form_data.get("job_description")
+            job_description = str(raw_jd) if raw_jd else None
+
+        if not skills and cv_text:
+            skills_match = re.search(r"Skills:\s*([^\n\r]+)", cv_text, re.IGNORECASE)
+            if skills_match:
+                skills = [
+                    sanitize_prompt_field(s, max_length=60)
+                    for s in skills_match.group(1).split(",")
+                ]
+        skills = [s for s in skills if s]
+
+        try:
+            pack = await self.knowledge_service.build_pack(
+                target_company=target_company,
+                target_role=target_role,
+                skills=skills,
+                experience_years=experience_years,
+                job_description=job_description,
+            )
+            return {"status": "ok", **pack}
+        except Exception as e:
+            clean_error = redact_sensitive_candidate_data(
+                str(e), form_data=form_data, cv_text=cv_text
+            )
+            logger.warning(
+                "Knowledge retrieval failed; continuing without grounding: %s", clean_error
+            )
+            return {
+                "status": "degraded",
+                "retrieval_backend": self.knowledge_service.backend_name,
+                "error": clean_error,
+            }
 
     def _load_inputs(self, workspace: SessionWorkspace) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Inspect workspace inputs directory and load form input or CV documents.
@@ -314,8 +338,24 @@ class ProfilerAgent:
             )
             wrapped_candidate = wrap_untrusted_candidate_data(combined_candidate)
 
-            # Execute safe reconnaissance with coordinated tools
-            recon_data = await self._gather_recon(target_company, target_role, workspace=workspace)
+            # Execute safe reconnaissance and knowledge retrieval concurrently
+            recon_coro = self._gather_recon(target_company, target_role, workspace=workspace)
+            knowledge: Optional[Dict[str, Any]] = None
+            if self.knowledge_service is not None:
+                recon_data, knowledge = await asyncio.gather(
+                    recon_coro,
+                    self._retrieve_knowledge(target_company, target_role, form_data, cv_text),
+                )
+            else:
+                recon_data = await recon_coro
+            knowledge_ok = knowledge is not None and knowledge.get("status") == "ok"
+
+            if knowledge_ok and knowledge.get("company_context"):
+                recon_data = dict(recon_data or {})
+                recon_data["knowledge_base"] = [
+                    {"topic": c["topic"], "content": c["content"], "confidence": c["confidence"]}
+                    for c in knowledge["company_context"]
+                ]
 
             # Step 1: Generate company intel (including candidate context so single-bundle works without hallucination)
             company_prompt = build_company_intel_prompt(
@@ -358,9 +398,13 @@ class ProfilerAgent:
                 plan_prompt = build_stage_plan_prompt(
                     interview_spec=interview_spec,
                     candidate_profile=candidate_profile,
+                    competencies=knowledge["rubric"]["competencies"] if knowledge_ok else None,
                 )
                 plan_res = await self._query_model(plan_prompt)
                 stage_plan = plan_res.get("stage_plan", plan_res)
+
+            if knowledge_ok:
+                stage_plan = ground_stage_plan(stage_plan, knowledge)
 
             # Atomically write all 4 artifacts through SessionWorkspace
             p1 = workspace.write_artifact(
@@ -384,15 +428,34 @@ class ProfilerAgent:
                 payload=stage_plan,
             )
 
+            artifacts = {
+                "company_intel": str(p1),
+                "candidate_profile": str(p2),
+                "interview_spec": str(p3),
+                "stage_plan": str(p4),
+            }
+            if knowledge is not None:
+                artifacts["retrieved_knowledge"] = str(
+                    workspace.write_artifact(
+                        "context/retrieved_knowledge.json",
+                        artifact_type="retrieved_knowledge",
+                        payload=knowledge,
+                    )
+                )
+            if knowledge_ok:
+                artifacts["rubric"] = str(
+                    workspace.write_artifact(
+                        "context/rubric.json",
+                        artifact_type="rubric",
+                        payload=knowledge["rubric"],
+                    )
+                )
+
             return {
                 "status": "SUCCESS",
                 "session_id": workspace.session_id,
-                "artifacts": {
-                    "company_intel": str(p1),
-                    "candidate_profile": str(p2),
-                    "interview_spec": str(p3),
-                    "stage_plan": str(p4),
-                },
+                "retrieval_status": knowledge["status"] if knowledge is not None else "disabled",
+                "artifacts": artifacts,
             }
 
         except Exception as e:
