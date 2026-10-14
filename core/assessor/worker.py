@@ -1,4 +1,10 @@
-"""Background assessor worker consuming Redis Streams evaluation tasks."""
+"""Background assessor worker consuming Redis Streams evaluation tasks.
+
+Xử lý một job chấm điểm từ queue với cơ chế giao ít nhất một lần.
+AssessorWorker kiểm tra phiên bị xóa, câu trả lời bị thay thế và artifact đã có,
+gọi evaluator rồi ghi artifact trước khi ghi completed/ACK và báo pipeline.
+Lỗi được đưa sang lịch retry hoặc dead-letter; pool chịu trách nhiệm đọc job liên tục.
+"""
 
 import asyncio
 import hashlib
@@ -206,6 +212,7 @@ class AssessorWorker:
         if not input_sha256:
             input_sha256 = hashlib.sha256(f"{question}:{candidate_text}".encode("utf-8")).hexdigest()
 
+        # Giữ lease khi kiểm tra/ghi trạng thái ngắn để phối hợp với thao tác xóa phiên.
         async with self.queue.session_mutation(session_id):
             if await self._discard_if_deleted(session_id, group_name, message_id):
                 return True
@@ -245,6 +252,7 @@ class AssessorWorker:
                         sanitize_secrets(str(e)),
                     )
 
+        # Gọi LLM ngoài lease: không giữ khóa phiên suốt thời gian mạng/model xử lý.
         # 3. Evaluate
         try:
             eval_result = await self._evaluate(
@@ -273,10 +281,12 @@ class AssessorWorker:
                 if key not in artifact_payload:
                     artifact_payload[key] = value
 
+            # Kiểm tra lại sau LLM vì phiên có thể đã bị xóa trong lúc đang chấm.
             async with self.queue.session_mutation(session_id):
                 if await self._discard_if_deleted(session_id, group_name, message_id):
                     return True
                 # 4. Atomically write the artifact, then record completion, then ACK
+                # Thứ tự artifact -> completed set -> ACK giúp lần giao lại tái dùng kết quả đã ghi.
                 write_task = asyncio.create_task(asyncio.to_thread(
                     ws.write_artifact, eval_rel_path, artifact_type="turn_evaluation",
                     payload=artifact_payload, schema_version=str(artifact_payload["schema_version"]),
@@ -324,6 +334,7 @@ class AssessorWorker:
                 retry_count = int(job_data.get("retry_count", 0)) + 1
                 job_data["retry_count"] = retry_count
 
+                # Đưa job vào delayed set trước ACK; hết budget thì DLQ và failed set chặn report.
                 if retry_count < self.max_retries:
                     delay = self.retry_base_delay_seconds * (2 ** (retry_count - 1))
                     delay += random.uniform(0, delay / 2)

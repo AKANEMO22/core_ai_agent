@@ -1,4 +1,9 @@
-"""Payload spillover management to disk when tool execution outputs exceed threshold."""
+"""Payload spillover management to disk when tool execution outputs exceed threshold.
+
+Runtime gọi ``maybe_spill`` sau khi tool trả kết quả: payload nhỏ đi thẳng về model,
+payload lớn được ghi vào ``spill/`` và trả preview/reference. Tool đọc lại bằng
+``read_spilled`` khi thật sự cần nội dung đầy đủ.
+"""
 
 import base64
 import json
@@ -48,6 +53,7 @@ class WorkspaceSpillManager:
         Returns:
             dict: Metadata containing either unspilled payload or spill reference with preview.
         """
+        # Đo kích thước byte UTF-8/nhị phân thay vì số ký tự để ngưỡng tương ứng với kích thước lưu/truyền.
         is_binary = False
         if isinstance(payload, str):
             payload_str = payload
@@ -81,7 +87,7 @@ class WorkspaceSpillManager:
                 "tool_name": tool_name,
             }
 
-        # Payload exceeds threshold: spill to spill/ directory
+        # Chỉ payload lớn mới ghi artifact; caller nhận preview và đường dẫn để tránh phình context/tool event.
         clean_tool = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_name)
         spill_filename = f"spill_tool_{clean_tool}_{uuid.uuid4().hex[:12]}.json"
         rel_spill_path = f"spill/{spill_filename}"
@@ -117,6 +123,7 @@ class WorkspaceSpillManager:
         Returns:
             Any: Original payload stored in the artifact.
         """
+        # Đọc qua validator cùng workspace để reference từ tool không thể thoát sandbox.
         resolved = self.workspace.resolve_path(spill_path)
         with open(resolved, "r", encoding="utf-8") as f:
             data = json.load(f)

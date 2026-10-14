@@ -3,6 +3,12 @@
 Every quote the narrative cites is re-verified against the candidate's actual turns; unverifiable
 quotes are removed before the report is written. If the model fails, a template narrative built
 from the evaluations is used instead.
+
+
+Viết phần diễn giải báo cáo từ quyết định đã được tính bởi decision.py.
+NarrativeWriter.write nhận decision, evaluations, transcript và ghi chú; gọi LLM
+hoặc dùng mẫu dự phòng, rồi loại trích dẫn không khớp trước khi trả narrative.
+ReportSynthesizer chịu trách nhiệm lưu báo cáo, còn module này chỉ tạo nội dung.
 """
 
 import asyncio
@@ -92,6 +98,7 @@ class NarrativeWriter:
     def verify_citations(narrative: Dict[str, Any], candidate_texts: List[str]) -> int:
         """Remove quotes that do not occur in any candidate answer. Returns how many were removed."""
         removed = 0
+        # Đối chiếu trên tập transcript thật, không dùng rationale do model tự viết làm nguồn.
         corpus = "\n".join(candidate_texts)
         for finding in narrative.get("criterion_findings", []):
             kept = []
@@ -112,6 +119,7 @@ class NarrativeWriter:
         claims: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return a verified narrative (model-written when possible, else template)."""
+        # Verdict đã chốt ở decision.py; LLM chỉ bổ sung phần diễn giải và kế hoạch luyện tập.
         narrative: Optional[Dict[str, Any]] = None
         if self.llm is not None:
             context = {
@@ -145,6 +153,7 @@ class NarrativeWriter:
                 narrative["source"] = "model"
             except StructuredOutputError as e:
                 logger.warning("Narrative fell back to template: %s", str(e)[:200])
+        # Mẫu dự phòng giữ báo cáo tạo được ngay cả khi provider hoặc structured output lỗi.
         if narrative is None:
             narrative = self.template(decision, evaluations)
         # Narrative vẫn là đầu ra của model/template; chỉ giữ trích dẫn khớp transcript thật.

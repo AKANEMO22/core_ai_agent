@@ -11,6 +11,12 @@ After each completed candidate turn N it:
 
 The orchestrator never mutates lifecycle state (that is the speaker's turn path), so it can never
 race the next turn's compare-and-set. Any failure yields a deterministic fallback directive.
+
+Điểm điều phối sau mỗi lượt ứng viên: run_cycle(session_id, turn_number) đọc
+state và artifact, gọi agent phụ, dựng coverage/notebook rồi quyết định directive
+cho lượt N+1. Speaker tiêu thụ directive và chịu trách nhiệm đổi lifecycle;
+module này chỉ đề xuất hành động, không tự chuyển stage trong state store.
+Kết quả LLM phải qua cổng kiểm tra rubric/ngân sách; lỗi hoặc quá hạn dùng fallback.
 """
 
 import asyncio
@@ -20,6 +26,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from core.language import interview_language_instruction, workspace_interview_language
 from core.orchestration.blackboard import Blackboard
 from core.orchestration.brief import BRIEF_PATH
 from core.orchestration.coverage import CoverageTracker, load_evaluations
@@ -216,6 +223,7 @@ class InterviewOrchestrator:
         return directive
 
     async def _cycle(self, session_id: str, turn_number: int, started: float) -> Optional[Directive]:
+        # Chỉ tạo directive khi session còn STAGE_ACTIVE; phiên đã đổi lifecycle không cần chu kỳ mới.
         ctx = await self._context(session_id)
         if ctx is None:
             return None
@@ -302,6 +310,7 @@ class InterviewOrchestrator:
         pool = self._question_pool(stage, next_stage, asked_ids, follow_ups)
         brief = workspace.read_text(BRIEF_PATH) if workspace.exists(BRIEF_PATH) else ""
         decision = await self._decide(
+            interview_language=workspace_interview_language(workspace),
             brief=brief,
             notebook=notebook_md,
             latest_question=latest_question,
@@ -382,7 +391,14 @@ class InterviewOrchestrator:
         try:
             return await run_structured(
                 self.llm,
-                [{"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT}, {"role": "user", "content": user}],
+                [
+                    {
+                        "role": "system",
+                        "content": ORCHESTRATOR_SYSTEM_PROMPT + "\n\n"
+                        + interview_language_instruction(ctx.get("interview_language")),
+                    },
+                    {"role": "user", "content": user},
+                ],
                 DECISION_SCHEMA,
                 max_repairs=1,
                 semaphore=self.llm_semaphore,
@@ -491,6 +507,7 @@ class InterviewOrchestrator:
     ) -> None:
         workspace = ctx["workspace"]
         next_turn = turn_number + 1
+        # Ghi directive cho N+1 trước, rồi đánh dấu on_time theo state mới đọc; không sửa lifecycle.
         await asyncio.to_thread(self.directives.write, workspace, next_turn, directive)
         current = await self.state_store.aget(session_id)
         on_time = current is not None and current.current_turn == turn_number

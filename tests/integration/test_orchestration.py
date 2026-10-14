@@ -62,6 +62,9 @@ async def test_brief_is_written_after_profiling_and_status_exposed(tmp_path: Pat
     for section in ("## Interview frame", "## Stages", "## CV points to probe", "## Risks"):
         assert section in brief
     assert "level 3 looks like" in brief
+    rubric_artifact = ws.read_json("context/rubric.json")
+    rubric = rubric_artifact.get("payload", rubric_artifact)
+    assert rubric["competencies"], "omitted experience years must not empty a title-grounded senior rubric"
 
 
 @pytest.mark.asyncio
@@ -156,10 +159,11 @@ async def test_coverage_gate_blocks_premature_transition(tmp_path: Path):
     )
     controller = app.state.controller
     await controller.start_interview(session_id)
-    await controller.submit_answer(session_id, "m1", ANSWERS[0])  # warmup (1 turn) -> technical
-    await controller.drain()
+    for index, answer in enumerate(ANSWERS[:3], start=1):
+        await controller.submit_answer(session_id, f"m{index}", answer)
+        await controller.drain()
     ws = app.state.workspace_mgr.get_or_create_workspace(session_id)
-    gated = ws.read_json("orchestration/directive_2.json")
+    gated = ws.read_json("orchestration/directive_4.json")
     assert gated["mode"] == "next_question"
     assert gated["reason"].startswith("coverage gate")
 

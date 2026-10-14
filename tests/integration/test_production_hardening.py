@@ -28,6 +28,9 @@ ANSWERS = [
     "I lead the payments platform team and own the ledger service.",
     "We guarantee exactly-once payments with idempotency keys stored transactionally.",
     "To avoid stampedes we use request coalescing and jittered expirations.",
+    "I would compare consistency, latency, and operational risk before choosing a design.",
+    "We validate changes with load tests, alerts, staged releases, and rollback criteria.",
+    "I would clarify ownership and trade-offs with the teams that operate the service.",
 ]
 
 
@@ -54,7 +57,7 @@ async def _create(app: Any, settings: Settings) -> Tuple[str, str]:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
         res = await client.post(
             "/api/v1/sessions",
-            json={"candidate_name": "Tester", "target_company": "Acme Systems", "target_role": "Senior Backend Engineer"},
+            json={"candidate_name": "Tester", "target_company": "Acme Systems", "target_role": "Senior Backend Engineer", "duration_minutes": 10},
             headers=_headers(settings),
         )
         assert res.status_code == 202, res.text
@@ -87,14 +90,16 @@ async def test_restart_resumes_session_without_duplicate_turns(tmp_path: Path) -
     opening_again = await controller.start_interview(session_id)
     assert opening_again.status == "replayed" and llm_b.call_count == 0
 
-    second = await controller.submit_answer(session_id, "m2", ANSWERS[1], expected_turn=2)
-    third = await controller.submit_answer(session_id, "m3", ANSWERS[2], expected_turn=3)
-    assert (second.turn_id, third.turn_id) == ("turn_002", "turn_003")
+    later_turns = [
+        await controller.submit_answer(session_id, f"m{index}", answer, expected_turn=index)
+        for index, answer in enumerate(ANSWERS[1:], start=2)
+    ]
+    assert [turn.turn_id for turn in later_turns] == [f"turn_{index:03d}" for index in range(2, len(ANSWERS) + 1)]
     await controller.drain()
 
     state = await app_b.state.state_mgr.aget(session_id)
     assert state.status == LifecycleStatus.ASSESSING
-    assert state.metadata["expected_assessments"] == 3
+    assert state.metadata["expected_assessments"] == len(ANSWERS)
 
     # Workers of the new process evaluate everything; the callback synthesizes the report
     queue = app_b.state.assessment_queue

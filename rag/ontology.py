@@ -122,8 +122,10 @@ ROLE_PATTERNS = [
     ("IF_BE_NET", r"\.net|c#|dotnet"),
     ("IF_BE_PHP", r"\bphp\b|laravel"),
     ("IF_FE", r"front[ -]?end|react|vue|angular"),
-    ("IF_BE_GEN", r"back[ -]?end|python|django|fastapi|node\.?js|golang"),
+    # Prefer an explicit generic SWE job title (especially Intern) over languages
+    # mentioned in its JD, since backend-specific frameworks may not cover Intern.
     ("IF_SWE", r"software engineer"),
+    ("IF_BE_GEN", r"back[ -]?end|python|django|fastapi|node\.?js|golang"),
     ("IF_SWD", r"software developer|lập trình viên phần mềm"),
 ]
 

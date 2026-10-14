@@ -1,4 +1,10 @@
-"""Report synthesizer: assessment barrier, deterministic decision, verified narrative, report artifacts."""
+"""Report synthesizer: assessment barrier, deterministic decision, verified narrative, report artifacts.
+
+Ghép kết quả từng lượt thành quyết định và báo cáo cuối phiên.
+ReportSynthesizer kiểm tra barrier Redis, đọc artifact/rubric rồi gọi decision.py
+và NarrativeWriter; lưu decision.json, final_assessment.json, interview_report.md
+trước khi chuyển REPORT_READY và phát event. ReviewService lưu ý kiến người duyệt riêng.
+"""
 
 import asyncio
 import json
@@ -21,11 +27,13 @@ from core.assessor.queue import (
     failed_assessments_key,
 )
 from core.orchestration.coverage import load_evaluations
+from core.observability import session_ref
 from core.runtime.agent import sanitize_secrets
 from core.runtime.client import RuntimeLLMClient
 from core.runtime.types import LoopEvent, LoopEventType
 from core.session.events import SessionEventStore
 from core.session.state import LifecycleStatus, SessionStateStore
+from core.storage.archive import ArtifactArchive
 from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -72,6 +80,7 @@ class ReportSynthesizer:
         decision_config: Optional[DecisionConfig] = None,
         narrative_writer: Optional[NarrativeWriter] = None,
         extra_versions: Optional[Dict[str, Any]] = None,
+        artifact_archive: Optional[ArtifactArchive] = None,
     ) -> None:
         """Initialize ReportSynthesizer.
 
@@ -85,6 +94,7 @@ class ReportSynthesizer:
             decision_config: Decision thresholds and product mode.
             narrative_writer: Narrative generator (defaults to one using `llm_client`).
             extra_versions: Version fields recorded in every decision (e.g. prompt versions).
+            artifact_archive: Optional durable archive used after report artifacts are finalized.
         """
         self.redis_client = redis_client
         self.workspace_resolver = workspace_resolver
@@ -95,6 +105,7 @@ class ReportSynthesizer:
         self.decision_config = decision_config or DecisionConfig()
         self.narrative_writer = narrative_writer or NarrativeWriter(llm_client)
         self.extra_versions = dict(extra_versions or {})
+        self.artifact_archive = artifact_archive
 
     def _get_workspace(self, session_id: str) -> SessionWorkspace:
         if hasattr(self.workspace_resolver, "get_or_create_workspace"):
@@ -112,6 +123,7 @@ class ReportSynthesizer:
         completed_count = await self.redis_client.scard(completed_assessments_key(session_id))
         failed_count = await self.redis_client.scard(failed_assessments_key(session_id))
 
+        # expected chưa biết khác với 0: không được phát report chỉ vì chưa có counter.
         expected = expected_assessments
         if expected is None:
             raw_exp = await self.redis_client.get(expected_assessments_key(session_id))
@@ -184,7 +196,9 @@ class ReportSynthesizer:
         if not rubric.get("competencies"):
             rubric, rubric_source = self._legacy_rubric(evaluations), "legacy"
 
+        # Quyết định tính bằng code trước; narrative không được tự sửa verdict hay điểm.
         decision = compute_decision(rubric, evaluations, self.decision_config, self._versions(ws, rubric, evaluations))
+        # Rubric dự phòng chỉ phục vụ tương thích; thiếu rubric truy xuất buộc người duyệt xác nhận.
         if rubric_source == "legacy" and decision["verdict"] != NEEDS_REVIEW:
             decision["verdict"] = NEEDS_REVIEW
             decision["requires_human_review"] = True
@@ -247,6 +261,7 @@ class ReportSynthesizer:
         }
         report_markdown = self._render_markdown(decision, narrative, final_assessment, rubric, evaluations, claims)
 
+        # Lưu đủ đầu ra trước khi chuyển trạng thái/phát event để người đọc thấy file báo cáo.
         await asyncio.to_thread(ws.write_text, DECISION_PATH, decision_json(decision))
         await asyncio.to_thread(
             ws.write_artifact, "reports/final_assessment.json", artifact_type="final_assessment", payload=final_assessment
@@ -275,6 +290,22 @@ class ReportSynthesizer:
                         "overall_score": decision["weighted_score"],
                         "report_synthesized_at": time.time(),
                     },
+                )
+
+        if self.artifact_archive is not None:
+            try:
+                await asyncio.to_thread(
+                    self.artifact_archive.archive_session,
+                    session_id,
+                    ws.root_path,
+                    owner_id=session_id,
+                )
+            except Exception as exc:
+                # Report completion is independent from storage; retention retries while local files remain.
+                logger.warning(
+                    "Artifact archive pending for session %s: %s",
+                    session_ref(session_id),
+                    sanitize_secrets(str(exc)),
                 )
 
         await self._publish(session_id, LoopEventType.DECISION_READY, {
@@ -398,6 +429,7 @@ class ReviewService:
             else self.workspace_resolver(session_id)
         )
         decision = json.loads(ws.read_text(DECISION_PATH)) if ws.exists(DECISION_PATH) else {}
+        # Ý kiến người duyệt được lưu riêng, kèm digest liên kết tới quyết định đã tính.
         review = {
             "reviewer_id": reviewer_id,
             "final_verdict": final_verdict,

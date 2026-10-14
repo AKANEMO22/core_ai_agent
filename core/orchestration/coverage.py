@@ -1,4 +1,11 @@
-"""Criterion coverage: how much verified evidence the interview has gathered per competency."""
+"""Criterion coverage: how much verified evidence the interview has gathered per competency.
+
+Chuyển các evaluation artifact đã có thành mức bao phủ từng competency.
+Orchestrator gọi load_evaluations -> CoverageTracker.build -> summary để biết
+cần hỏi thêm hay được kết thúc stage. Schema mới chỉ cộng evidence có quote
+verified; schema cũ được quy đổi điểm với confidence cố định thấp hơn.
+Covered là đủ lượng evidence theo confidence, không đồng nghĩa đã đạt pass_level.
+"""
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -56,6 +63,7 @@ class CriterionCoverage:
 
     @property
     def level(self) -> Optional[float]:
+        # Level là trung bình có trọng số evidence, độc lập với weight của competency trong rubric.
         total = sum(e.weight for e in self.evidence)
         if total <= 0:
             return None
@@ -124,6 +132,7 @@ class CoverageTracker:
                             primary=bool(item.get("primary", True)),
                         )
                     )
+            # Artifact cũ thiếu evidence theo criterion nên dùng ánh xạ điểm với confidence bảo thủ.
             else:
                 level = legacy_level(evaluation.get("content_score"))
                 if level is None:

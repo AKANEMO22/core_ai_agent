@@ -1,4 +1,10 @@
-"""Core streaming agent loop with tool execution, soft schema repair, and budget control."""
+"""Core streaming agent loop with tool execution, soft schema repair, and budget control.
+
+Luồng sử dụng: Vòng điều khiển một lượt agent: nhận lịch sử chat, gọi provider, phát LoopEvent cho tầng session.
+API lắp RuntimeAgent với profile và tool; run_loop_streaming nối kết quả tool vào lịch sử
+rồi gọi model tiếp, đến khi có câu trả lời cuối hoặc chạm giới hạn vòng/thời gian/hủy.
+Policy, hook và schema được kiểm tra trước khi chạy tool; workspace giữ đầu ra lớn ngoài prompt.
+"""
 
 import asyncio
 import json
@@ -145,6 +151,7 @@ class RuntimeAgent:
                 payload=payload,
             )
 
+        # Sao chép danh sách để lịch sử làm việc của lượt không nối thêm phần tử vào input của caller.
         working_messages = list(messages)
         visible_tools = self.policy.visible_tools(self.profile, self.tools)
         formatted_tools = [t.to_openai_format() for t in visible_tools] if visible_tools else None
@@ -220,6 +227,7 @@ class RuntimeAgent:
                     tools=formatted_tools,
                     **kwargs,
                 )
+                # Deadline dùng đồng hồ monotonic và áp lên từng lần chờ chunk, không chỉ lúc mở request.
                 iterator = stream.__aiter__()
                 try:
                     while True:
@@ -430,6 +438,7 @@ class RuntimeAgent:
                         continue
 
                     # Validate schema
+                    # Lỗi schema thành tool result để model tự sửa; ngân sách sửa dùng chung cho cả lượt.
                     is_valid, violations = tool.validate_arguments(parsed_args)
                     if not is_valid:
                         if schema_repairs_used < self.schema_repair_budget:
@@ -503,6 +512,7 @@ class RuntimeAgent:
                     # Check spillover threshold if session workspace is attached
                     if self.workspace:
                         spill_mgr = WorkspaceSpillManager(self.workspace)
+                        # Event giữ đường dẫn/preview; prompt chỉ nhận phần gọn để đầu ra lớn không làm phình context.
                         spill_info = spill_mgr.maybe_spill(tool_name, execution_result)
                         if spill_info["is_spilled"]:
                             preview_text = spill_info["preview"]

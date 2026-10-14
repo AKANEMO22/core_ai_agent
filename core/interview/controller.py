@@ -1,8 +1,11 @@
-"""Transport-independent interview session controller.
+"""Điểm điều khiển phiên dùng chung cho adapter REST và WebSocket.
 
-Serializes turns per session, enforces idempotency, backpressure and cancellation, publishes
-every turn event, and schedules post-turn work. The WebSocket gateway and the REST API are
-thin adapters over this class.
+Adapter gọi start_interview hoặc submit_answer với session_id/nội dung client.
+Controller kiểm tra hủy, tốc độ và ledger, lấy lease phiên cùng slot generation,
+rồi gọi runner và publish các event. Kết quả TurnRequestResult cho adapter biết
+lượt hoàn tất, bị ngắt, phát lại, bị từ chối hay cần thử lại. Sau lượt thành công,
+hook chấm/tóm tắt được lên lịch nền; xử lý request trùng phải giữ message → turn
+và payload hash để tránh gọi LLM lại cho một câu trả lời đã hoàn tất.
 """
 
 import asyncio
@@ -313,6 +316,7 @@ class InterviewSessionController:
         if self.cancellations.is_session_cancelled(session_id):
             return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="SESSION_CANCELLED")
 
+        # Lease theo phiên tuần tự hóa lượt giữa các process; slot generation giới hạn toàn bộ tải.
         lock_token = await self.lease.acquire(self._lock_key(session_id), self.turn_lock_ttl_ms)
         if lock_token is None:
             return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="TURN_IN_PROGRESS")
@@ -407,7 +411,7 @@ class InterviewSessionController:
 
         lock_token = await self.lease.acquire(self._lock_key(session_id), self.turn_lock_ttl_ms)
         if lock_token is None:
-            return TurnRequestResult(status="rejected", error_code="TURN_IN_PROGRESS")
+            return self._busy("TURN_IN_PROGRESS")
 
         registered = False
         turn_id: Optional[str] = None
@@ -492,8 +496,10 @@ class InterviewSessionController:
             if summary["status"] == "failed":
                 return TurnRequestResult(status="failed", turn_id=turn_id, error_code="TURN_FAILED")
 
+            # Chỉ đánh dấu hoàn tất sau khi stream đã publish kết quả; retry sau đó đi qua replay.
             await self.ledger.complete(session_id, message_id)
             registered = False
+            # Hook chạy nền và được registry theo dõi để hủy phiên có thể dừng công việc liên quan.
             for hook in self.after_turn_hooks:
                 self._spawn(session_id, hook(session_id, turn_number), f"after_turn:{turn_id}")
             if summary["dialogue_completed"]:

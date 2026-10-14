@@ -1,4 +1,10 @@
-"""Data models and event definitions for agent streaming runtime execution loop."""
+"""Data models and event definitions for agent streaming runtime execution loop.
+
+Luồng sử dụng: Hai lớp dữ liệu nối provider, agent và tầng phát sự kiện session.
+Provider phát IterationChunk (token/tool/usage); RuntimeAgent chuyển thành LoopEvent có
+session_id, turn_id và sequence để caller truyền đi và lưu lại. LoopEventType còn chứa
+sự kiện nghiệp vụ interview; LoopStatus mô tả trạng thái của riêng vòng agent.
+"""
 
 import time
 import uuid
@@ -92,6 +98,7 @@ class LoopEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: f"evt_{uuid.uuid4().hex[:16]}")
     session_id: str
     turn_id: str
+    # RuntimeAgent tăng sequence trong từng lượt; tầng session có thể bổ sung thứ tự lưu/broadcast riêng.
     sequence: int
     timestamp: Union[float, str] = Field(default_factory=time.time)
     type: LoopEventType

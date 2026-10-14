@@ -1,4 +1,9 @@
-"""Agent profiles: per-role model, tools, budgets, deadlines and compaction policy."""
+"""Agent profiles: per-role model, tools, budgets, deadlines and compaction policy.
+
+Luồng sử dụng: Cấu hình từng vai trò được API nạp lúc khởi động: model, tool được phép, vòng gọi và deadline.
+load_profiles hợp nhất mặc định, file JSON, rồi chuỗi override; trả bản đồ AgentProfile
+sau khi kiểm tra các ràng buộc môi trường. Runtime, policy và compactor cùng dùng profile này.
+"""
 
 import json
 import logging
@@ -139,6 +144,7 @@ def validate_profiles(profiles: Mapping[str, AgentProfile], app_env: str = "deve
             dev_tools = sorted(profile.allowed_tools & DEV_ONLY_TOOLS)
             if dev_tools:
                 errors.append(f"profile '{name}' enables development-only tools {dev_tools}")
+        # Speaker chỉ sinh câu trả lời trực tiếp; cấm tool để giữ giới hạn độ trễ của đường gọi này.
         if name == "speaker" and profile.allowed_tools:
             errors.append("the speaker profile must not have tools (hot-path latency contract)")
         if profile.max_iterations < 1:
@@ -164,6 +170,7 @@ def load_profiles(
     if overrides_json.strip():
         sources.append(json.loads(overrides_json))
 
+    # Nguồn sau ghi đè nguồn trước; compaction được ghép từng trường thay vì thay cả policy.
     for source in sources:
         for name, values in source.get("profiles", source).items():
             base = profiles.get(name, AgentProfile(name=name)).to_dict()

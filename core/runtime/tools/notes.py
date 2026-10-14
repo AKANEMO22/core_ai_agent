@@ -3,6 +3,12 @@
 Notes are capped per section and may not quote the candidate verbatim (more than 12 consecutive
 words). Candidate speech belongs in the code-rendered evidence log, so injected instructions in
 an answer cannot become part of the orchestrator's trusted memory.
+
+
+Luồng sử dụng: Lưu phần ghi chú do orchestrator sửa, được notebook/orchestrator đọc lại trong lượt sau.
+UpdateNotesTool nhận section/text rồi chuyển cho NotesStore kiểm tra giới hạn, trùng
+trích dẫn dài từ candidate và ghi artifact có lịch sử; trả dict status cho runtime.
+Evidence nguyên văn được lưu ở luồng khác, ghi chú này dành cho nhận xét diễn giải.
 """
 
 import re
@@ -66,6 +72,7 @@ class NotesStore:
         cap = NOTE_SECTIONS[section]
         if len(text) > cap:
             return {"status": "invalid", "error": f"section '{section}' is limited to {cap} characters"}
+        # So với lời candidate đã lưu trước khi ghi, tránh đưa trích dẫn dài vào bộ nhớ ghi chú.
         if contains_verbatim_quote(text, self.candidate_texts()):
             return {
                 "status": "invalid",
@@ -74,6 +81,7 @@ class NotesStore:
         notes = self.load()
         notes["sections"][section] = text
         notes["history"].append({"section": section, "author": author, "at": time.time(), "length": len(text)})
+        # Giữ dấu vết cập nhật gần nhất nhưng chặn lịch sử metadata tăng không giới hạn.
         notes["history"] = notes["history"][-200:]
         self.workspace.write_artifact(NOTES_PATH, artifact_type="notebook_notes", payload=notes)
         return {"status": "ok", "section": section, "length": len(text)}

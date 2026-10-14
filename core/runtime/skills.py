@@ -9,6 +9,11 @@ Each file starts with front matter:
     name: technical
     version: 1.0.0
     ---
+
+
+Luồng sử dụng: Registry nội dung markdown của ứng dụng, được API khởi tạo cho speaker/brief và các caller khác.
+Đọc playbook theo họ vai trò và loại stage, hoặc template theo tên; trả Skill kèm version/hash
+để truy vết nội dung đã dùng. Việc chọn file do code quyết định, không nhận đường dẫn từ model.
 """
 
 import hashlib
@@ -71,6 +76,7 @@ class SkillRegistry:
         self.root = Path(root or DEFAULT_SKILLS_ROOT)
         self._playbooks: Dict[Tuple[str, str], Skill] = {}
         self._templates: Dict[str, Skill] = {}
+        # Nạp ngay khi tạo registry: front matter lỗi được báo ở khởi động thay vì giữa lượt.
         self.load()
 
     def _load_file(self, path: Path, default_name: str) -> Skill:
@@ -100,6 +106,7 @@ class SkillRegistry:
     def get_playbook(self, role_family: Optional[str], stage_type: Optional[str]) -> Optional[Skill]:
         """Playbook for a role family and stage type, falling back to the `any` family."""
         stage = stage_type or "technical"
+        # Fallback chỉ đổi họ vai trò sang any, vẫn giữ đúng loại stage đang được yêu cầu.
         return self._playbooks.get((role_family or "any", stage)) or self._playbooks.get(("any", stage))
 
     def get_template(self, name: str) -> Optional[Skill]:

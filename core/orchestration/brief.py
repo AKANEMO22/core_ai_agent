@@ -3,6 +3,12 @@
 The model writes only narrative fields (frame, persona notes, CV probes, risks). Stage structure,
 criteria with anchors and question candidates are rendered by code from retrieved artifacts, so
 the brief cannot invent criteria or leak evaluator-only expected answers.
+
+Tạo tài liệu định hướng cố định sau profiling, trước khi bắt đầu hỏi đáp.
+InterviewBriefWriter.write đọc context/*.json, xin LLM phần diễn giải rồi ghép
+stage/rubric/câu hỏi bằng code thành context/interview_brief.md. Orchestrator
+đọc tài liệu này ở mỗi chu kỳ. Nội dung diễn giải bị kiểm tra rò expected_points;
+lỗi sinh JSON hoặc validation khiến writer dùng phần diễn giải dự phòng.
 """
 
 import asyncio
@@ -10,6 +16,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from core.language import interview_language_instruction, workspace_interview_language
 from core.runtime.client import RuntimeLLMClient
 from core.runtime.sanitize import sanitize_secrets
 from core.runtime.skills import SkillRegistry
@@ -155,6 +162,7 @@ class InterviewBriefWriter:
         knowledge = _payload(workspace, "context/retrieved_knowledge.json")
         template = self.skills.get_template("interview_brief") if self.skills else None
         instructions = template.content if template else "Write the interview brief. Respond with JSON only for `interview_brief`."
+        # Chỉ gửi dữ liệu định hướng; đáp án expected_points không thuộc context để LLM viết narrative.
         context = {
             "company_intel": _payload(workspace, "context/company_intel.json"),
             "candidate_profile": _payload(workspace, "context/candidate_profile.json"),
@@ -166,7 +174,11 @@ class InterviewBriefWriter:
             ],
         }
         messages = [
-            {"role": "system", "content": instructions},
+            {
+                "role": "system",
+                "content": instructions + "\n\n"
+                + interview_language_instruction(workspace_interview_language(workspace)),
+            },
             {
                 "role": "user",
                 "content": "<untrusted_context>\n"
@@ -183,6 +195,7 @@ class InterviewBriefWriter:
             logger.warning("Brief generation fell back to template: %s", sanitize_secrets(str(e)))
             narrative, status = self._fallback_narrative(workspace), "fallback"
 
+        # Stage và tiêu chí được ghép từ artifact thay vì giao LLM viết lại cấu trúc.
         markdown = self._render(narrative, workspace)
         if self.validate(markdown, knowledge, narrative):
             narrative, status = self._fallback_narrative(workspace), "fallback"

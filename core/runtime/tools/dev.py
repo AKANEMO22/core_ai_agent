@@ -2,6 +2,12 @@
 
 These mirror a minimal coding-agent harness for offline tooling and experiments. They are refused
 when APP_ENV=production, and agent profiles that enable them fail validation in production.
+
+
+Luồng sử dụng: Factory tool tổng quát cho thí nghiệm phát triển: đọc/ghi/sửa file và chạy shell trong cwd chỉ định.
+build_dev_tools nhận thư mục gốc/môi trường, trả danh sách RuntimeTool; production bị từ chối.
+Tool file kiểm tra đường dẫn và trả dict status; shell có timeout/giới hạn output.
+Thư mục cwd của shell không phải ranh giới cô lập hệ điều hành cho lệnh tùy ý.
 """
 
 import asyncio
@@ -55,6 +61,7 @@ def build_dev_tools(sandbox_root: Path, app_env: str, bash_timeout_seconds: floa
         if not target.is_file():
             return {"status": "not_found"}
         text = target.read_text(encoding="utf-8")
+        # Chỉ sửa khi khớp đúng một chỗ để không âm thầm thay nhiều đoạn giống nhau.
         count = text.count(old_text)
         if count != 1:
             return {"status": "invalid", "error": f"old_text must match exactly once (matched {count})"}
@@ -62,6 +69,7 @@ def build_dev_tools(sandbox_root: Path, app_env: str, bash_timeout_seconds: floa
         return {"status": "ok"}
 
     async def bash(command: str, **_: Any) -> Dict[str, Any]:
+        # Lệnh chạy trong shell thật; cwd đặt thư mục làm việc, không giới hạn quyền của process.
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=str(root),

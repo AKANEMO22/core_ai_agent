@@ -1,4 +1,9 @@
-"""Workspace retention policy and idempotent cleanup manager."""
+"""Workspace retention policy and idempotent cleanup manager.
+
+DELETE phiên gọi ``delete_workspace`` theo session ID; job dọn định kỳ gọi
+``cleanup_expired_workspaces`` để quét theo mtime. Cả hai đều chỉ xóa thư mục con an toàn
+bên dưới workspace root, không nhận một đường dẫn tùy ý từ caller.
+"""
 
 import os
 import shutil
@@ -55,7 +60,8 @@ class WorkspaceCleanupManager:
         if not session_id_or_dir or not str(session_id_or_dir).strip():
             return None
 
-        # Verify path safety to prevent directory traversal
+        # Thử tên thư mục trực tiếp trước, sau đó mới ánh xạ raw session ID sang tên đã chuẩn hóa.
+        # Mọi nhánh đều qua validator để ID không thể biến thành đường dẫn xóa tùy ý.
         target_path = validate_path_safety(self.root_base, session_id_or_dir)
 
         # Enforce that target is strictly a descendant of root_base (not root_base itself)
@@ -82,6 +88,7 @@ class WorkspaceCleanupManager:
         Returns:
             bool: True if workspace existed and was deleted, False if already absent.
         """
+        # Xóa idempotent: retry sau khi đã xóa trả False thay vì coi là lỗi.
         ws_dir = self._resolve_workspace_dir(session_id_or_dir)
         if ws_dir is None or not ws_dir.exists():
             return False
@@ -92,13 +99,18 @@ class WorkspaceCleanupManager:
         except FileNotFoundError:
             return False
 
-    def cleanup_expired_workspaces(self, max_age_hours: Optional[int] = None) -> List[str]:
+    def cleanup_expired_workspaces(
+        self,
+        max_age_hours: Optional[int] = None,
+        protect_session_ids: Optional[List[str]] = None,
+    ) -> List[str]:
         """Scan workspace root and remove workspaces older than retention threshold.
 
         Considers latest modification time across workspace root and all contained files.
 
         Args:
             max_age_hours: Override retention period in hours.
+            protect_session_ids: Sessions whose only durable copy is not yet archived.
 
         Returns:
             List[str]: List of deleted workspace directory names.
@@ -106,12 +118,16 @@ class WorkspaceCleanupManager:
         if not self.root_base.exists():
             return []
 
+        # Tuổi workspace lấy file mới nhất, vì write file con có thể không chạm mtime thư mục trên mọi OS.
         effective_hours = max_age_hours if max_age_hours is not None else self.retention_hours
         cutoff_time = time.time() - (effective_hours * 3600)
         deleted: List[str] = []
+        protected_names = {normalize_session_id(session_id) for session_id in (protect_session_ids or [])}
 
         for entry in self.root_base.iterdir():
             if not entry.is_dir():
+                continue
+            if entry.name in protected_names:
                 continue
 
             try:

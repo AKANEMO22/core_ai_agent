@@ -14,6 +14,12 @@ criterion's final level is the confidence-weighted mean of its evidence levels.
 
 The output is a pure function of its inputs (no timestamps, sorted keys), so identical evaluations,
 rubric and versions always produce a byte-identical `decision.json`.
+
+
+Tính kết luận bằng quy tắc Python từ rubric và các đánh giá có bằng chứng.
+ReportSynthesizer gọi compute_decision: CoverageTracker gộp bằng chứng, sau đó
+xét tiêu chí bắt buộc, vùng sát ngưỡng và điểm trung bình có trọng số.
+Trả decision cùng digest đầu vào; decision_json chuẩn hóa thứ tự để lưu/tái kiểm tra.
 """
 
 import hashlib
@@ -70,6 +76,7 @@ def compute_decision(
     versions: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute the verdict and per-criterion detail. Pure and deterministic."""
+    # CoverageTracker gộp mức/confidence từ nhiều lượt; decision chỉ áp dụng luật kết luận.
     tracker = CoverageTracker(rubric, config.min_confidence)
     coverage = tracker.build(evaluations)
     pass_threshold = float(rubric.get("pass_threshold", 3.0))
@@ -117,6 +124,7 @@ def compute_decision(
             }
         )
 
+    # Mẫu số chỉ gồm trọng số của tiêu chí đủ bằng chứng, không coi thiếu dữ liệu là điểm 0.
     weighted_score = _round(weighted_sum / weight_total) if weight_total > 0 else None
     reasons: List[str] = []
     if must_have_failed:
@@ -153,6 +161,7 @@ def compute_decision(
     )
     requires_review = verdict == NEEDS_REVIEW or (config.product_mode == "hiring_assist" and bool(flagged_injection))
 
+    # Bỏ timestamp xử lý khỏi fingerprint để cùng dữ liệu chấm cho cùng digest.
     canonical_inputs = json.dumps(
         {
             "rubric": rubric,

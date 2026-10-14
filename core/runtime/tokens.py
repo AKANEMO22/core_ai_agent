@@ -1,4 +1,10 @@
-"""Token estimation for context budgeting without a provider-specific tokenizer dependency."""
+"""Token estimation for context budgeting without a provider-specific tokenizer dependency.
+
+Luồng sử dụng: Ước lượng kích thước context cho speaker, brief, orchestrator và ContextCompactor.
+TokenCounter nhận văn bản hoặc messages (kể cả tool_calls), trả số token tính/ước lượng.
+Dùng tiktoken nếu có, nếu không dùng tỷ lệ ký tự theo hệ chữ; đây là số phục vụ
+ngân sách nội bộ, không thay thế usage do provider báo để thống kê chi phí.
+"""
 
 import json
 import math
@@ -54,6 +60,7 @@ class TokenCounter:
 
     def count_message(self, message: Dict[str, Any]) -> int:
         """Tokens for one chat message including role and tool-call overhead."""
+        # Ngoài content cần tính framing và arguments của tool: hai phần này cũng chiếm context.
         total = 4  # per-message framing overhead
         content = message.get("content")
         if isinstance(content, str):

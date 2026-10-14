@@ -1,4 +1,10 @@
-"""Per-session cancellation tokens for in-flight generations and delegated tasks."""
+"""Quản lý tín hiệu dừng generation và tác vụ nền theo session_id trong một tiến trình.
+
+InterviewSessionController lấy token trước khi gọi runner; runner/runtime quan sát
+asyncio.Event để dừng phát câu trả lời khi người dùng ngắt lời. Hủy một generation
+cho phép lượt sau lấy token mới; hủy cả phiên giữ dấu hủy để từ chối công việc mới.
+Registry chỉ giữ trạng thái RAM, không truyền tín hiệu hủy giữa các tiến trình.
+"""
 
 import asyncio
 from typing import Dict, Optional, Set
@@ -22,6 +28,7 @@ class CancellationRegistry:
     def token_for(self, session_id: str) -> asyncio.Event:
         """Return the live token for a session, creating a fresh one if the last was used."""
         token = self._tokens.get(session_id)
+        # Token đã bật thuộc generation cũ; lượt mới cần token riêng, trừ khi cả phiên đã hủy.
         if token is None or token.is_set():
             token = asyncio.Event()
             if session_id in self._cancelled_sessions:
@@ -44,6 +51,7 @@ class CancellationRegistry:
 
     def finish_generation(self, session_id: str, token: asyncio.Event) -> None:
         """Forget a completed generation's token."""
+        # So sánh đúng đối tượng để generation cũ không xóa token của generation mới.
         if self._tokens.get(session_id) is token:
             self._tokens.pop(session_id, None)
         self._reasons.pop(session_id, None)
@@ -56,6 +64,7 @@ class CancellationRegistry:
 
     def cancel_session(self, session_id: str) -> int:
         """Cancel the generation and all tracked tasks; refuse new work. Returns tasks cancelled."""
+        # Đánh dấu phiên trước khi dừng task để token_for không cho công việc mới tiếp tục.
         self._cancelled_sessions.add(session_id)
         self.cancel_generation(session_id, reason="session_cancelled")
         cancelled = 0

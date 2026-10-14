@@ -8,6 +8,7 @@ import pytest
 from core.agents.quotes import verify_quote
 from core.assessor.decision import FAIL, NEEDS_REVIEW, DecisionConfig, compute_decision
 from core.interview.director import StageDirector
+from core.interview import runner as interview_runner
 from core.orchestration.coverage import CoverageTracker
 from core.orchestration.orchestrator import InterviewOrchestrator
 from core.runtime.client import ProviderCapabilities
@@ -79,6 +80,74 @@ def test_must_have_clearly_below_pass_level_fails():
 
 
 # ---------------------------------------------------------------- stage extension
+
+
+@pytest.mark.parametrize(
+    "language, expected_round, expected_duration, expected_intro",
+    [
+        ("vi", "tổng hợp", "90 phút", "giới thiệu"),
+        ("en", "combined", "90 minutes", "introduce yourself"),
+    ],
+)
+def test_opening_fallback_names_candidate_role_round_duration_and_invites_introduction(
+    language, expected_round, expected_duration, expected_intro
+):
+    build = getattr(interview_runner, "build_opening_fallback", lambda **kwargs: "")
+    opening = build(
+        candidate_name="Synthetic Candidate",
+        target_role="Software Engineer Intern",
+        interview_round="combined",
+        duration_minutes=90,
+        language=language,
+    ).lower()
+
+    assert "synthetic candidate" in opening
+    assert "software engineer intern" in opening
+    assert expected_round in opening
+    assert expected_duration in opening
+    assert expected_intro in opening
+
+
+def test_opening_fallback_does_not_ask_for_age():
+    build = getattr(interview_runner, "build_opening_fallback", lambda **kwargs: "")
+    opening = build(
+        candidate_name="Synthetic Candidate",
+        target_role="Software Engineer Intern",
+        interview_round="combined",
+        duration_minutes=90,
+        language="vi",
+    ).lower()
+
+    assert "tuổi" not in opening
+    assert "age" not in opening
+
+
+def test_opening_protocol_validator_rejects_missing_role_and_age_questions():
+    build = getattr(interview_runner, "build_opening_fallback", lambda **kwargs: "")
+    validate = getattr(interview_runner, "opening_meets_protocol", lambda **kwargs: False)
+    opening = build(
+        candidate_name="Synthetic Candidate",
+        target_role="Software Engineer Intern",
+        interview_round="combined",
+        duration_minutes=90,
+        language="vi",
+    )
+    context = {
+        "candidate_name": "Synthetic Candidate",
+        "target_role": "Software Engineer Intern",
+        "interview_round": "combined",
+        "duration_minutes": 90,
+        "language": "vi",
+    }
+
+    assert validate(opening, **context)
+    assert not validate(opening.replace("Software Engineer Intern", "the role"), **context)
+    assert not validate(opening + " Bạn bao nhiêu tuổi?", **context)
+    english_context = {**context, "language": "en"}
+    english_opening = build(**english_context)
+    validate_english = getattr(interview_runner, "opening_meets_protocol", lambda *args, **kwargs: False)
+    assert validate_english(english_opening + " We will keep this stage conversational.", **english_context)
+    assert not validate_english(english_opening + " How old are you?", **english_context)
 
 
 @pytest.mark.asyncio

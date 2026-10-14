@@ -433,11 +433,21 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
             elif msg_type == "replay":
                 await _send_replay(payload.get("last_sequence"), payload.get("last_event_id"))
             elif msg_type == "start_interview":
+                if getattr(settings, "STUDIO_REQUIRE_REAL_PROVIDER", False) and (settings.INSPECTOR_ENABLED or settings.TEST_UI_ENABLED) and (
+                    not app.state.studio_execution_allowed(session_id)
+                ):
+                    await lease.send_text(_control_frame(session_id, LoopEventType.ERROR, {"code": "REAL_PROVIDER_REQUIRED", "retryable": False}))
+                    continue
                 if controller is None:
                     await lease.send_text(_control_frame(session_id, LoopEventType.ERROR, {"code": "RUNNER_UNAVAILABLE"}))
                     continue
                 _spawn(controller.start_interview(session_id))
             elif msg_type in ("candidate_answer", "turn_submit"):
+                if getattr(settings, "STUDIO_REQUIRE_REAL_PROVIDER", False) and (settings.INSPECTOR_ENABLED or settings.TEST_UI_ENABLED) and (
+                    not app.state.studio_execution_allowed(session_id)
+                ):
+                    await lease.send_text(_control_frame(session_id, LoopEventType.ERROR, {"code": "REAL_PROVIDER_REQUIRED", "retryable": False}))
+                    continue
                 try:
                     candidate_msg = CandidateAnswerMessage.model_validate(payload)
                 except ValidationError:

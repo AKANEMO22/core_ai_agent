@@ -1,4 +1,10 @@
-"""Dialogue completion → assessment barrier → report synthesis pipeline."""
+"""Dialogue completion → assessment barrier → report synthesis pipeline.
+
+Nối sự kiện kết thúc hội thoại với việc chờ đánh giá và tạo báo cáo.
+AssessmentPipeline chốt số job cần hoàn tất, chuyển phiên sang ASSESSING và
+chỉ gọi ReportSynthesizer khi barrier đủ; callback worker và sweep đều có thể gọi lại.
+Lease theo phiên giới hạn các lời gọi tổng hợp đồng thời.
+"""
 
 import logging
 from typing import Any, Awaitable, Callable, Optional
@@ -49,6 +55,7 @@ class AssessmentPipeline:
         if state is None:
             return
         if state.status == LifecycleStatus.DIALOGUE_COMPLETED:
+            # Đếm job_id duy nhất lúc hội thoại đóng; retry không làm tăng số assessment cần chờ.
             expected = int(await self.redis.scard(enqueued_assessments_key(session_id)))
             await self.redis.set(
                 expected_assessments_key(session_id), expected, ex=self.counter_ttl_seconds
@@ -68,6 +75,7 @@ class AssessmentPipeline:
     async def maybe_synthesize(self, session_id: str) -> bool:
         """Synthesize the report if the barrier is satisfied. Returns True if a report was written."""
         lock_key = f"session:{session_id}:synth_lock"
+        # Worker hoàn tất và sweeper có thể cùng gọi; chỉ người giữ lease đi qua barrier.
         token = await self._lease.acquire(lock_key, self.synthesis_lock_ttl_seconds * 1000)
         if token is None:
             return False
@@ -76,6 +84,7 @@ class AssessmentPipeline:
             if state is None or state.status != LifecycleStatus.ASSESSING:
                 return False
 
+            # Có job lỗi vĩnh viễn thì chuyển trạng thái lỗi; chưa đủ kết quả thì đợi callback/sweep sau.
             is_ready, completed, failed, expected = await self.synthesizer.check_barrier(session_id)
             if failed > 0:
                 try:

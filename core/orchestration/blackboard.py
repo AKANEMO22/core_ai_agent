@@ -1,4 +1,10 @@
-"""Per-session blackboard in Redis: shared state written by delegated agents, read by the orchestrator."""
+"""Per-session blackboard in Redis: shared state written by delegated agents, read by the orchestrator.
+
+Bảng trao đổi tạm thời theo session trong Redis, được orchestration dùng để
+lưu coverage, cờ guard và kết quả phân tích phụ dưới dạng JSON. set/get phục vụ
+luồng chạy; persist sao chép snapshot sang workspace để truy vết sau phiên.
+TTL thuộc cả hash của session và được gia hạn sau mỗi lần ghi.
+"""
 
 import json
 from typing import Any, Dict, Optional
@@ -30,6 +36,7 @@ class Blackboard:
         return json.loads(raw) if raw is not None else default
 
     async def merge_flags(self, session_id: str, flags: Dict[str, Any]) -> Dict[str, Any]:
+        # Đây là đọc-sửa-ghi, không phải merge nguyên tử; None nghĩa là agent chưa có kết luận mới.
         current = await self.get(session_id, "flags", {}) or {}
         current.update({k: v for k, v in flags.items() if v is not None})
         await self.set(session_id, "flags", current)
@@ -41,6 +48,7 @@ class Blackboard:
 
     async def persist(self, session_id: str, workspace: SessionWorkspace) -> None:
         """Write the blackboard snapshot as an artifact (dialogue completion, audit)."""
+        # Redis phục vụ trao đổi tức thời; artifact này giữ bản chụp để audit sau phiên.
         workspace.write_artifact(
             "orchestration/blackboard.json", artifact_type="blackboard", payload=await self.snapshot(session_id)
         )

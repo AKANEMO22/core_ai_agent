@@ -1,6 +1,9 @@
 """Observability primitives: safe session references, structured JSON logging, metrics registry.
 
 Metrics are exposed in the Prometheus text exposition format without an external dependency.
+
+API khởi tạo logging/metrics lúc tạo app; request handler và agent ghi số liệu qua registry,
+còn endpoint metrics gọi ``render()`` để xuất định dạng Prometheus.
 """
 
 import contextvars
@@ -24,6 +27,7 @@ def session_ref(session_id: Optional[str]) -> str:
     """Non-reversible 12-character session reference safe for logs and metrics labels."""
     if not session_id:
         return "-"
+    # Log/metric chỉ cần một nhãn ổn định để nối sự kiện; không đưa ID gốc vào telemetry.
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
 
 
@@ -37,6 +41,7 @@ class JsonLogFormatter(logging.Formatter):
     RESERVED = set(vars(logging.makeLogRecord({})).keys()) | {"message", "asctime"}
 
     def format(self, record: logging.LogRecord) -> str:
+        # Formatter gom context có sẵn vào một JSON line; caller vẫn chịu trách nhiệm không log transcript.
         entry: Dict[str, Any] = {
             "ts": round(record.created, 3),
             "level": record.levelname,
@@ -64,6 +69,7 @@ class SessionIdRedactionFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Lọc chuỗi ở sát handler như lớp phòng thủ cuối nếu exception đã nhúng session ID vào message.
         message = record.getMessage()
         if "sess_" in message:
             record.msg = _SESSION_ID_PATTERN.sub(lambda m: f"session:{session_ref(m.group(0))}", message)
@@ -77,6 +83,7 @@ def configure_logging(level: str = "INFO", json_format: bool = True) -> None:
     root.setLevel(level)
     for handler in root.handlers:
         if getattr(handler, "_ai_runtime_handler", False):
+            # create_app có thể được gọi nhiều lần trong test; không gắn thêm handler trùng.
             return
     handler = logging.StreamHandler()
     handler._ai_runtime_handler = True  # type: ignore[attr-defined]
@@ -86,6 +93,7 @@ def configure_logging(level: str = "INFO", json_format: bool = True) -> None:
 
 
 def _label_key(labels: Optional[Dict[str, str]]) -> Tuple[Tuple[str, str], ...]:
+    # Sắp xếp label để cùng một bộ nhãn luôn ánh xạ về đúng một series metric.
     return tuple(sorted((labels or {}).items()))
 
 
@@ -135,12 +143,14 @@ class MetricsRegistry:
                 hist = {"buckets": [0] * len(self.buckets), "count": 0, "sum": 0.0, "values": []}
                 series[key] = hist
             for idx, bound in enumerate(self.buckets):
+                # Histogram Prometheus dùng bucket tích lũy: một mẫu tăng mọi giới hạn >= giá trị.
                 if value <= bound:
                     hist["buckets"][idx] += 1
             hist["count"] += 1
             hist["sum"] += value
             hist["values"].append(value)
             if len(hist["values"]) > 10000:
+                # Giữ bộ đệm gần đây có giới hạn để quantile nội bộ không làm RAM tăng vô hạn.
                 del hist["values"][:5000]
 
     def counter_value(self, name: str, labels: Optional[Dict[str, str]] = None) -> float:
@@ -159,6 +169,7 @@ class MetricsRegistry:
     def render(self) -> str:
         """Render all metrics in the Prometheus text exposition format."""
         lines: List[str] = []
+        # Snapshot được dựng dưới lock để counter/bucket của cùng lần scrape nhất quán với nhau.
         with self._lock:
             for name, series in sorted(self._counters.items()):
                 full = f"{self.namespace}_{name}"
@@ -198,17 +209,20 @@ class Timer:
         self.started = 0.0
 
     def __enter__(self) -> "Timer":
+        # Dùng monotonic clock để thời gian hệ thống chỉnh không làm sai duration.
         self.started = time.perf_counter()
         return self
 
     def __exit__(self, *exc: Any) -> None:
         if self.registry is not None:
+            # Context manager ghi cả khi block bên trong ném exception, vì thời gian vẫn có ích để chẩn đoán.
             self.registry.observe(self.name, time.perf_counter() - self.started, self.labels)
 
 
 def build_default_metrics() -> MetricsRegistry:
     """Registry with HELP text for every metric the runtime emits."""
     registry = MetricsRegistry()
+    # Khai báo HELP tại một chỗ để endpoint /metrics giải thích được các số liệu do runtime phát ra.
     for name, help_text in {
         "ttft_seconds": "Time from accepted answer (including queue wait) to first response token",
         "turn_duration_seconds": "Duration of an interviewer turn",

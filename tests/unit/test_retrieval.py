@@ -106,8 +106,8 @@ def test_default_corpus_loads_every_collection():
         ("Staff Engineer", 3, "staff"),
         ("Junior Frontend Developer", 10, "junior"),
         ("Software Engineer", 1, "junior"),
-        ("Software Engineer", 6, "senior"),
-        ("Software Engineer", None, "mid"),
+        ("Software Engineer", 6, "mid"),
+        ("Software Engineer", None, None),
     ],
 )
 def test_infer_level(role, years, expected):
@@ -188,7 +188,9 @@ async def test_build_pack_times_out_as_retrieval_error():
         client=MockRetrievalClient(latency_seconds=0.2), timeout_seconds=0.01
     )
     with pytest.raises(RetrievalError, match="timed out"):
-        await service.build_pack(target_company="Acme Systems", target_role="Backend Engineer")
+        await service.build_pack(
+            target_company="Acme Systems", target_role="Backend Engineer", seniority="senior"
+        )
 
 
 @pytest.mark.asyncio

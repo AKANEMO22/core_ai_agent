@@ -1,15 +1,58 @@
-"""Reconnaissance research tools with enterprise SSRF defense and IP address validation."""
+"""Bounded, source-linked company research with outbound SSRF protection."""
 
+import asyncio
 import ipaddress
+import hashlib
+from html.parser import HTMLParser
 import logging
 import socket
 import urllib.parse
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from core.runtime.agent import sanitize_secrets
 from core.runtime.tooling import RuntimeTool
 
 logger = logging.getLogger(__name__)
+
+
+class _ReadableHTML(HTMLParser):
+    """Extract a compact text view while discarding active and non-content elements."""
+
+    _DROP = {"script", "style", "noscript", "svg", "iframe", "canvas", "template", "nav", "footer"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._drop_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag in self._DROP:
+            self._drop_depth += 1
+        elif tag in {"p", "br", "li", "h1", "h2", "h3", "h4", "tr", "section", "article"} and not self._drop_depth:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._DROP and self._drop_depth:
+            self._drop_depth -= 1
+        elif tag in {"p", "li", "h1", "h2", "h3", "h4", "tr", "section", "article"} and not self._drop_depth:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._drop_depth and data.strip():
+            self.parts.append(data.strip())
+
+
+def _readable_page_text(content: bytes, content_type: str) -> str:
+    if "text/plain" in content_type:
+        raw = content.decode("utf-8", errors="replace")
+    elif "text/html" in content_type or not content_type:
+        parser = _ReadableHTML()
+        parser.feed(content.decode("utf-8", errors="replace"))
+        raw = " ".join(parser.parts)
+    else:
+        return ""
+    return " ".join(raw.split())[:8_000]
 
 # RFC 6598 Carrier-Grade NAT network
 CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
@@ -119,6 +162,7 @@ def validate_outbound_url(url: str, allow_http: bool = False) -> bool:
         if not addr_infos:
             return False
 
+        # Một địa chỉ DNS bị cấm là đủ từ chối hostname, kể cả các địa chỉ còn lại công khai.
         for addr in addr_infos:
             ip_str = addr[4][0]
             resolved_ip = ipaddress.ip_address(ip_str)
@@ -143,9 +187,11 @@ class SafeWebSearchTool(RuntimeTool):
         self,
         timeout: float = 10.0,
         max_bytes: int = 1024 * 1024,
+        api_key: Optional[str] = None,
     ) -> None:
         self.timeout = timeout
         self.max_bytes = max_bytes
+        self.api_key = api_key.strip() if api_key else ""
 
         super().__init__(
             name="safe_web_search",
@@ -192,28 +238,43 @@ class SafeWebSearchTool(RuntimeTool):
         """
         if target_url:
             clean_url = sanitize_secrets(target_url)
-            if not validate_outbound_url(target_url):
+            if not await asyncio.to_thread(validate_outbound_url, target_url):
                 logger.warning("SSRF blocked attempt to access unsafe URL: %s", clean_url)
                 return {
                     "status": "blocked",
                     "error": f"URL '{clean_url}' blocked by SSRF defense policy",
                 }
 
-            # Enforce timeout and max_bytes via controlled outbound request
             try:
                 import httpx
 
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.get(target_url, follow_redirects=False)
-                    content_slice = resp.content[: self.max_bytes]
-                    text_content = content_slice.decode("utf-8", errors="replace")
+                async with httpx.AsyncClient(timeout=min(self.timeout, 5.0), follow_redirects=False) as client:
+                    async with client.stream("GET", target_url, headers={"User-Agent": "DPL-Pvan-Research/1.0"}) as resp:
+                        resp.raise_for_status()
+                        content_type = resp.headers.get("content-type", "").casefold()
+                        if "text/html" not in content_type and "text/plain" not in content_type:
+                            return {"status": "unavailable", "url": clean_url, "reason": "unsupported_content_type"}
+                        body = bytearray()
+                        async for chunk in resp.aiter_bytes():
+                            remaining = self.max_bytes - len(body)
+                            if remaining <= 0:
+                                break
+                            body.extend(chunk[:remaining])
+                            if len(chunk) > remaining:
+                                break
+                        text_content = _readable_page_text(bytes(body), content_type)
+                    if not text_content:
+                        return {"status": "unavailable", "url": clean_url, "reason": "no_readable_page_text"}
                     return {
                         "status": "success",
                         "url": clean_url,
                         "status_code": resp.status_code,
-                        "content": text_content[:2000],
-                        "truncated": len(resp.content) > self.max_bytes,
-                        "total_bytes": len(resp.content),
+                        "content": text_content,
+                        "content_hash": hashlib.sha256(body).hexdigest(),
+                        "content_type": content_type,
+                        "truncated": len(body) >= self.max_bytes,
+                        "total_bytes_read": len(body),
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
                     }
             except Exception as req_err:
                 clean_err = sanitize_secrets(str(req_err))
@@ -224,18 +285,69 @@ class SafeWebSearchTool(RuntimeTool):
                     "error": clean_err,
                 }
 
-        # Return structured recon search summary
-        return {
-            "status": "success",
-            "query": query,
-            "results": [
-                {
-                    "title": f"Engineering Overview for {query}",
-                    "snippet": f"Technical culture, tech stack, and interview practices for {query}.",
-                    "source": "curated_recon_index",
-                }
-            ][:max_results],
-        }
+        if not self.api_key:
+            return {"status": "unavailable", "reason": "search_provider_not_configured", "query": query}
+
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                response = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
+                    params={
+                        "q": str(query)[:600],
+                        "count": max(1, min(int(max_results), 4)),
+                        "country": "ALL",
+                        "search_lang": "en",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+            collected_at = datetime.now(timezone.utc).isoformat()
+            results = []
+            seen = set()
+            for position, item in enumerate((payload.get("web") or {}).get("results") or []):
+                if not isinstance(item, dict):
+                    continue
+                url = str(item.get("url") or "").strip()
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    continue
+                title = str(item.get("title") or "").strip()[:400]
+                snippet = str(item.get("description") or "").strip()[:1200]
+                canonical = urllib.parse.urlunparse(
+                    (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "", "")
+                )
+                content_hash = hashlib.sha256(f"{canonical}\n{title}\n{snippet}".encode("utf-8")).hexdigest()
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+                results.append(
+                    {
+                        "source_id": f"web_{content_hash[:20]}",
+                        "title": title,
+                        "snippet": snippet,
+                        "url": url,
+                        "source": url,
+                        "source_type": "search_result",
+                        "trust_tier": "unreviewed",
+                        "verification_status": "unreviewed",
+                        "query": str(query)[:600],
+                        "position": position + 1,
+                        "content_hash": content_hash,
+                        "published_at": item.get("published_at"),
+                        "source_age": item.get("page_age") or item.get("age"),
+                        "collected_at": collected_at,
+                    }
+                )
+                if len(results) >= max(1, min(int(max_results), 4)):
+                    break
+            return {"status": "success", "query": query, "results": results, "collected_at": collected_at}
+        except Exception as req_err:
+            clean_err = sanitize_secrets(str(req_err))
+            logger.warning("Web search provider request failed: %s", clean_err)
+            return {"status": "error", "reason": clean_err, "query": query}
 
 
 class MarketIntelTool(RuntimeTool):
@@ -306,14 +418,13 @@ class MarketIntelTool(RuntimeTool):
             data = dict(self.CURATED_INTEL[clean_name])
             data["company"] = company_name
             data["target_role"] = target_role or "Software Engineer"
+            data["source_type"] = "static_curated_entry"
+            data["verification_status"] = "unreviewed"
             return data
 
-        # Default intelligent heuristic profile for unknown companies
         return {
             "company": company_name,
             "target_role": target_role or "Software Engineer",
-            "culture": f"Dynamic technology environment at {company_name} emphasizing reliability, scalable systems, and strong collaboration.",
-            "tech_stack": ["Python", "TypeScript", "PostgreSQL", "Docker", "Cloud Native"],
-            "hiring_bar": "High standard for core domain competence, problem solving, and architecture design.",
-            "interview_focus": "Hands-on coding, architecture tradeoffs, domain problem-solving, and communication.",
+            "status": "unavailable",
+            "reason": "No reviewed company-specific source is available; do not infer company facts.",
         }

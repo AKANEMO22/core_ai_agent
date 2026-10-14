@@ -1,8 +1,16 @@
-"""Context assembler enforcing strict token budgets and deterministic truncation priority."""
+"""Ghép prompt dạng chuỗi từ spec, stage, hồ sơ, nghiên cứu công ty và lịch sử hội thoại.
+
+Runner dùng ContextAssembler khi không được cấu hình SpeakerContextBuilder.
+assemble_prompt trả prompt sau khi giảm lịch sử cũ → nghiên cứu → chi tiết hồ sơ;
+nếu vẫn quá lớn thì cắt nội dung Q&A gần nhất. estimate_tokens dùng số ký tự/4,
+không phải tokenizer của model. Phần lõi quá lớn vẫn có thể vượt ngân sách khi
+không còn phần có thể cắt; max_tokens là mục tiêu dựa trên ước lượng này.
+"""
 
 import math
 from typing import Any, Dict, List, Optional
 
+from core.language import interview_language_instruction
 
 class ContextAssembler:
     """Assembles prompt contexts for interviewer subagents under a strict token ceiling.
@@ -98,6 +106,7 @@ class ContextAssembler:
         # Separate inviolable current Q&A from older turns
         # If 2 or more turns, last 2 represent current Q&A (Interviewer Q + Candidate A)
         # If 1 turn, it represents current Q&A
+        # Giữ Q&A gần nhất qua các bước bỏ lịch sử/hồ sơ; chỉ cắt nội dung ở phương án cuối.
         min_turns_to_keep = min(2, len(turns))
         old_turns = turns[:-min_turns_to_keep] if min_turns_to_keep > 0 else []
         current_qa_turns = turns[-min_turns_to_keep:] if min_turns_to_keep > 0 else []
@@ -125,6 +134,7 @@ class ContextAssembler:
                 f"- Tone: {tone}\n"
                 f"- Knowledge Scope: {scope_str}"
             )
+            sections.append(interview_language_instruction(spec.get("interview_language")))
 
             # 2. Inviolable Core: Stage Goals, Competencies and Key Questions
             stage_lines = [
@@ -256,6 +266,7 @@ class ContextAssembler:
                 return prompt
 
         # --- Truncation Priority 4: Truncate verbose candidate content in current Q&A ---
+        # Cắt bản sao để không sửa transcript nguồn; phần lõi prompt không có nhánh cắt.
         active_qa_turns = [dict(t) for t in current_qa_turns]
         while self.estimate_tokens(prompt) > self.max_tokens:
             excess_tokens = self.estimate_tokens(prompt) - self.max_tokens

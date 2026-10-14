@@ -1,4 +1,11 @@
-"""Redis-backed session state store with optimistic compare-and-set transitions."""
+"""Lưu trạng thái phiên lên Redis theo hợp đồng async của SessionStateStore.
+
+Các dịch vụ tạo/đọc phiên rồi gọi atransition với snapshot và expected_version.
+Store đọc lại bản authoritative trong WATCH, dùng build_transition kiểm tra FSM,
+rồi MULTI/EXEC ghi trạng thái và đổi index theo status; xung đột trả lỗi CAS.
+Đầu ra là snapshot đã lưu. TTL áp dụng cho state, còn index được dọn mục hết hạn
+khi alist_by_status chạy, phục vụ các tác vụ rà soát và phục hồi phiên.
+"""
 
 import json
 import logging
@@ -106,6 +113,7 @@ class RedisSessionStateStore:
                 current = self._decode(raw)
                 updated = build_transition(current, expected_version, new_status, **updates)
 
+                # Cập nhật state và chuyển membership status trong cùng transaction.
                 pipe.multi()
                 pipe.set(key, self._encode(updated), ex=self.ttl_seconds)
                 if updated.status != current.status:
@@ -134,6 +142,7 @@ class RedisSessionStateStore:
         for member in members:
             session_id = member.decode("utf-8") if isinstance(member, bytes) else str(member)
             current = await self.aget(session_id)
+            # Index set không hết TTL cùng state; loại mục stale khi đọc danh sách phục hồi.
             if current is None or current.status != status:
                 await self.redis.srem(self._index(status), session_id)
                 continue

@@ -161,13 +161,14 @@ def test_report_api_exposes_verdict_decision_and_review(tmp_path: Path, product_
     with TestClient(app) as client:
         created = client.post("/api/v1/sessions", json={
             "candidate_name": "R", "target_company": "Acme Systems", "target_role": "Senior Backend Engineer",
+            "duration_minutes": 20,
         }, headers=headers).json()
         sid = created["session_id"]
         with client.websocket_connect(f"/ws/sessions/{sid}/stream", headers={"Authorization": f"Bearer {created['session_token']}"}) as ws:
             ws.send_json({"type": "start_interview"})
             while ws.receive_json()["type"] != "turn_complete":
                 pass
-            for i in range(1, 6):
+            for i in range(1, 11):
                 ws.send_json({"type": "candidate_answer", "message_id": f"m{i}",
                               "candidate_answer": f"Answer number {i}: we partition by tenant, cache hot keys and measure p99 latency."})
                 frame = ws.receive_json()
@@ -184,7 +185,7 @@ def test_report_api_exposes_verdict_decision_and_review(tmp_path: Path, product_
             time.sleep(0.1)
         body = res.json()
         assert res.status_code == 200, body
-        assert body["verdict"] == verdict and body["decision"]["verdict"] == verdict
+        assert body["verdict"] == verdict and body["decision"]["verdict"] == verdict, body["decision"]
         assert "Verdict" in body["report_markdown"]
         if product_mode == "hiring_assist":
             assert "support, not replace" in body["final_assessment"]["disclaimer"]

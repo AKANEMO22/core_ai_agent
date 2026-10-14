@@ -2,6 +2,12 @@
 
 Every delegation is bounded (per-agent semaphore, deadline), cancellable with its session,
 recorded as `delegation_started` / `delegation_completed` events, and persisted as an artifact.
+
+Bộ chạy agent phụ được đăng ký lúc khởi tạo runtime. Orchestrator truyền
+(session_id, task dict) qua delegate và nhận handle để chờ kết quả hoặc tiếp tục
+chạy nền. Mỗi agent có semaphore và timeout riêng; event/artifact ghi lại
+trạng thái, thời gian và kết quả. Speaker không được chờ delegation đồng bộ
+vì đây là đường phản hồi trực tiếp cho ứng viên.
 """
 
 import asyncio
@@ -36,6 +42,7 @@ class DelegationHandle:
     async def result(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Wait for the result; None on timeout, failure or cancellation (never raises)."""
         try:
+            # Hết thời gian chờ của caller vẫn giữ task chạy; deadline của agent được quản lý trong _run.
             return await asyncio.wait_for(asyncio.shield(self.task), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             return None
@@ -103,6 +110,7 @@ class DelegationRuntime:
             session_id, LoopEventType.DELEGATION_STARTED, {"delegation_id": delegation_id, "agent": agent}, turn_id
         )
         try:
+            # Timeout tính khi agent đã có slot; thời gian chờ semaphore không nằm trong wait_for này.
             async with self._semaphores[agent]:
                 result = await asyncio.wait_for(self._agents[agent](session_id, task), timeout=deadline)
         except asyncio.TimeoutError:
@@ -174,8 +182,11 @@ class DelegationRuntime:
             raise DelegationError("the speaker may not delegate synchronously (hot-path latency contract)")
         deadline = (deadline_ms / 1000) if deadline_ms is not None else self._deadlines[agent]
         delegation_id = uuid.uuid4().hex[:12]
-        task_handle = asyncio.create_task(
-            self._run(delegation_id, agent, session_id, task, deadline, turn_id), name=f"delegate:{agent}"
+        invocation = self._run(delegation_id, agent, session_id, task, deadline, turn_id)
+        recorder = getattr(self, "trace_recorder", None)
+        task_handle = (
+            recorder.spawn_task(session_id, invocation, f"delegate:{agent}", {"delegation_id": delegation_id, "turn_id": turn_id})
+            if recorder is not None else asyncio.create_task(invocation, name=f"delegate:{agent}")
         )
         if self.cancellations is not None:
             self.cancellations.register_task(session_id, task_handle)

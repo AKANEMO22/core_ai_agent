@@ -1,7 +1,10 @@
-"""Rolling conversation summary, refreshed in the background after each turn.
+"""Tóm tắt hội thoại tăng dần để speaker không phải đưa toàn bộ lượt cũ vào prompt.
 
-The speaker includes the summary instead of old raw turns, so long interviews stay within the
-speaker budget without blocking the hot path on a summarization call.
+Hook nền sau lượt gọi RollingSummarizer.update với workspace và through_turn.
+Hàm đọc summary trước, lấy transcript từ last_turn_included + 1, gọi structured LLM
+rồi ghi rolling_summary.json; SpeakerContextBuilder đọc artifact đó ở lượt sau.
+Lease theo phiên giảm cập nhật đồng thời khi có Redis. Khi structured output lỗi,
+hàm giữ bản cũ; việc tóm tắt không nằm trên đường phát câu trả lời của speaker.
 """
 
 import asyncio
@@ -86,6 +89,7 @@ class RollingSummarizer:
                 return None
         try:
             previous = self.load(workspace)
+            # Mốc này tránh tóm tắt lại phần đã gộp; summary trước là đầu vào cho lần merge tiếp theo.
             start = int(previous.get("last_turn_included", -1)) + 1
             if through_turn - start + 1 < self.min_new_turns:
                 return previous
@@ -117,6 +121,7 @@ class RollingSummarizer:
             except StructuredOutputError as e:
                 logger.warning("Rolling summary kept previous version: %s", sanitize_secrets(str(e)))
                 return previous
+            # Chỉ nâng mốc sau structured output hợp lệ để bản cũ còn dùng được khi LLM lỗi.
             result["last_turn_included"] = through_turn
             result["updated_at"] = time.time()
             await asyncio.to_thread(

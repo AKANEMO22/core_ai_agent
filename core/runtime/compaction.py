@@ -10,6 +10,12 @@ Invariants (tested):
     - the last `keep_last_messages` messages are never removed or changed;
     - an assistant message with `tool_calls` and its `tool` results are kept or removed together;
     - the compacted list never contains a `tool` message without its assistant call.
+
+
+Luồng sử dụng: RuntimeAgent dùng ContextCompactor trước khi gọi model để giảm lịch sử vượt ngân sách.
+Đầu vào là messages cùng CompactionPolicy; đầu ra gồm lịch sử mới, bước đã áp dụng và số token.
+Thử rút gọn kết quả tool, tóm tắt bằng LLM nếu có, rồi bỏ cụm cũ; luôn giữ system, pinned,
+phần cuối và cặp assistant/tool cùng nhau. Phần được bảo vệ có thể vẫn vượt ngân sách.
 """
 
 import asyncio
@@ -105,6 +111,7 @@ class ContextCompactor:
         return policy.enabled and self.counter.count_messages(messages) > policy.threshold_ratio * budget_tokens
 
     def _protected_units(self, messages: Sequence[Dict[str, Any]], units: List[List[int]], keep_last: int) -> set:
+        # Bảo vệ theo cụm, nên giữ một tool result ở đuôi cũng giữ assistant call tương ứng.
         protected = set()
         for position, unit in enumerate(units):
             first = messages[unit[0]]
@@ -131,6 +138,7 @@ class ContextCompactor:
         if not policy.enabled or before <= policy.threshold_ratio * budget_tokens:
             return result
 
+        # Nén xuống dưới ngưỡng kích hoạt để lượt kế tiếp còn khoảng trống, tránh nén lại ngay.
         target = int(policy.threshold_ratio * budget_tokens * 0.8)
         working = [dict(m) for m in messages]
         units = _units(working)

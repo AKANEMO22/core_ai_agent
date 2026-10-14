@@ -1,4 +1,11 @@
-"""Stage director managing stage index, turn counters, completion triggers, and CAS progression."""
+"""Điều khiển tiến độ stage từ curriculum và snapshot trạng thái phiên.
+
+Runner gọi record_turn sau khi lưu câu trả lời/gửi job chấm; hàm tăng bộ đếm,
+xét directive, tool complete_stage và ngân sách lượt. Khi stage hoàn tất, runner
+gọi advance_stage để chọn stage kế tiếp hoặc chuyển DIALOGUE_COMPLETED.
+Các hàm trả snapshot từ CAS của state store; chúng không sinh câu hỏi bằng LLM
+và không tự viết report. max_extra_turns chặn việc gia hạn stage vô hạn.
+"""
 
 from typing import Any, Dict, List, Optional
 
@@ -115,6 +122,7 @@ class StageDirector:
         target_turns = stage_cfg.get("target_turns") or stage_cfg.get("turns", 3)
 
         # 2. Update stage and overall turn counters
+        # current_turn đếm toàn phiên; stage_turns đếm riêng stage để kiểm tra ngân sách từng đoạn.
         metadata = dict(state.metadata)
         stage_turns_dict = dict(metadata.get("stage_turns", {}))
         current_stage_turns = stage_turns_dict.get(curr_stage_id, 0) + 1
@@ -180,6 +188,7 @@ class StageDirector:
         curr_idx = self._find_stage_index(state.current_stage_id)
         next_idx = curr_idx + 1
 
+        # Sang stage kế tiếp chỉ đổi stage_id; status vẫn STAGE_ACTIVE ở nhánh này.
         if next_idx < len(self.stages):
             next_stage = self.stages[next_idx]
             next_stage_id = next_stage["stage_id"]

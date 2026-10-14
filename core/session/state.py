@@ -1,4 +1,11 @@
-"""Session state management and FSM lifecycle transitions with compare-and-set (CAS) validation."""
+"""Định nghĩa vòng đời phiên, snapshot trạng thái và hợp đồng lưu trữ SessionStateStore.
+
+API, profiling, StageDirector và đánh giá nền đọc snapshot rồi yêu cầu atransition
+với expected_version. build_transition kiểm tra version/FSM, tạo snapshot mới và
+tăng state_version; store chịu trách nhiệm ghi snapshot đó một cách nguyên tử.
+SessionStateManager dùng RAM; RedisSessionStateStore ở store.py dùng cùng quy tắc.
+Snapshot được dùng theo quy ước không sửa trực tiếp, dataclass không có frozen=True.
+"""
 
 import time
 from dataclasses import dataclass, field
@@ -44,6 +51,7 @@ class SessionAlreadyExistsError(ValueError):
 
 
 # Terminal states from which no further progression is allowed
+# ASSESSMENT_FAILED còn đường retry về ASSESSING; REPORT_READY mới là kết thúc thành công.
 TERMINAL_STATUSES: Set[LifecycleStatus] = {
     LifecycleStatus.REPORT_READY,
     LifecycleStatus.FAILED,
@@ -213,6 +221,7 @@ def build_transition(
             )
         target_status = new_status
 
+    # Sao chép/merge metadata và tạo state mới; giữ created_at nhưng tăng version cho mỗi ghi.
     merged_metadata = dict(state.metadata)
     if "metadata" in updates and isinstance(updates["metadata"], dict):
         merged_metadata.update(updates["metadata"])
@@ -230,6 +239,7 @@ def build_transition(
     )
 
 
+# Các bên gọi phụ thuộc hợp đồng async này để đổi backend RAM/Redis mà giữ quy tắc FSM.
 class SessionStateStore(Protocol):
     """Async contract for session lifecycle persistence with compare-and-set transitions.
 

@@ -13,6 +13,43 @@ services:
       retries: 10
     restart: unless-stopped
 
+  redisinsight:
+    image: redis/redisinsight:latest
+    environment:
+      RI_REDIS_HOST: redis
+      RI_REDIS_PORT: "6379"
+      RI_REDIS_ALIAS: dpl-pvan
+      RI_REDIS_DB: "0"
+    ports:
+      - "127.0.0.1:5540:5540"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - redisinsight_data:/data
+    restart: unless-stopped
+
+  minio:
+    build:
+      context: ./docker/minio
+      dockerfile: Dockerfile
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dpl-pvan-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local-compose-minio-password-change-before-use}
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
   app:
     build:
       context: .
@@ -20,26 +57,44 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       APP_ENV: development
       PRODUCT_MODE: practice
+      PROFILING_DEADLINE_SECONDS: ${DPL_PROFILING_DEADLINE_SECONDS:-240}
+      # Two separate frontends, sharing the real core and durable trace archive.
+      INSPECTOR_ENABLED: ${DPL_INSPECTOR_ENABLED:-true}
+      INSPECTOR_LOCAL_AUTH: ${DPL_INSPECTOR_LOCAL_AUTH:-true}
+      TEST_UI_ENABLED: ${DPL_TEST_UI_ENABLED:-true}
+      STUDIO_REQUIRE_REAL_PROVIDER: true
       JWT_SECRET: ${DOCKER_JWT_SECRET:-local-compose-development-secret-change-before-production}
       REDIS_URL: redis://redis:6379/0
       WORKSPACE_ROOT_BASE: /data/workspaces
+      ARTIFACT_ARCHIVE_ENABLED: "true"
+      ARTIFACT_ARCHIVE_BUCKET: user-artifacts
+      ARTIFACT_ARCHIVE_CATALOG_PATH: /data/archive/catalog.sqlite3
+      OBJECT_STORE_ENDPOINT: http://minio:9000
+      OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:-dpl-pvan-local}
+      OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-local-compose-minio-password-change-before-use}
+      OBJECT_STORE_REGION: us-east-1
+      OBJECT_STORE_VERIFY_TLS: "false"
       RETRIEVAL_BACKEND: ${DPL_RETRIEVAL_BACKEND:-rag}
       RAG_DATA_DIR: /app/data
       RAG_INDEX_PATH: /data/rag/index.db
       RAG_EMBEDDING_PROVIDER: lsa
-      # Empty by default: the app uses its scripted local provider and makes no LLM API calls.
-      # Set DOCKER_LLM_API_KEY (and optionally DOCKER_LLM_API_URL / DOCKER_LLM_MODEL) to opt in.
-      LLM_API_KEY: ${DOCKER_LLM_API_KEY:-}
-      LLM_API_URL: ${DOCKER_LLM_API_URL:-}
-      LLM_MODEL: ${DOCKER_LLM_MODEL:-}
+      BRAVE_SEARCH_API_KEY: ${DOCKER_BRAVE_SEARCH_API_KEY:-}
+      # Without a real provider, both UIs load but execution is disabled. No scripted fallback.
+      # Set DOCKER_LLM_API_KEY, DOCKER_LLM_API_URL and DOCKER_LLM_MODEL for real runs.
+      LLM_API_KEY: ${DOCKER_LLM_API_KEY:-${LLM_API_KEY:-${OPENAI_API_KEY:-}}}
+      LLM_API_URL: ${DOCKER_LLM_API_URL:-${LLM_API_URL:-}}
+      LLM_MODEL: ${DOCKER_LLM_MODEL:-${LLM_MODEL:-}}
     ports:
       - "127.0.0.1:${DPL_PVAN_PORT:-8001}:8000"
     volumes:
       - interview_workspaces:/data/workspaces
       - rag_index:/data/rag
+      - artifact_catalog:/data/archive
     healthcheck:
       test:
         - CMD
@@ -55,5 +110,8 @@ services:
 
 volumes:
   redis_data:
+  redisinsight_data:
   interview_workspaces:
   rag_index:
+  minio_data:
+  artifact_catalog:

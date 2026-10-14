@@ -1,4 +1,10 @@
-"""Hook bus for the agent runtime: lifecycle events with per-hook budgets and isolation."""
+"""Hook bus for the agent runtime: lifecycle events with per-hook budgets and isolation.
+
+Luồng sử dụng: Bus mở rộng vòng đời: runtime và tầng session phát HookContext, handler nhận dữ liệu sự kiện.
+Hook blocking chạy tuần tự và có hạn thời gian; hook nền chạy bằng task riêng.
+HookOutcome gom quyết định/lỗi để caller xử lý; lỗi blocking ở BEFORE_TOOL chặn tool,
+còn lỗi ở sự kiện khác chỉ được ghi log. drain hỗ trợ chờ task nền khi kết thúc.
+"""
 
 import asyncio
 import logging
@@ -116,6 +122,7 @@ class HookBus:
         started = time.perf_counter()
         for registration in self._hooks.get(event, []):
             if not registration.blocking:
+                # Task nền không có quyền chặn caller; tập tham chiếu giữ task sống tới khi hoàn tất.
                 task = asyncio.create_task(self._run_background(registration, ctx))
                 self._background.add(task)
                 task.add_done_callback(self._background.discard)
@@ -129,6 +136,7 @@ class HookBus:
                     outcome.reasons.append(decision.reason or registration.name)
             except asyncio.TimeoutError:
                 outcome.errors.append(f"{registration.name}: timeout")
+                # BEFORE_TOOL là chốt thực thi: hook blocking lỗi thì không cho tool chạy.
                 if event in self.FAIL_CLOSED_EVENTS:
                     outcome.denied = True
                     outcome.reasons.append(f"{registration.name} timed out")

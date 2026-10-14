@@ -1,4 +1,11 @@
-"""Session event store and replay primitives with monotonic sequences and bounded retention."""
+"""Nhật ký LoopEvent theo phiên và công cụ phát lại cho kết nối bị gián đoạn.
+
+Publisher ghi sự kiện từ runner/runtime; API streaming dùng EventReplayer để lấy
+phần lịch sử sau event_id hoặc sequence của client. Đầu vào là session_id và event,
+đầu ra là event đã gán sequence hoặc danh sách/luồng event được lọc.
+Khi có Redis, append_async cấp sequence bằng INCR; lịch sử vẫn có giới hạn độ dài
+và TTL nên replay chỉ bao phủ các sự kiện còn được lưu, không phải toàn bộ vĩnh viễn.
+"""
 
 import asyncio
 import logging
@@ -82,6 +89,7 @@ class SessionEventStore:
             del bucket[: len(bucket) - self.max_length]
         self._events.move_to_end(session_id)
         self._sequences[session_id] = max(self._sequences[session_id], event.sequence)
+        # Chỉ loại cache theo LRU khi còn bản Redis; RAM-only cần giữ bản duy nhất.
         if self._redis is not None:
             while len(self._events) > self.memory_max_sessions:
                 evicted, _ = self._events.popitem(last=False)
@@ -173,6 +181,7 @@ class SessionEventStore:
             self._check_explicit_sequence(session_id, event.sequence, current)
             await self._redis.set(self._seq_key(session_id), event.sequence, ex=self.ttl_seconds)
 
+        # Serialize sau khi có sequence để payload phát đi và bản lưu dùng cùng thứ tự.
         serialized = event.model_dump_json()
         object.__setattr__(event, "_cached_json", serialized)
         self._cache_append(session_id, event)
@@ -300,6 +309,7 @@ class EventReplayer:
     def __init__(self, store: SessionEventStore) -> None:
         self.store = store
 
+    # Replay cắt trên lịch sử đã lưu; không chạy lại agent hay tạo câu trả lời mới.
     def replay(
         self,
         session_id: str,

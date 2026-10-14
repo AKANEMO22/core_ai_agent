@@ -1,4 +1,10 @@
-"""Deterministic mock LLM provider client for unit and integration testing."""
+"""Deterministic mock LLM provider client for unit and integration testing.
+
+Luồng sử dụng: Provider mô phỏng cho kiểm thử và phát triển; agent dùng đúng stream_chat như backend thật.
+Nhận cấu hình token, tool call, lượt dựng sẵn hoặc responder để phát IterationChunk xác định.
+Thứ tự ưu tiên nhánh phản hồi trong stream_chat quyết định dữ liệu nào được dùng; call_count
+giúp chọn lượt tiếp theo mà không cần kết nối mạng.
+"""
 
 import asyncio
 import json
@@ -75,6 +81,7 @@ class MockLLMClient:
             yield IterationChunk(reasoning_summary=summary)
 
         # 2. Dynamic responder, then canned structured JSON responses
+        # Responder có thể trả None để nhường cho các nhánh canned phía sau.
         if self.responder is not None:
             dynamic = self.responder(messages)
             if dynamic is not None:
@@ -130,6 +137,7 @@ class MockLLMClient:
                 return
 
         # 3. Handle canned tool calls on first turn (or repeatedly if repeat_tool_calls=True)
+        # Mặc định chỉ gọi tool một lần, để lần gọi model kế tiếp chuyển sang câu trả lời cuối.
         if self.canned_tool_calls and (not self._tool_calls_consumed or self.repeat_tool_calls):
             if not self.repeat_tool_calls:
                 self._tool_calls_consumed = True

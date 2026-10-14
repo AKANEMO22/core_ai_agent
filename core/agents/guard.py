@@ -2,6 +2,11 @@
 
 A cheap heuristic runs first; the model is consulted only when the heuristic is inconclusive.
 Flags feed the orchestrator (redirect directives) and the report; answers are still evaluated.
+
+
+Phát hiện dấu hiệu yêu cầu đổi luật chấm điểm hoặc trả lời lạc đề.
+InputGuard.check nhận câu hỏi/câu trả lời, thử regex trước rồi mới gọi LLM khi cần;
+trả các cờ cho luồng điều phối. Đây là tín hiệu cảnh báo, không phải điểm đánh giá.
 """
 
 import asyncio
@@ -66,6 +71,7 @@ class InputGuard:
         self.min_words_for_model = min_words_for_model
 
     async def check(self, question: str, answer: str) -> Dict[str, Any]:
+        # Dấu hiệu regex rõ ràng hoặc câu quá ngắn được xử lý ngay, tiết kiệm độ trễ LLM.
         flags = heuristic_flags(answer)
         if flags["injection_suspected"] or self.llm is None or len((answer or "").split()) < self.min_words_for_model:
             return flags
@@ -86,6 +92,7 @@ class InputGuard:
                 semaphore=self.semaphore,
                 temperature=0.0,
             )
+        # Khi model lỗi vẫn trả các cờ heuristic; lỗi này không chặn vòng hội thoại.
         except StructuredOutputError:
             return flags
         return {

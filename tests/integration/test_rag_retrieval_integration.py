@@ -7,6 +7,7 @@ from config.settings import Settings
 from core.retrieval.factory import build_knowledge_service
 from core.retrieval.port import RetrievalError, RetrievalQuery
 from rag.adapter import RAGRetrievalClient
+from rag.ontology import resolve_role
 from rag.schemas import RAGInterviewRequest
 
 
@@ -48,6 +49,19 @@ def _framework():
         },
         "passing_thresholds": {"Junior": "3.6 / 5.0"},
         "technical_questions": [
+            {
+                "id": "BE_INT_01",
+                "level": "Intern",
+                "question": "How would you test a small Python API change?",
+                "key_concepts": ["Python", "API", "testing"],
+                "expected_answer": "Describe a focused test and the behavior it protects.",
+                "scoring_rubric": {
+                    "poor": "Names no test or behavior.",
+                    "acceptable": "Describes a relevant test.",
+                    "excellent": "Connects the test to a failure mode and validation result.",
+                },
+                "citation_url": "https://example.test/intern-api-test",
+            },
             {
                 "id": "BE_Q01",
                 "level": "Junior",
@@ -114,6 +128,13 @@ def _client(tmp_path):
 
 def _search(client, query):
     return asyncio.run(client.search(query))
+
+
+def test_role_resolution_prefers_general_swe_title_before_language_skill_for_intern():
+    assert resolve_role(
+        "Software Engineer Intern Python FastAPI Redis backend APIs",
+        {"IF_SWE", "IF_BE_GEN"},
+    ) == "IF_SWE"
 
 
 def test_rag_adapter_serves_the_core_collections_and_builds_an_offline_index(tmp_path):
@@ -197,6 +218,23 @@ def test_rag_adapter_serves_the_core_collections_and_builds_an_offline_index(tmp
     )
     assert context.status == "ok"
     assert context.selected_questions
+
+
+def test_rag_knowledge_pack_maps_intern_source_level_to_junior_core_rubric(tmp_path):
+    service = build_knowledge_service(
+        Settings(RETRIEVAL_BACKEND="mock"),
+        client=_client(tmp_path),
+    )
+    pack = asyncio.run(service.build_pack(
+        target_company="Example Corp",
+        target_role="Software Engineer Intern",
+        skills=["Python"],
+    ))
+
+    assert pack["level"] == "junior"
+    assert pack["source_level"] == "intern"
+    assert pack["rubric"]["competencies"]
+    assert any(pack["question_bank"].values())
 
 
 def test_rag_adapter_does_not_map_unsupported_levels_to_junior(tmp_path):

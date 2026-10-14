@@ -1,4 +1,10 @@
-"""Tool abstraction, signature schema inspection, and soft schema validation."""
+"""Tool abstraction, signature schema inspection, and soft schema validation.
+
+Luồng sử dụng: Cầu nối giữa callable Python và tool model có thể gọi: RuntimeTool giữ tên, schema và hàm.
+RuntimeAgent quảng bá schema, kiểm tra arguments rồi gọi execute; kết quả hàm được
+đưa lại vào lịch sử chat. Workspace là ngữ cảnh được runtime chèn, không phải tham số model
+phải sinh; hàm đồng bộ chạy ở thread để không chặn event loop.
+"""
 
 import asyncio
 import inspect
@@ -128,6 +134,7 @@ class RuntimeTool:
 
         for param_name, param in sig.parameters.items():
             # Skip framework-injected context variables
+            # Loại ngữ cảnh do Python/runtime cung cấp khỏi schema gửi cho model.
             if param_name in ("workspace", "self", "cls"):
                 continue
 
@@ -196,6 +203,7 @@ class RuntimeTool:
         if "workspace" in sig.parameters and "workspace" not in args_dict:
             args_dict["workspace"] = workspace
 
+        # Giữ một API await duy nhất cho caller, dù callable phía dưới là sync hay async.
         if inspect.iscoroutinefunction(self.func):
             return await self.func(**args_dict)
         return await asyncio.to_thread(self.func, **args_dict)

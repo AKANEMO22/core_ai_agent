@@ -1,4 +1,10 @@
-"""Verbatim quote verification shared by evaluator, claim checker and narrative."""
+"""Verbatim quote verification shared by evaluator, claim checker and narrative.
+
+Tiện ích kiểm chứng bằng chứng dùng chung cho evaluator, claims và narrative.
+verify_quote nhận trích dẫn và nguồn transcript, trả bool sau khi chuẩn hóa hai phía.
+Dấu ba chấm cho phép bỏ đoạn nhưng các mảnh còn lại phải xuất hiện theo đúng thứ tự;
+đây là kiểm tra khớp văn bản, không xác nhận ý nghĩa hay mức năng lực.
+"""
 
 import re
 import unicodedata
@@ -6,6 +12,7 @@ import unicodedata
 
 def normalize_for_match(text: str) -> str:
     """Case/accent/punctuation/whitespace folding used for quote verification."""
+    # Chuẩn hóa Unicode, chữ hoa/thường và dấu câu giống nhau ở cả quote lẫn nguồn.
     text = unicodedata.normalize("NFKC", text or "").lower()
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip()
@@ -37,6 +44,7 @@ def verify_quote(quote: str, source: str, min_words: int = 3) -> bool:
     haystack = _strip_fillers(normalize_for_match(source))
     if len(segments) == 1:
         return segments[0] in haystack
+    # Di chuyển vị trí tìm kiếm về phía trước để không đảo thứ tự các mảnh trích dẫn.
     position = 0
     for segment in segments:
         if len(segment.split()) < 2:

@@ -1,4 +1,10 @@
-"""Security protections for isolated workspaces, path resolution, and file uploads."""
+"""Security protections for isolated workspaces, path resolution, and file uploads.
+
+Workspace gọi ``validate_path_safety`` trước khi đọc/ghi/xóa file; API gọi
+``validate_upload_content`` trước khi chấp nhận CV/JD. Kiểm tra đường dẫn xử lý traversal
+và symlink, còn upload đi tuần tự qua giới hạn kích thước, chữ ký nhị phân, cấu trúc JSON
+và chính sách MIME.
+"""
 
 import json
 import os
@@ -123,6 +129,7 @@ def validate_upload_content(
     Raises:
         WorkspaceUploadError: If validation fails.
     """
+    # Hàm chạy trước khi upload được lưu: giới hạn byte/depth và loại executable trước khi kiểm MIME.
     settings = get_settings()
     effective_max_size = max_size_bytes if max_size_bytes is not None else settings.MAX_UPLOAD_SIZE_BYTES
     effective_max_depth = max_json_depth if max_json_depth is not None else settings.MAX_JSON_DEPTH
@@ -159,6 +166,7 @@ def validate_upload_content(
 
     if is_json:
         try:
+            # Chỉ parse JSON khi nội dung có dấu hiệu là JSON; độ sâu chặn payload lồng quá mức.
             decoded = raw_bytes.decode("utf-8")
             parsed = json.loads(decoded)
             depth = _calculate_json_depth(parsed)
@@ -172,7 +180,7 @@ def validate_upload_content(
             if (filename and filename.lower().endswith(".json")) or (content_type and "json" in content_type.lower()):
                 raise WorkspaceUploadError(f"Invalid JSON syntax in upload: {e}") from e
 
-    # Detect MIME type for policy enforcement
+    # MIME khai báo từ client không đủ tin cậy; so với chữ ký file và cách giải mã thực tế.
     detected_mime: Optional[str] = None
     if raw_bytes.startswith(b"%PDF-"):
         detected_mime = "application/pdf"

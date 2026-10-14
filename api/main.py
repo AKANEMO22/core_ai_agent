@@ -11,8 +11,10 @@ import fakeredis.aioredis
 from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from api.auth import SessionRevocationList, require_service_token
+from api.inspect import router as inspect_router
 from api.routes import router as sessions_router
 from api.websocket import ConnectionManager, ws_router
 from config.settings import Settings, get_settings, validate_settings
@@ -40,7 +42,10 @@ from core.runtime.priority import BackgroundLLMClient, HedgedLLMClient, HotPathG
 from core.runtime.profiles import load_profiles
 from core.runtime.skills import SkillRegistry
 from core.observability import build_default_metrics, configure_logging, correlation_id_var
+from fe_inspect.instrumentation import RuntimeTraceRecorder
+from fe_inspect.provider import UnconfiguredLLMClient
 from core.profiler.agent import ProfilerAgent
+from core.profiler.tools import SafeWebSearchTool
 from core.retrieval.factory import build_knowledge_service
 from core.retrieval.port import RetrievalClient
 from core.runtime.agent import RuntimeAgent, sanitize_secrets
@@ -52,9 +57,10 @@ from core.session.cancellation import CancellationRegistry
 from core.session.events import SessionEventStore
 from core.session.idempotency import MessageLedger, RedisIdempotencyStore, RedisLease, TokenBucket
 from core.session.store import RedisSessionStateStore
+from core.storage import ArtifactArchive, S3ObjectStore
 from core.workspace.cleanup import WorkspaceCleanupManager
 from core.workspace.retention import RetentionService
-from core.workspace.session import SessionWorkspaceManager
+from core.workspace.session import SessionWorkspaceManager, normalize_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,7 @@ def create_app(
     llm_client: Optional[RuntimeLLMClient] = None,
     settings: Optional[Settings] = None,
     retrieval_client: Optional[RetrievalClient] = None,
+    artifact_archive: Optional[ArtifactArchive] = None,
     **kwargs: Any,
 ) -> FastAPI:
     """Create the AI runtime application.
@@ -101,6 +108,8 @@ def create_app(
     config_errors = validate_settings(app_settings)
     if config_errors:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(config_errors))
+    if app_settings.APP_ENV.strip().lower() == "production" and app_settings.INSPECTOR_LOCAL_AUTH:
+        raise RuntimeError("Core Studio local token issuing is development-only")
 
     # 1. Redis
     active_redis = redis_client
@@ -117,6 +126,36 @@ def create_app(
     ws_base_path.mkdir(parents=True, exist_ok=True)
     workspace_mgr = SessionWorkspaceManager(root_base=str(ws_base_path), fsync=app_settings.WORKSPACE_FSYNC)
     cleanup_mgr = WorkspaceCleanupManager(root_base=str(ws_base_path))
+    active_artifact_archive = artifact_archive
+    if active_artifact_archive is None and app_settings.ARTIFACT_ARCHIVE_ENABLED:
+        if not all(
+            (
+                app_settings.OBJECT_STORE_ENDPOINT,
+                app_settings.OBJECT_STORE_ACCESS_KEY,
+                app_settings.OBJECT_STORE_SECRET_KEY,
+            )
+        ):
+            raise RuntimeError("S3-compatible object store endpoint and credentials are required when artifact archiving is enabled")
+        active_artifact_archive = ArtifactArchive(
+            object_store=S3ObjectStore(
+                endpoint_url=app_settings.OBJECT_STORE_ENDPOINT,
+                access_key=app_settings.OBJECT_STORE_ACCESS_KEY,
+                secret_key=app_settings.OBJECT_STORE_SECRET_KEY,
+                region=app_settings.OBJECT_STORE_REGION,
+                verify_tls=app_settings.OBJECT_STORE_VERIFY_TLS,
+                timeout_seconds=app_settings.OBJECT_STORE_TIMEOUT_SECONDS,
+            ),
+            bucket=app_settings.ARTIFACT_ARCHIVE_BUCKET,
+            catalog_path=app_settings.ARTIFACT_ARCHIVE_CATALOG_PATH,
+            max_restore_bytes=app_settings.ARTIFACT_ARCHIVE_MAX_RESTORE_BYTES,
+        )
+    if app_settings.APP_ENV.strip().lower() == "production" and active_artifact_archive is not None:
+        raise RuntimeError(
+            "Durable artifact archives require user ownership authorization before production use"
+        )
+    studio_enabled = app_settings.INSPECTOR_ENABLED or app_settings.TEST_UI_ENABLED
+    strict_studio = studio_enabled and app_settings.STUDIO_REQUIRE_REAL_PROVIDER
+    inspect_trace_recorder = RuntimeTraceRecorder(workspace_mgr) if studio_enabled else None
 
     # 3. Durable session primitives
     metrics = build_default_metrics()
@@ -149,9 +188,16 @@ def create_app(
                 model=app_settings.llm_model,
                 base_url=app_settings.LLM_API_URL or None,
             )
+        elif strict_studio:
+            active_llm = UnconfiguredLLMClient()
         else:
             active_llm = _default_mock_llm()
     verify_capabilities(active_llm)
+    if inspect_trace_recorder is not None:
+        inspect_trace_recorder.instrument_events(event_store)
+        inspect_trace_recorder.instrument_state(state_store)
+        if hasattr(active_llm, "_stream_once"):
+            inspect_trace_recorder.wrap(active_llm, "_stream_once", "Provider HTTP attempt", "llm")
 
     # Agent profiles: each structured agent calls the provider with its own profile model.
     profiles = load_profiles(overrides_json=app_settings.AGENT_PROFILES_OVERRIDES, app_env=app_settings.APP_ENV)
@@ -163,20 +209,32 @@ def create_app(
         if isinstance(active_llm, OpenAIRuntimeLLMClient) and app_settings.SPEAKER_HEDGE_AFTER_MS > 0
         else active_llm
     )
+    if inspect_trace_recorder is not None:
+        # A separate wrapper prevents tracing a shared provider as "speaker" during
+        # background agent calls. HTTP attempts remain children of the active caller.
+        speaker_llm = ProfiledLLMClient(speaker_llm)
 
     def llm_for(profile_name: str) -> RuntimeLLMClient:
         """Client for a background agent: its profile model, yielding to in-flight speaker turns."""
         profile = profiles.get(profile_name)
-        return BackgroundLLMClient(
+        client = BackgroundLLMClient(
             ProfiledLLMClient(active_llm, profile.model if profile else ""),
             hot_path_gate,
             max_wait_seconds=app_settings.BACKGROUND_YIELD_MAX_MS / 1000,
         )
+        if inspect_trace_recorder is not None:
+            inspect_trace_recorder.wrap(client, "stream_chat", f"{profile_name} model", "llm", profile_name)
+        return client
 
     knowledge_service = build_knowledge_service(app_settings, client=retrieval_client)
+    profiler_tools = (
+        [SafeWebSearchTool(api_key=app_settings.BRAVE_SEARCH_API_KEY)]
+        if app_settings.BRAVE_SEARCH_API_KEY and not isinstance(active_llm, MockLLMClient)
+        else []
+    )
     profiler_agent = ProfilerAgent(
         llm_client=llm_for("profiler"),
-        tools=[] if isinstance(active_llm, MockLLMClient) else None,
+        tools=profiler_tools,
         knowledge_service=knowledge_service,
     )
 
@@ -206,6 +264,7 @@ def create_app(
             semaphore=synthesis_semaphore,
         ),
         extra_versions={"narrative_prompt": "report_narrative@1", "orchestrator_prompt": "orchestrator_decision@1"},
+        artifact_archive=active_artifact_archive,
     )
     pipeline = AssessmentPipeline(
         redis_client=active_redis,
@@ -249,6 +308,7 @@ def create_app(
         cleanup_mgr=cleanup_mgr,
         raw_upload_retention_hours=app_settings.RAW_UPLOAD_RETENTION_HOURS,
         artifact_retention_days=app_settings.SESSION_ARTIFACT_RETENTION_DAYS,
+        artifact_archive=active_artifact_archive,
     )
 
     # 7. Harness: profiles, hooks, skills
@@ -271,16 +331,20 @@ def create_app(
             except Exception as e:
                 logger.warning("Could not read stage plan: %s", sanitize_secrets(str(e)))
         speaker = profiles["speaker"]
+        runtime_agent = RuntimeAgent(
+            client=speaker_llm, workspace=ws, profile=speaker, hooks=hooks,
+            policy=tool_policy, metrics=metrics,
+        )
+        if inspect_trace_recorder is not None:
+            inspect_trace_recorder.bind_agent(runtime_agent, "speaker", "session", session_id)
+            inspect_trace_recorder.wrap(runtime_agent, "run_loop_streaming", "Speaker turn", "agent")
+            if runtime_agent.compactor is not None:
+                inspect_trace_recorder.wrap(runtime_agent.compactor, "maybe_compact", "Context compaction", "operation", "speaker")
+            for tool in runtime_agent.tools:
+                inspect_trace_recorder.wrap(tool, "execute", f"Tool: {tool.name}", "tool", "speaker")
         return InteractiveSubagentRunner(
             workspace=ws,
-            runtime_agent=RuntimeAgent(
-                client=speaker_llm,
-                workspace=ws,
-                profile=speaker,
-                hooks=hooks,
-                policy=tool_policy,
-                metrics=metrics,
-            ),
+            runtime_agent=runtime_agent,
             context_assembler=ContextAssembler(max_tokens=app_settings.MAX_SUBAGENT_PROMPT_TOKENS),
             stage_director=StageDirector(
                 stages=stages, state_mgr=state_store, max_extra_turns=app_settings.STAGE_MAX_EXTRA_TURNS
@@ -305,7 +369,7 @@ def create_app(
         metrics=metrics,
     )
 
-    register_subagents(delegation, llm_for, workspace_mgr, retrieval_client=knowledge_service.client,
+    registered_agents = register_subagents(delegation, llm_for, workspace_mgr, retrieval_client=knowledge_service.client,
                        profiles=profiles, semaphore=orchestration_semaphore)
 
     orchestrator = InterviewOrchestrator(
@@ -331,6 +395,34 @@ def create_app(
     brief_writer = InterviewBriefWriter(
         llm=llm_for("brief"), skills=skills, deadline_seconds=profiles["brief"].turn_deadline_ms / 1000
     )
+    if inspect_trace_recorder is not None:
+        recorder = inspect_trace_recorder
+        recorder.wrap(speaker_llm, "stream_chat", "Speaker model", "llm", "speaker")
+        for owner, name, method in [
+            (profiler_agent, "profiler", "run_profiling"),
+            (worker.evaluator, "evaluator", "evaluate_turn"),
+            (synthesizer.narrative_writer, "narrative", "write"),
+            (orchestrator, "orchestrator", "run_cycle"),
+            (summarizer, "summary", "update"),
+            (brief_writer, "brief", "write"),
+            (registered_agents["followup"], "followup", "plan"),
+            (registered_agents["claims"], "claims", "check"),
+            (registered_agents["guard"], "guard", "check"),
+        ]:
+            recorder.bind_agent(owner, name)
+            recorder.wrap(owner, method, f"{name}.{method}", "agent")
+        recorder.wrap(knowledge_service, "build_pack", "Build retrieval knowledge pack", "retrieval")
+        recorder.wrap(profiler_agent, "_query_model", "Profiler structured query", "operation", "profiler")
+        recorder.wrap(profiler_agent, "_retrieve_knowledge", "Profiler retrieval", "retrieval", "profiler")
+        recorder.wrap(orchestrator, "_decide", "Choose next directive", "operation", "orchestrator")
+        recorder.wrap(knowledge_service, "_search", "Retrieval query", "retrieval")
+        recorder.wrap(knowledge_service.client, "search", "Retrieval backend search", "retrieval")
+        recorder.wrap(delegation, "delegate", "Schedule delegation", "operation", "orchestrator")
+        recorder.wrap(delegation, "_run", "Execute delegated task", "task")
+        delegation.trace_recorder = recorder
+        recorder.wrap(assessment_queue, "enqueue", "Enqueue assessment", "operation")
+        recorder.wrap(worker, "_process_job_data", "Assessment worker delivery", "task", "assessor")
+        recorder.wrap(synthesizer, "synthesize", "Report synthesis", "operation")
 
     async def after_turn_orchestrate(session_id: str, turn_number: int) -> None:
         await orchestrator.run_cycle(session_id, turn_number)
@@ -360,6 +452,9 @@ def create_app(
         metrics=metrics,
         hot_path_gate=hot_path_gate,
     )
+    if inspect_trace_recorder is not None:
+        inspect_trace_recorder.instrument_controller(controller)
+        inspect_trace_recorder.instrument_registry(runners)
     if app_settings.ORCHESTRATOR_ENABLED:
         controller.after_turn_hooks.append(after_turn_orchestrate)
     if app_settings.ROLLING_SUMMARY_ENABLED:
@@ -383,6 +478,9 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         if app_settings.APP_ENV.strip().lower() == "production":
             configure_logging(json_format=True)
+        if active_artifact_archive is not None:
+            await asyncio.to_thread(active_artifact_archive.initialize)
+            app.state.artifact_archive_initialized = True
         if app_settings.ASSESSOR_POOL_SIZE > 0:
             await worker_pool.start()
         background_tasks["retention"] = asyncio.create_task(_retention_loop(), name="retention")
@@ -394,7 +492,10 @@ def create_app(
             await asyncio.gather(*background_tasks.values(), return_exceptions=True)
             background_tasks.clear()
             await controller.drain(timeout=10.0)
+            await hooks.drain(timeout=5.0)
             await worker_pool.stop(grace_seconds=30.0)
+            if inspect_trace_recorder is not None:
+                await inspect_trace_recorder.close()
 
     app = FastAPI(
         title="AI Interview Platform Core Engine",
@@ -423,6 +524,11 @@ def create_app(
 
     @app.middleware("http")
     async def correlation_middleware(request: Request, call_next: Any) -> Response:
+        if strict_studio and request.method == "POST" and request.url.path.startswith("/api/v1/sessions") and not request.url.path.endswith(("/cancel", "/review")):
+            parts = request.url.path.rstrip("/").split("/")
+            session_id = parts[4] if len(parts) > 4 else None
+            if not studio_execution_allowed(session_id):
+                return JSONResponse(status_code=503, content={"detail": "Real LLM/retrieval required; legacy simulation archives are read-only."})
         incoming = request.headers.get("x-correlation-id", "")
         correlation_id = incoming if 0 < len(incoming) <= 64 and incoming.isascii() else uuid.uuid4().hex[:16]
         token = correlation_id_var.set(correlation_id)
@@ -437,6 +543,8 @@ def create_app(
     app.state.settings = app_settings
     app.state.workspace_mgr = workspace_mgr
     app.state.cleanup_mgr = cleanup_mgr
+    app.state.artifact_archive = active_artifact_archive
+    app.state.artifact_archive_initialized = active_artifact_archive is None
     app.state.redis_client = active_redis
     app.state.event_store = event_store
     app.state.connection_mgr = connection_mgr
@@ -465,6 +573,22 @@ def create_app(
     app.state.profiles = profiles
     app.state.hot_path_gate = hot_path_gate
     app.state.hooks = hooks
+    app.state.inspect_trace_recorder = inspect_trace_recorder
+    app.state.studio_real_provider = not isinstance(active_llm, (MockLLMClient, UnconfiguredLLMClient))
+    def studio_execution_allowed(session_id=None):
+        if not app.state.studio_real_provider or knowledge_service.backend_name == "mock":
+            return False
+        if session_id and (ws_base_path / normalize_session_id(session_id) / "inspect/simulation_result.json").is_file():
+            return False
+        return True
+    app.state.studio_execution_allowed = studio_execution_allowed
+    if inspect_trace_recorder is not None:
+        inspect_trace_recorder.provider_metadata = {
+            "client": type(active_llm).__name__,
+            "model": app_settings.llm_model if app.state.studio_real_provider else None,
+            "real_provider": app.state.studio_real_provider,
+            "retrieval_backend": knowledge_service.backend_name,
+        }
     app.state.skills = skills
     app.state.blackboard = blackboard
     app.state.delegation = delegation
@@ -514,11 +638,20 @@ def create_app(
             if app_settings.APP_ENV.strip().lower() == "production":
                 is_ready = False
 
-        provider_ok = not isinstance(active_llm, MockLLMClient) or app_settings.APP_ENV != "production"
-        details["provider"] = "configured" if not isinstance(active_llm, MockLLMClient) else "mock"
+        provider_ok = not isinstance(active_llm, (MockLLMClient, UnconfiguredLLMClient)) or (
+            not strict_studio and app_settings.APP_ENV != "production"
+        )
+        details["provider"] = "unconfigured" if isinstance(active_llm, UnconfiguredLLMClient) else "mock" if isinstance(active_llm, MockLLMClient) else "configured"
         is_ready = is_ready and provider_ok
         details["retrieval_backend"] = knowledge_service.backend_name
         details["max_concurrent_sessions"] = app_settings.MAX_CONCURRENT_SESSIONS
+        if active_artifact_archive is not None:
+            details["artifact_archive"] = (
+                "initialized" if app.state.artifact_archive_initialized else "unavailable"
+            )
+            is_ready = is_ready and app.state.artifact_archive_initialized
+        else:
+            details["artifact_archive"] = "disabled"
 
         return JSONResponse(
             status_code=status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -537,6 +670,18 @@ def create_app(
 
     app.include_router(sessions_router)
     app.include_router(ws_router)
+    if studio_enabled:
+        app.include_router(inspect_router)
+    if app_settings.INSPECTOR_ENABLED:
+        inspect_dir = Path(__file__).resolve().parent.parent / "FE-inspect"
+        if not inspect_dir.is_dir():
+            raise RuntimeError(f"FE-inspect assets are missing: {inspect_dir}")
+        app.mount("/inspect", StaticFiles(directory=str(inspect_dir), html=True), name="fe-inspect")
+    if app_settings.TEST_UI_ENABLED:
+        test_dir = Path(__file__).resolve().parent.parent / "FE-test"
+        if not test_dir.is_dir():
+            raise RuntimeError(f"FE-test assets are missing: {test_dir}")
+        app.mount("/test", StaticFiles(directory=str(test_dir), html=True), name="fe-test")
     return app
 
 

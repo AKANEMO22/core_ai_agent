@@ -4,6 +4,12 @@ For each turn, one structured call scores every targeted competency on the retri
 or reports `insufficient_evidence`. Every quote is verified against the candidate's actual words;
 unverifiable quotes are dropped and the criterion's confidence is halved, so invented evidence
 cannot inflate a score. Without a retrieved rubric the legacy two-score evaluator is used.
+
+
+Chấm một câu trả lời theo các mức mô tả của rubric lấy từ workspace.
+AssessorWorker gọi evaluate_turn với câu hỏi, transcript và các tiêu chí mục tiêu;
+module trả payload chấm điểm sau khi xác minh trích dẫn, để worker lưu artifact.
+Nếu không tìm được tiêu chí rubric phù hợp, chuyển sang TurnEvaluator tương thích cũ.
 """
 
 import json
@@ -138,6 +144,7 @@ class CriterionEvaluator:
         rubric = _payload(workspace, "context/rubric.json") if workspace else {}
         competencies = {c["competency_id"]: c for c in rubric.get("competencies", []) if c.get("competency_id")}
         scoped = [competencies[t] for t in targets if t in competencies]
+        # Không có anchor cho mục tiêu thì dùng evaluator cũ, tránh tự dựng thang rubric.
         if not scoped:
             result = await self.legacy.evaluate_turn(
                 question=question, candidate_text=candidate_text, rubric_target=targets,
@@ -147,6 +154,7 @@ class CriterionEvaluator:
             return result
 
         knowledge = _payload(workspace, "context/retrieved_knowledge.json") if workspace else {}
+        # Câu hỏi ở lượt trước xác định tiêu chí chính và expected_points cho lần chấm này.
         asked = self._asked_question(workspace, turn_id) if workspace else {}
         expected = self._expected_points(knowledge, asked.get("question_id"))
         primary = asked.get("target_criterion") if asked.get("target_criterion") in competencies else None
@@ -170,6 +178,7 @@ class CriterionEvaluator:
                 "Respond with JSON only for `criterion_evaluation`.",
             ]
         )
+        # Lỗi structured output được truyền lên worker để dùng cơ chế retry của queue.
         raw = await run_structured(
             self.llm,
             [{"role": "system", "content": EVALUATOR_SYSTEM_PROMPT}, {"role": "user", "content": user}],
@@ -179,6 +188,7 @@ class CriterionEvaluator:
             temperature=0.0,
         )
 
+        # Chỉ xuất các tiêu chí đã yêu cầu; tiêu chí model bỏ sót trở thành thiếu bằng chứng.
         by_id = {item.get("competency_id"): item for item in raw.get("criteria", [])}
         criteria: List[Dict[str, Any]] = []
         unverified_total = 0
@@ -197,6 +207,7 @@ class CriterionEvaluator:
                     }
                 )
                 continue
+            # Đối chiếu quote với câu trả lời gốc trước khi cho phép mức điểm tham gia coverage.
             evidence = []
             for quote in item.get("evidence_quotes") or []:
                 verified = verify_quote(quote, candidate_text)

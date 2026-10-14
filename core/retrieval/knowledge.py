@@ -1,4 +1,12 @@
-"""Interview knowledge service composing retrieval results into interview-ready artifacts."""
+"""Interview knowledge service composing retrieval results into interview-ready artifacts.
+
+Lớp ghép dữ liệu giữa retrieval adapter và ProfilerAgent: build_pack nhận
+công ty, vai trò, kỹ năng/kinh nghiệm/JD, trả rubric, question_bank và nguồn.
+Role profile/rubric/company context được lấy trước; truy vấn câu hỏi phụ thuộc
+competency trong rubric. ground_stage_plan sau đó sửa đề xuất stage của LLM
+để bám tiêu chí và câu hỏi đã lấy. Backend rag thiếu evidence gây RetrievalError;
+profiler bên gọi quyết định nhánh degraded.
+"""
 
 import asyncio
 import re
@@ -15,9 +23,9 @@ from core.retrieval.port import (
 STAGE_TYPES = ("warmup", "technical", "system_design", "behavioral", "wrapup")
 
 _LEVEL_PATTERNS = (
-    ("staff", re.compile(r"\b(staff|principal|distinguished)\b")),
-    ("senior", re.compile(r"\b(senior|sr|lead|architect)\b")),
-    ("junior", re.compile(r"\b(junior|jr|intern|fresher|entry|graduate)\b")),
+    ("staff", re.compile(r"\b(staff|principal|distinguished|architect)\b")),
+    ("senior", re.compile(r"\b(senior|sr\.?|lead)\b")),
+    ("junior", re.compile(r"\b(junior|jr\.?|intern(?:ship)?|fresher|entry|graduate|associate)\b")),
     ("mid", re.compile(r"\b(mid|intermediate)\b")),
 )
 
@@ -34,6 +42,7 @@ _ROLE_FAMILY_PATTERNS = (
     ("enterprise", re.compile(r"\b(erp|sap|odoo)\b")),
     ("business_analyst", re.compile(r"\b(business analyst|product analyst|business analysis|business intelligence)\b")),
 )
+_GENERIC_BACKEND_TITLE = re.compile(r"\b(software engineer|software developer|programmer|application developer)\b")
 
 # Ordered: the first matching stage type wins.
 _STAGE_TYPE_PATTERNS = (
@@ -43,35 +52,38 @@ _STAGE_TYPE_PATTERNS = (
     ("system_design", re.compile(r"(system[\s_-]?design|architect|\bdesign\b|scalab)")),
 )
 
-DEFAULT_ROLE_FAMILY = "backend"
 DEFAULT_PASS_THRESHOLD = 3.0
 DEFAULT_RUBRIC_VERSION = "rubric_v1"
 
 
-def infer_level(target_role: Optional[str], experience_years: Optional[int] = None) -> str:
-    """Map a free-text role title (and experience) onto the junior/mid/senior/staff ladder."""
+def infer_level(target_role: Optional[str], experience_years: Optional[float] = None) -> Optional[str]:
+    """Map explicit role evidence or experience onto the supported IT ladder."""
     role_text = (target_role or "").lower()
     for level, pattern in _LEVEL_PATTERNS:
         if pattern.search(role_text):
             return level
     if experience_years is None:
-        return "mid"
-    if experience_years < 2:
+        return None
+    if experience_years < 3:
         return "junior"
-    if experience_years < 5:
+    if experience_years < 7:
         return "mid"
-    if experience_years < 9:
-        return "senior"
-    return "staff"
+    return "senior"
 
 
-def infer_role_family(target_role: Optional[str], skills: Optional[Sequence[str]] = None) -> str:
-    """Map a role title and skill list onto a role family; the title takes precedence over skills."""
-    for text in ((target_role or "").lower(), " ".join(skills or []).lower()):
+def infer_role_family(target_role: Optional[str], skills: Optional[Sequence[str]] = None) -> Optional[str]:
+    """Map supported titles/skills without silently assigning unrelated roles to backend."""
+    role_text = (target_role or "").lower()
+    skills_text = " ".join(skills or []).lower()
+    # A generic "Software Engineer" title must not mask a specific family in the
+    # candidate's skills. Prefer explicit title evidence, then explicit skills.
+    for text in (role_text, skills_text):
         for family, pattern in _ROLE_FAMILY_PATTERNS:
             if pattern.search(text):
                 return family
-    return DEFAULT_ROLE_FAMILY
+    if _GENERIC_BACKEND_TITLE.search(role_text) or _GENERIC_BACKEND_TITLE.search(skills_text):
+        return "backend"
+    return None
 
 
 def classify_stage_type(stage: Dict[str, Any]) -> str:
@@ -136,8 +148,9 @@ class InterviewKnowledgeService:
         target_company: str,
         target_role: str,
         skills: Optional[Sequence[str]] = None,
-        experience_years: Optional[int] = None,
+        experience_years: Optional[float] = None,
         job_description: Optional[str] = None,
+        seniority: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Retrieve and assemble the knowledge pack for one interview.
 
@@ -156,7 +169,36 @@ class InterviewKnowledgeService:
             RetrievalError: If any retrieval call fails or times out.
         """
         role_family = infer_role_family(target_role, skills)
-        level = infer_level(target_role, experience_years)
+        if role_family is None:
+            raise RetrievalError(
+                f"No indexed interview role family matches '{target_role}'. The plan must be reviewed as generic/degraded."
+            )
+        requested_seniority = str(seniority or "").strip().casefold()
+        source_level = requested_seniority if requested_seniority in {"intern", "fresher", "junior"} else None
+        if requested_seniority in {"intern", "fresher", "junior"}:
+            level = "junior"
+        elif requested_seniority in {"mid", "senior", "staff"}:
+            level = requested_seniority
+        else:
+            level = infer_level(target_role, experience_years)
+            title_source_levels = (
+                ("intern", re.compile(r"\bintern(?:ship)?\b", re.I)),
+                ("fresher", re.compile(r"\b(fresher|graduate|new grad|entry[- ]level)\b", re.I)),
+                ("junior", re.compile(r"\b(junior|jr\.?|associate)\b", re.I)),
+            )
+            source_level = next(
+                (value for value, pattern in title_source_levels if pattern.search(target_role or "")),
+                None,
+            )
+            if source_level is None and experience_years is not None and experience_years < 1:
+                source_level = "fresher"
+            elif source_level is None and level == "junior":
+                source_level = "junior"
+        if level is None:
+            raise RetrievalError("No interview level could be inferred; user confirmation is required")
+        if level == "staff":
+            raise RetrievalError("Staff and principal roles are outside the supported IT Intern–Senior scope")
+        query_level = source_level or level
         family_filter = [role_family, "any"]
         focus_text = " ".join(
             part
@@ -179,7 +221,7 @@ class InterviewKnowledgeService:
                 RetrievalQuery(
                     collection=RetrievalCollection.RUBRIC.value,
                     text=focus_text,
-                    filters={"role_family": family_filter, "levels": level},
+                    filters={"role_family": family_filter, "levels": query_level},
                     top_k=self.max_competencies,
                 )
             ),
@@ -193,6 +235,7 @@ class InterviewKnowledgeService:
             ),
         )
 
+        # Với corpus thật, không dựng rubric mặc định để che việc thiếu evidence cho vai trò/cấp độ.
         if self.backend_name == "rag" and (not role_chunks or not rubric_chunks):
             raise RetrievalError(
                 "RAG has no role and rubric evidence for "
@@ -211,7 +254,7 @@ class InterviewKnowledgeService:
                         text=f"{focus_text} {comp['name']}",
                         filters={
                             "competency": comp["competency_id"],
-                            "levels": level,
+                            "levels": query_level,
                             "role_family": family_filter,
                         },
                         top_k=self.questions_per_competency,
@@ -220,7 +263,7 @@ class InterviewKnowledgeService:
                 for comp in rubric["competencies"]
             ]
         )
-        if self.backend_name == "rag" and not any(question_lists):
+        if self.backend_name == "rag" and not any(question_lists) and level not in {"mid", "senior"}:
             raise RetrievalError(
                 "RAG has no question evidence for "
                 f"role_family='{role_family}', level='{level}'"
@@ -249,9 +292,15 @@ class InterviewKnowledgeService:
             "retrieval_backend": self.backend_name,
             "role_family": role_family,
             "level": level,
+            "source_level": source_level or level,
             "role_profile": role_profile,
             "rubric": rubric,
             "question_bank": question_bank,
+            "question_bank_status": (
+                "generated_from_candidate_profile_and_jd"
+                if level in {"mid", "senior"} and not any(question_lists)
+                else "retrieved"
+            ),
             "company_context": company_context,
             "sources": sources,
         }
@@ -399,6 +448,7 @@ def ground_stage_plan(
             target = _pick_stage_for_competency(dict_stages, stage_types_by_comp[cid])
             target["criteria"].append(cid)
 
+    # Dùng chung tập id qua mọi stage để một câu hỏi không bị gắn lại ở stage khác.
     used_question_ids: Set[str] = set()
     for stage in dict_stages:
         stage["criteria_labels"] = [comp_by_id[cid]["name"] for cid in stage["criteria"]]

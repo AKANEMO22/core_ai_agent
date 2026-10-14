@@ -3,6 +3,12 @@
 Uses the asked question's retrieved follow-ups and evaluator-only expected points to find what the
 answer missed, and may retrieve a harder question for the same competency. Its suggestions go to
 the orchestrator, never directly to the candidate, so expected points are not exposed.
+
+
+Lập gợi ý hỏi tiếp từ câu trả lời và ngân hàng câu hỏi đã truy xuất.
+FollowUpPlanner.plan kết hợp expected_points riêng cho người chấm với LLM,
+có thể tìm thêm câu khó hơn qua RetrievalClient; trả gaps/suggestions cho orchestrator.
+Bên điều phối quyết định câu nào được hỏi, planner không gửi trực tiếp cho ứng viên.
 """
 
 import asyncio
@@ -10,6 +16,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from core.language import interview_language_instruction, workspace_interview_language
 from core.retrieval.port import RetrievalClient, RetrievalQuery
 from core.runtime.client import RuntimeLLMClient
 from core.runtime.structured import StructuredOutputError, run_structured
@@ -81,6 +88,7 @@ class FollowUpPlanner:
     async def _harder_question(self, knowledge: Dict[str, Any], question: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if self.retrieval is None:
             return None
+        # Truy xuất bổ sung có timeout riêng; thất bại chỉ bỏ gợi ý khó hơn.
         try:
             chunks = await asyncio.wait_for(
                 self.retrieval.search(
@@ -110,6 +118,7 @@ class FollowUpPlanner:
         return None
 
     async def plan(self, workspace: SessionWorkspace, turn_number: int, question_text: str, answer: str) -> Dict[str, Any]:
+        # Ghép answer hiện tại với câu interviewer ở lượt trước và metadata của question_id.
         knowledge = _payload(workspace, "context/retrieved_knowledge.json")
         asked = _payload(workspace, f"turns/turn_{turn_number - 1}_interviewer.json")
         question = find_question(knowledge, asked.get("question_id")) or {}
@@ -124,7 +133,11 @@ class FollowUpPlanner:
             result = await run_structured(
                 self.llm,
                 [
-                    {"role": "system", "content": FOLLOWUP_PROMPT},
+                    {
+                        "role": "system",
+                        "content": FOLLOWUP_PROMPT + "\n\n"
+                        + interview_language_instruction(workspace_interview_language(workspace)),
+                    },
                     {
                         "role": "user",
                         "content": "\n\n".join(
@@ -150,6 +163,7 @@ class FollowUpPlanner:
                 for s in result.get("suggestions", [])
             ]
             gaps = list(result.get("answer_gaps", []))
+        # Khi LLM không trả kết quả hợp lệ, dùng follow-up có sẵn trong knowledge pack.
         except StructuredOutputError:
             suggestions = retrieved_follow_ups[:2]
 

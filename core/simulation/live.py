@@ -5,6 +5,9 @@ provider; a second model instance plays the candidate at a target level. Results
 report, decision, timings) are written to data/live_runs/<timestamp>-<persona>/.
 
     RUN_LIVE_LLM=1 uv run python -m core.simulation.live --persona strong --persona weak
+
+Lệnh CLI tạo app tạm, khởi động worker, cho candidate model trả lời trong khi control-plane
+xử lý, rồi lưu transcript/metrics/report dưới thư mục ``--out`` để kiểm tra thủ công.
 """
 
 import argparse
@@ -49,6 +52,7 @@ class LiveCandidate:
     llm: OpenAIRuntimeLLMClient
 
     async def answer(self, question: str, history: List[Dict[str, str]]) -> str:
+        # Candidate model nhận một cửa sổ lịch sử gần nhất và chỉ trả lời câu hỏi hiện tại.
         persona = PERSONAS[self.name]
         messages = [
             {
@@ -93,6 +97,7 @@ async def run_persona(
     model: Optional[str] = None,
     speaker_model: Optional[str] = None,
 ) -> Dict[str, Any]:
+    # Mỗi persona có app/workspace riêng; provider thật được cấu hình qua settings môi trường.
     update: Dict[str, Any] = {
         "ASSESSOR_BLOCK_MS": 50, "ASSESSOR_RECOVERY_INTERVAL_SECONDS": 0.5, "REPORT_SWEEP_INTERVAL_SECONDS": 1.0,
     }
@@ -141,6 +146,7 @@ async def run_persona(
         session_id = res.json()["session_id"]
     timings["profiling_seconds"] = round(time.perf_counter() - started, 2)
 
+    # Worker cần chạy song song với hội thoại để xử lý assessment và tạo report cuối.
     await app.state.worker_pool.start()
     controller = app.state.controller
     workspace = app.state.workspace_mgr.get_or_create_workspace(session_id)
@@ -164,6 +170,7 @@ async def run_persona(
             if state.status != LifecycleStatus.STAGE_ACTIVE:
                 break
             # The candidate "speaks" while the control plane finishes the previous cycle.
+            # Candidate đang “nói” trong lúc orchestrator xử lý control-plane của lượt trước.
             answer_task = asyncio.create_task(candidate.answer(question, history))
             drain_start = time.perf_counter()
             await controller.drain(timeout=60)
@@ -205,6 +212,7 @@ async def run_persona(
             print(f"[{name}] turn {turn}: ttft={timings['turns'][-1]['ttft_seconds']}s "
                   f"stage={artifact.get('stage_id')} directive={artifact.get('directive_source')}/{artifact.get('directive_mode')}")
 
+        # Đợi các directive cuối, sau đó poll trạng thái report vì worker đánh giá độc lập với request.
         await controller.drain(timeout=60)
         deadline = time.perf_counter() + 300
         report_started = time.perf_counter()
@@ -224,6 +232,7 @@ async def run_persona(
         data = workspace.read_json(path.relative_to(workspace.root_path).as_posix())
         evaluations.append(data.get("payload", data))
     ttfts = sorted(t["ttft_seconds"] for t in timings["turns"] if t["ttft_seconds"] is not None)
+    # Snapshot kết quả và latency ra thư mục run để so sánh persona qua nhiều lần chạy.
     summary = {
         "persona": name,
         "session_id": session_id,
@@ -263,6 +272,7 @@ async def run_persona(
 
 async def main_async(personas: List[str], out_root: Path, relaxed: bool = False,
                      model: Optional[str] = None, speaker_model: Optional[str] = None) -> None:
+    # Chạy tuần tự để mỗi persona có summary riêng và không tranh tài nguyên giữa các run.
     for name in personas:
         summary = await run_persona(name, out_root, relaxed=relaxed, model=model, speaker_model=speaker_model)
         printable = {k: v for k, v in summary.items() if k != "timings"}
@@ -276,6 +286,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--relaxed", action="store_true", help="long deadlines for slow gateways")
     parser.add_argument("--model", help="model for all agents (overrides LLM_MODEL)")
     parser.add_argument("--speaker-model", help="model for the realtime speaker only")
+    # Điểm vào CLI; module docstring có lệnh chạy mẫu và cờ --persona/--out/--relaxed/--model.
     args = parser.parse_args(argv)
     asyncio.run(main_async(args.persona or ["strong"], args.out, args.relaxed, args.model, args.speaker_model))
 

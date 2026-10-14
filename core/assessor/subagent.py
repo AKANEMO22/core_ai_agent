@@ -1,4 +1,10 @@
-"""Turn-level rubric evaluation subagent with non-scoring descriptive delivery observations."""
+"""Turn-level rubric evaluation subagent with non-scoring descriptive delivery observations.
+
+Evaluator tương thích cũ: chấm nội dung và cách trình bày trên thang 1–10.
+TurnEvaluator nhận câu hỏi, câu trả lời và mục tiêu rubric, gom token LLM rồi
+đọc JSON, giới hạn điểm và trả phản hồi. CriterionEvaluator dùng nó khi thiếu rubric.
+VAD chỉ tạo quan sát mô tả, không tham gia tính điểm năng lực.
+"""
 
 import json
 import logging
@@ -105,6 +111,7 @@ class TurnEvaluator:
         Returns:
             Dict[str, Any]: Structured evaluation scores, feedback, and descriptive observations.
         """
+        # Prompt chấm chỉ chứa câu hỏi/câu trả lời và target; dữ liệu VAD được mô tả ở bước sau.
         targets = rubric_target or []
         user_prompt = (
             f"Generate evaluation for `assessment` in JSON format with schema:\n"
@@ -121,6 +128,7 @@ class TurnEvaluator:
         ]
 
         # Stream and accumulate response
+        # Client trả token theo stream; phải gom đủ response trước khi giải mã JSON.
         full_text = ""
         async for chunk in self.llm_client.stream_chat(messages=messages):
             if chunk.token:
@@ -151,6 +159,7 @@ class TurnEvaluator:
                     pass
 
         # Extract dimensions with robust defaults and score clamping (1-10)
+        # Nhánh legacy dùng giá trị mặc định khi thiếu trường, khác nhánh structured có retry.
         content_score = int(parsed.get("content_score", 5))
         content_score = max(1, min(10, content_score))
 

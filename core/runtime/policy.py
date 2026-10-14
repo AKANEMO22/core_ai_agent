@@ -1,4 +1,9 @@
-"""Tool policy: which tools an agent profile may see and execute."""
+"""Tool policy: which tools an agent profile may see and execute.
+
+Luồng sử dụng: RuntimeAgent dùng policy để lọc tool gửi cho model và kiểm tra lại khi model yêu cầu chạy.
+Đầu vào là AgentProfile và tên tool; PolicyDecision trả quyền cùng lý do từ chối.
+Không có profile thì cho phép mọi tool đã đăng ký; có profile thì dùng allowed_tools.
+"""
 
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
@@ -32,4 +37,5 @@ class ToolPolicy:
 
     def visible_tools(self, profile: Optional[AgentProfile], tools: Iterable[RuntimeTool]) -> List[RuntimeTool]:
         """Tools to advertise to the model for this profile."""
+        # Dùng cùng một phép kiểm tra cho quảng bá và thực thi để hai ranh giới không lệch nhau.
         return [t for t in tools if self.check(profile, t.name).allowed]

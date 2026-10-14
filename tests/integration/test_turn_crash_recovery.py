@@ -87,7 +87,9 @@ async def test_abandoned_execution_retries_same_turn_after_lease_expires(tmp_pat
     await _abandon(rig)
 
     held = await rig.controller.submit_answer(SESSION, MESSAGE, ANSWER, expected_turn=1)
+    assert held.status == "busy"
     assert held.error_code == "TURN_IN_PROGRESS"
+    assert held.retry_after_ms is not None and held.retry_after_ms > 0
     assert rig.provider.call_count == 0
 
     await _expire_execution(rig)

@@ -1,4 +1,8 @@
-"""Agent runtime execution loop, protocols, tools, and provider adapters."""
+"""Agent runtime execution loop, protocols, tools, and provider adapters.
+
+Luồng sử dụng: Điểm nhập chung của runtime: xuất agent loop, hợp đồng stream, tool và provider.
+Các nơi lắp ghép ứng dụng có thể nhập từ package này; logic xử lý nằm ở các module con.
+"""
 
 from core.runtime.agent import RuntimeAgent
 from core.runtime.client import ProviderCapabilities, RuntimeLLMClient

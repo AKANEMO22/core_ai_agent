@@ -29,6 +29,12 @@ Filter semantics (`RetrievalQuery.filters`), applied per key against chunk metad
 The bundled RAG corpus currently supplies Intern/Fresher/Junior evidence only. Its adapter maps
 those source levels to core `junior`; core `mid`, `senior`, and `staff` queries return no chunks.
 The adapter does not invent higher-level evidence.
+
+Hợp đồng dữ liệu duy nhất mà core cần từ nguồn tri thức. Bên gọi tạo
+RetrievalQuery với collection/filter/top_k; adapter trả danh sách RetrievedChunk
+kèm metadata và source, hoặc RetrievalError đã che bí mật. KnowledgeService
+và RetrieveTool dùng protocol này nên có thể đổi backend mà giữ luồng gọi.
+Điểm score phụ thuộc backend; không nên coi nó là xác suất hay confidence rubric.
 """
 
 from dataclasses import dataclass, field

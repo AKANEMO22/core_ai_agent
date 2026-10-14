@@ -1,4 +1,11 @@
-"""Idempotency management, payload conflict detection, per-session locks, and token bucket rate limiting."""
+"""Các cơ chế chống thực thi lặp, khóa phiên và giới hạn tốc độ cho request.
+
+Controller dùng hash payload để phát hiện message_id bị dùng lại với nội dung khác,
+MessageLedger để nối message với turn và RedisLease để chỉ một bên xử lý phiên.
+Store idempotency tổng quát dùng begin → thực thi → record; khi thất bại thì release.
+Ledger lưu dấu turn để replay/khôi phục, còn lease chỉ giữ quyền thực thi trong TTL;
+hai cơ chế có vai trò riêng. TokenBucket là giới hạn trong RAM của tiến trình.
+"""
 
 import asyncio
 import contextlib
@@ -327,6 +334,7 @@ class IdempotencyManager:
 
     async def arelease(self, key: str) -> None:
         """Release a claimed key after a failed execution so it can be retried."""
+        # Bỏ claim lỗi để request thử lại; cache kết quả hoàn tất là dữ liệu riêng.
         self._in_flight.pop(key, None)
 
 
@@ -460,6 +468,7 @@ class MessageLedger:
             IdempotencyConflictError: Existing entry has a different payload hash.
         """
         value = json.dumps({"turn_id": turn_id, "status": "in_progress", "payload_hash": payload_hash})
+        # HSETNX giữ ánh xạ message → turn đầu tiên; request sau chỉ kiểm tra và dùng lại.
         created = await self.redis.hsetnx(self._key(session_id), message_id, value)
         await self.redis.expire(self._key(session_id), self.ttl_seconds)
         if created:
@@ -513,6 +522,7 @@ class RedisLease:
             try:
                 await pipe.watch(key)
                 current = await pipe.get(key)
+                # Lease có thể hết TTL rồi được bên khác lấy; token cũ không được mở khóa mới.
                 if current is None or (
                     current.decode("utf-8") if isinstance(current, bytes) else current
                 ) != token:

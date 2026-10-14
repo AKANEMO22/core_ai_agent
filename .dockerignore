@@ -13,6 +13,7 @@ data/
 !data/
 data/*
 !data/interview_frameworks.json
+!data/it_seniority_rubrics.json
 test_data
 tests
 docs

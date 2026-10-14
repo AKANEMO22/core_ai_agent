@@ -1,4 +1,11 @@
-"""Deterministic in-memory retrieval adapter backed by a JSON fixture corpus."""
+"""Deterministic in-memory retrieval adapter backed by a JSON fixture corpus.
+
+Adapter cục bộ cho development/fixture, thực hiện cùng search(query) như
+backend RAG nhưng dùng corpus JSON trong bộ nhớ. Collection và metadata lọc
+trước; độ trùng token xếp hạng, chunk_id phá hòa để kết quả ổn định.
+latency_seconds/fail_with mô phỏng độ trễ và lỗi; đây không phải tìm kiếm
+embedding hay bằng chứng đã truy vấn một dịch vụ ngoài.
+"""
 
 import asyncio
 import json
@@ -134,5 +141,6 @@ class MockRetrievalClient:
                 )
             )
 
+        # Không loại score=0: mock trả top_k trong tập đã lọc, ngay cả khi không trùng token.
         scored.sort(key=lambda c: (-c.score, c.chunk_id))
         return scored[: max(0, query.top_k)]

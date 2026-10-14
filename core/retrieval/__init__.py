@@ -1,4 +1,10 @@
-"""Retrieval port, mock adapter, and interview knowledge composition."""
+"""Retrieval port, mock adapter, and interview knowledge composition.
+
+Cổng import chung cho retrieval: công bố query/chunk/protocol, mock adapter
+và dịch vụ ghép knowledge pack. Profiler dùng InterviewKnowledgeService;
+agent ở control plane có thể dùng RetrieveTool từ module tool. Backend thật
+được chọn qua factory, giúp logic phỏng vấn không phụ thuộc trực tiếp index RAG.
+"""
 
 from core.retrieval.knowledge import (
     STAGE_TYPES,

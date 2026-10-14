@@ -1,4 +1,9 @@
-"""Protocol definitions and capability declarations for LLM providers."""
+"""Protocol definitions and capability declarations for LLM providers.
+
+Luồng sử dụng: Hợp đồng giữa agent và backend LLM: stream_chat nhận messages/tools và trả IterationChunk.
+Provider tự khai báo khả năng để bước khởi động kiểm tra; ProfiledLLMClient áp model của
+vai trò làm mặc định cho các agent gọi provider trực tiếp, vẫn giữ tham số gọi tường minh.
+"""
 
 from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 from pydantic import BaseModel, Field
@@ -63,6 +68,7 @@ def verify_capabilities(client: Any, required: Tuple[str, ...] = REQUIRED_CAPABI
     capabilities = getattr(client, "capabilities", None)
     if capabilities is None:
         raise ProviderCapabilityError("provider does not declare capabilities")
+    # Kiểm tra khi lắp client để lỗi thiếu khả năng xuất hiện trước khi bắt đầu lượt interview.
     missing = [name for name in required if not getattr(capabilities, name, False)]
     if missing:
         raise ProviderCapabilityError(f"provider lacks required capabilities: {missing}")

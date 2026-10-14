@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,11 @@ class RAGRetrievalClient:
         self.frameworks = self.engine.payload["frameworks"]
         self.questions = self.engine.questions
         self.texts = self.engine.texts
+        level_framework_path = self.data_dir / "it_seniority_rubrics.json"
+        self.level_framework = (
+            json.loads(level_framework_path.read_text(encoding="utf-8"))
+            if level_framework_path.exists() else {"framework_version": "unavailable", "levels": {}}
+        )
         self._competencies: dict[str, tuple[str, dict[str, Any]]] = {}
         self._competencies_by_role: dict[str, list[dict[str, Any]]] = {}
         for role_id, framework in self.frameworks.items():
@@ -240,9 +246,13 @@ class RAGRetrievalClient:
         normalized = [str(value).strip().casefold() for value in values]
         if any(value not in CORE_LEVELS for value in normalized):
             return None
-        if "junior" not in normalized:
+        if len(set(normalized)) != 1:
             return None
-        return "junior"
+        return normalized[0]
+
+    @staticmethod
+    def _level_competency_id(level: str, competency_id: str) -> str:
+        return f"it:{level}:{competency_id}"
 
     @staticmethod
     def _matches_filters(metadata: dict[str, Any], filters: dict[str, Any]) -> bool:
@@ -272,6 +282,38 @@ class RAGRetrievalClient:
         for role_id in roles:
             framework = self.frameworks[role_id]
             family = self._role_family(role_id, framework)
+            if requested_level in {"mid", "senior"}:
+                level_record = (self.level_framework.get("levels") or {}).get(requested_level)
+                if not level_record:
+                    continue
+                competencies = [
+                    self._level_competency_id(requested_level, item["id"])
+                    for item in level_record.get("competencies", [])
+                ]
+                content = "\n".join(
+                    [
+                        str(framework.get("role_title", "")),
+                        str(level_record.get("expectations", "")),
+                        *[str(item) for item in framework.get("target_competencies", [])[:8]],
+                    ]
+                ).strip()
+                output.append(
+                    RetrievedChunk(
+                        chunk_id=f"role:{role_id}:{requested_level}",
+                        collection=RetrievalCollection.ROLE_PROFILE.value,
+                        content=content,
+                        score=self._score(query.text, content),
+                        metadata={
+                            "role_family": family,
+                            "level": requested_level,
+                            "competencies": competencies,
+                            "pass_threshold": float(level_record.get("pass_threshold", 3.0)),
+                            "rubric_version": str(self.level_framework.get("framework_version", "it-level-v1")),
+                        },
+                        source=f"it_seniority_rubrics.json#{requested_level}/expectations + {role_id}/target_competencies",
+                    )
+                )
+                continue
             competencies = self._competencies_by_role[role_id]
             profile_level = requested_level or "junior"
             metadata = {
@@ -306,6 +348,45 @@ class RAGRetrievalClient:
         self, query: RetrievalQuery, roles: list[str]
     ) -> list[RetrievedChunk]:
         output = []
+        raw_levels = self._as_values(query.filters.get("levels", query.filters.get("level")))
+        requested_level = next(
+            (str(value).strip().casefold() for value in raw_levels if str(value).strip().casefold() in {"mid", "senior"}),
+            None,
+        )
+        if requested_level:
+            level_record = (self.level_framework.get("levels") or {}).get(requested_level)
+            if not level_record:
+                return []
+            for role_id in roles:
+                framework = self.frameworks[role_id]
+                family = self._role_family(role_id, framework)
+                for competency in level_record.get("competencies", []):
+                    competency_id = self._level_competency_id(requested_level, competency["id"])
+                    metadata = {
+                        "competency": competency_id,
+                        "name": competency.get("name", competency_id),
+                        "role_family": family,
+                        "levels": [requested_level],
+                        "weight": float(competency.get("weight", 1.0)),
+                        "must_have": bool(competency.get("must_have", False)),
+                        "pass_level": 3,
+                        "anchors": dict(competency.get("anchors", {})),
+                        "framework_version": self.level_framework.get("framework_version"),
+                    }
+                    if not self._matches_filters(metadata, query.filters):
+                        continue
+                    content = str(competency.get("description", "")).strip()
+                    output.append(
+                        RetrievedChunk(
+                            chunk_id=competency_id,
+                            collection=RetrievalCollection.RUBRIC.value,
+                            content=content or metadata["name"],
+                            score=self._score(query.text, content + " " + metadata["name"]),
+                            metadata=metadata,
+                            source=f"it_seniority_rubrics.json#{requested_level}/competencies/{competency['id']}",
+                        )
+                    )
+            return self._rank_chunks(output, query)[: query.top_k]
         for role_id in roles:
             framework = self.frameworks[role_id]
             source_levels = self._source_levels(query, framework)
@@ -317,7 +398,9 @@ class RAGRetrievalClient:
                     "competency": pillar["competency_id"],
                     "name": pillar.get("pillar_en") or pillar["pillar"],
                     "role_family": family,
-                    "levels": ["junior"],
+                    # Intern/Fresher interviews use the shared junior rubric, while
+                    # source-level filters still need to match the original corpus level.
+                    "levels": list(dict.fromkeys(["junior", *source_levels])),
                     "source_levels": source_levels,
                     "weight": float(pillar.get("weight_percent", 1)),
                     "must_have": False,
@@ -344,6 +427,14 @@ class RAGRetrievalClient:
     def _search_questions(
         self, query: RetrievalQuery, roles: list[str]
     ) -> list[RetrievedChunk]:
+        requested_levels = {
+            str(value).strip().casefold()
+            for value in self._as_values(query.filters.get("levels", query.filters.get("level")))
+        }
+        if requested_levels.intersection({"mid", "senior"}):
+            # Do not relabel junior questions as mid/senior evidence. The core generates
+            # CV/JD-specific probes from the retrieved level rubric instead.
+            return []
         eligible: set[str] = set()
         metadata_by_id: dict[str, dict[str, Any]] = {}
         extra_query = query.text or ""

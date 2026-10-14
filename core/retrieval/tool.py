@@ -1,4 +1,11 @@
-"""`retrieve` runtime tool exposing the retrieval port to control-plane agents."""
+"""`retrieve` runtime tool exposing the retrieval port to control-plane agents.
+
+Đưa retrieval port thành tool tên retrieve trong vòng chạy agent. search nhận
+collection/query/competency/top_k, ghép filter cố định của session rồi gọi
+adapter dưới deadline; trả status cùng content, nguồn và metadata được cho phép.
+Expected_points bị ẩn mặc định để câu trả lời mẫu không lọt vào prompt speaker;
+chỉ bên có quyền evaluator mới nên bật include_expected_points.
+"""
 
 import asyncio
 from typing import Any, Dict, Iterable, Optional
@@ -82,6 +89,7 @@ class RetrieveTool(RuntimeTool):
         """Execute one bounded retrieval and return content plus a safe metadata subset."""
         if collection not in self.allowed_collections:
             return {"status": "denied", "error": f"collection '{collection}' is not allowed"}
+        # Role/level lấy từ session, competency từ lần gọi tool; không nhận tùy ý mọi metadata filter.
         filters = dict(self.fixed_filters)
         if competency:
             filters["competency"] = competency
@@ -102,6 +110,7 @@ class RetrieveTool(RuntimeTool):
         except RetrievalError as e:
             return {"status": "error", "error": str(e)}
 
+        # Lọc đầu ra sau retrieval: backend có thể trả nhiều metadata hơn agent được phép nhìn.
         visible = set(VISIBLE_METADATA)
         if self.include_expected_points:
             visible.add("expected_points")

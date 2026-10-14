@@ -1,4 +1,10 @@
-"""Retrieval backend selection from application settings."""
+"""Retrieval backend selection from application settings.
+
+Nối cấu hình ứng dụng với retrieval port khi runtime được khởi tạo.
+build_retrieval_client chọn adapter rag hoặc mock; build_knowledge_service
+bọc adapter với timeout và số kết quả theo settings. Client có thể được inject
+để tái sử dụng; backend không được nhận diện gây lỗi rõ ràng thay vì đổi sang mock.
+"""
 
 from typing import Optional
 
@@ -19,6 +25,7 @@ def build_retrieval_client(settings: Settings) -> RetrievalClient:
     """
     backend = settings.RETRIEVAL_BACKEND.strip().lower()
     if backend == "rag":
+        # Import nhánh RAG khi được chọn để mock không phải khởi tạo phụ thuộc index/embedding.
         from rag.adapter import RAGRetrievalClient
 
         return RAGRetrievalClient(

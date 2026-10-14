@@ -36,6 +36,8 @@ ANSWERS = [
     "Hello! I am a senior engineer with six years in distributed services.",
     "We use Redis Streams for at-least-once messaging and distributed locks for idempotency.",
     "For high throughput we partition streams, use read replicas and enforce TTL cache tiers.",
+    "I reduce production risk with staged releases, latency alerts, rollback criteria and a post-incident review.",
+    "I owned the service migration, compared consistency and availability trade-offs, and validated it with load tests.",
     "How does the team approach observability and distributed tracing?",
 ]
 
@@ -86,6 +88,7 @@ def _create_session(client: TestClient, headers: Dict[str, str]) -> Dict[str, An
             "experience_years": 6,
             "target_company": "Acme Systems",
             "target_role": "Senior Backend Engineer",
+            "duration_minutes": 10,
             "skills": ["Python", "Redis", "Distributed Systems"],
             "cv_text": f"Experience:\n{CV_SECRET_LINE}\nSkills: Python, Redis",
         },
@@ -186,7 +189,12 @@ def test_full_lifecycle_through_real_app(tmp_path: Path, caplog: pytest.LogCaptu
         ws_dir = app.state.workspace_mgr.get_or_create_workspace(session_id)
         for index in range(1, len(ANSWERS) + 1):
             evaluation = ws_dir.read_json(f"evaluations/turn_{index:03d}_eval.json")
-            assert evaluation["rubric_target"], "assessment must target retrieved criteria"
+            if evaluation["stage_id"] in {"opening", "candidate_questions"}:
+                assert evaluation["rubric_target"] == [], "intro and candidate Q&A must not be scored"
+            else:
+                assert evaluation["rubric_target"], (
+                    f"assessable stage {evaluation['stage_id']} must target retrieved criteria"
+                )
         assert ws_dir.exists("turns/turn_0_interviewer.json")
 
     # Log hygiene: candidate answers, CV text and provider keys never reach logs

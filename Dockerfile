@@ -14,15 +14,19 @@ COPY pyproject.toml uv.lock README.md ./
 COPY api ./api
 COPY config ./config
 COPY core ./core
+COPY fe_inspect ./fe_inspect
+COPY FE-inspect ./FE-inspect
+COPY FE-test ./FE-test
 COPY rag ./rag
 COPY skills ./skills
 COPY data/interview_frameworks.json ./data/interview_frameworks.json
+COPY data/it_seniority_rubrics.json ./data/it_seniority_rubrics.json
 
 # fakeredis is in the dev dependency group but api.main imports it at module load,
 # so this development image currently installs the locked dev group as well.
 RUN uv sync --locked \
     && useradd --system --uid 10001 --create-home app \
-    && mkdir -p /data/workspaces /data/rag \
+    && mkdir -p /data/workspaces /data/rag /data/archive \
     && chown -R app:app /data
 
 ENV PATH="/opt/venv/bin:${PATH}"

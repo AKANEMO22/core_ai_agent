@@ -71,6 +71,26 @@ class Settings(BaseSettings):
         default=True,
         description="Enforce os.fsync on atomic file writes",
     )
+    ARTIFACT_ARCHIVE_ENABLED: bool = Field(
+        default=False,
+        description="Archive report-ready session workspaces in S3-compatible object storage",
+    )
+    ARTIFACT_ARCHIVE_BUCKET: str = Field(default="user-artifacts", min_length=3, max_length=63)
+    ARTIFACT_ARCHIVE_CATALOG_PATH: Path = Field(
+        default=Path("./data/archive/catalog.sqlite3"),
+        description="Durable SQLite catalog and deletion tombstones for archived workspaces",
+    )
+    ARTIFACT_ARCHIVE_MAX_RESTORE_BYTES: int = Field(
+        default=512 * 1024 * 1024,
+        ge=1024 * 1024,
+        description="Maximum expanded workspace bytes accepted during archive restore",
+    )
+    OBJECT_STORE_ENDPOINT: str = Field(default="")
+    OBJECT_STORE_ACCESS_KEY: str = Field(default="")
+    OBJECT_STORE_SECRET_KEY: str = Field(default="")
+    OBJECT_STORE_REGION: str = Field(default="us-east-1")
+    OBJECT_STORE_VERIFY_TLS: bool = Field(default=True)
+    OBJECT_STORE_TIMEOUT_SECONDS: int = Field(default=30, ge=1, le=300)
 
     # Message Queue & State
     REDIS_URL: str = Field(
@@ -157,6 +177,22 @@ class Settings(BaseSettings):
         default="development",
         description="'development' or 'production'; production enables fail-fast config validation",
     )
+    INSPECTOR_ENABLED: bool = Field(
+        default=False,
+        description="Mount the local FE-inspect UI and run/artifact inspection API",
+    )
+    INSPECTOR_LOCAL_AUTH: bool = Field(
+        default=False,
+        description="Allow FE-inspect to issue short-lived service tokens for a loopback development stack",
+    )
+    TEST_UI_ENABLED: bool = Field(
+        default=False,
+        description="Mount FE-test for real core interviews; no synthetic candidate runs",
+    )
+    STUDIO_REQUIRE_REAL_PROVIDER: bool = Field(
+        default=True,
+        description="Studio refuses scripted/mock LLM and mock retrieval when executing sessions",
+    )
     PRODUCT_MODE: str = Field(
         default="practice",
         description="'practice' (readiness coaching) or 'hiring_assist' (requires human review)",
@@ -210,7 +246,7 @@ class Settings(BaseSettings):
 
     # Profiling & turns
     PROFILING_DEADLINE_SECONDS: float = Field(
-        default=90.0,
+        default=180.0,
         description="Deadline for pre-flight profiling before the session fails",
     )
     TURN_DEADLINE_SECONDS: float = Field(
@@ -302,6 +338,10 @@ class Settings(BaseSettings):
         default=5,
         description="Company knowledge passages retrieved per session",
     )
+    BRAVE_SEARCH_API_KEY: str = Field(
+        default="",
+        description="Optional server-side Brave Search API key; company research is explicitly unavailable when empty",
+    )
 
 
 DEFAULT_JWT_SECRET = "supersecretjwtkeyforinterviewsdefaultchangeinproduction"
@@ -332,6 +372,10 @@ def validate_settings(settings: Settings) -> List[str]:
         errors.append("PRODUCT_MODE must be 'practice' or 'hiring_assist'")
     if not settings.REDIS_URL:
         errors.append("REDIS_URL is required")
+    if settings.ARTIFACT_ARCHIVE_ENABLED:
+        errors.append(
+            "ARTIFACT_ARCHIVE_ENABLED is not available in production until durable user identity and owner authorization are configured"
+        )
     return errors
 
 

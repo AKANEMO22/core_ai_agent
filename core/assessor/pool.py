@@ -1,4 +1,10 @@
-"""Lifecycle-managed pool of assessor consumers with recovery, retry promotion and heartbeats."""
+"""Lifecycle-managed pool of assessor consumers with recovery, retry promotion and heartbeats.
+
+Quản lý vòng đời các consumer đánh giá trong tiến trình ứng dụng.
+Pool đọc job từ RedisAssessmentQueue và giao AssessorWorker xử lý; vòng bảo trì
+đưa retry tới hạn về stream, thu hồi job từ consumer im lặng và gọi sweep báo cáo.
+start/stop gắn với vòng đời ứng dụng; heartbeat/status phục vụ kiểm tra readiness.
+"""
 
 import asyncio
 import logging
@@ -75,6 +81,7 @@ class AssessorWorkerPool:
         self._stopping.set()
         if not self._tasks:
             return
+        # Cho job đang chạy thời gian kết thúc; sau grace period mới hủy các task còn lại.
         _, pending = await asyncio.wait(self._tasks, timeout=grace_seconds)
         for task in pending:
             task.cancel()
@@ -108,6 +115,7 @@ class AssessorWorkerPool:
                 for message_id, job_data in jobs:
                     self._in_flight += 1
                     try:
+                        # Worker chịu trách nhiệm ACK/retry và artifact; pool chỉ quản lý vòng đọc cùng bộ đếm.
                         await self.worker._process_job_data(self.group_name, message_id, job_data)
                         self._processed += 1
                     finally:
@@ -121,6 +129,7 @@ class AssessorWorkerPool:
     async def _maintain(self) -> None:
         while not self._stopping.is_set():
             try:
+                # Ba bước phục hồi: retry tới hạn, pending của consumer chết, rồi pipeline báo cáo.
                 await self.queue.promote_due_retries()
                 await self.worker.recover_and_process_idle_jobs(
                     group_name=self.group_name,

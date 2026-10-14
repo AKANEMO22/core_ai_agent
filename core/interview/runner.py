@@ -1,11 +1,21 @@
-"""Interactive interviewer runner: turn execution, streaming generation, persistence and assessment."""
+"""Thực thi một lượt đối thoại của phiên và phát LoopEvent cho controller.
+
+Controller gọi run_opening cho turn 0, run_turn cho câu trả lời ứng viên.
+Runner đọc blueprint/artifact, chọn directive và context, gọi runtime streaming,
+lưu artifact, gửi job chấm rồi cập nhật stage/state trước TURN_COMPLETE.
+Đầu vào gồm session_id, transcript, token hủy và thông tin rubric; đầu ra là luồng
+sự kiện cùng các artifact lưu trong workspace. Generation lỗi không tăng lượt;
+output một phần do bị ngắt vẫn được lưu như một lượt interrupted.
+"""
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
+from core.language import workspace_interview_language
 from core.interview.context import ContextAssembler
 from core.interview.director import StageDirector, StageSessionConflictError
 from core.interview.queue import AssessmentJob, AssessmentQueue
@@ -25,11 +35,115 @@ from core.workspace.session import SessionWorkspace
 logger = logging.getLogger(__name__)
 
 OPENING_INSTRUCTION = (
-    "Begin the interview now. Greet the candidate in one short sentence, explain the format "
-    "of this stage in one sentence, then ask the first question. Ask exactly one question."
+    "Begin the interview now. Use the candidate's submitted name when it is available. "
+    "Briefly explain the selected interview round and planned duration, then invite a short "
+    "introduction relevant to the target role. Ask exactly one question. Do not ask age or "
+    "unrelated personal details."
 )
 
 TURN_FAILED_CODE = "TURN_FAILED"
+
+_OPENING_ROUND_LABELS = {
+    "vi": {
+        "hr": "nhân sự",
+        "technical": "kỹ thuật",
+        "hiring_manager": "quản lý tuyển dụng",
+        "combined": "tổng hợp",
+    },
+    "en": {
+        "hr": "HR",
+        "technical": "technical",
+        "hiring_manager": "hiring manager",
+        "combined": "combined",
+    },
+}
+
+
+def _opening_round_label(interview_round: str, language: str) -> str:
+    lang = "vi" if str(language).lower().startswith("vi") else "en"
+    round_key = str(interview_round or "combined").strip().lower()
+    return _OPENING_ROUND_LABELS[lang].get(round_key, round_key.replace("_", " "))
+
+
+def build_opening_fallback(
+    *,
+    candidate_name: str,
+    target_role: str,
+    interview_round: str,
+    duration_minutes: int,
+    language: str = "vi",
+) -> str:
+    """Build a deterministic first turn when generation omits required interview context."""
+    lang = "vi" if str(language).lower().startswith("vi") else "en"
+
+    def clean(value: Any, default: str, limit: int = 160) -> str:
+        return " ".join(str(value or default).split())[:limit]
+
+    name = clean(candidate_name, "bạn" if lang == "vi" else "candidate", 120)
+    role = clean(target_role, "vị trí đang ứng tuyển" if lang == "vi" else "target role", 120)
+    round_label = _opening_round_label(interview_round, lang)
+    try:
+        minutes = max(1, int(duration_minutes))
+    except (TypeError, ValueError):
+        minutes = 40
+    if lang == "vi":
+        return (
+            f"Chào {name}. Hôm nay chúng ta sẽ luyện vòng {round_label} cho vị trí {role}, "
+            f"dự kiến khoảng {minutes} phút. Trước tiên, bạn hãy giới thiệu ngắn gọn về bản thân "
+            "và kinh nghiệm liên quan đến vị trí này nhé."
+        )
+    return (
+        f"Hello {name}. Today we'll practice the {round_label} interview for the {role} role, "
+        f"planned for about {minutes} minutes. To begin, please briefly introduce yourself "
+        "and the experience relevant to this role."
+    )
+
+
+def opening_meets_protocol(
+    text: str,
+    *,
+    candidate_name: str,
+    target_role: str,
+    interview_round: str,
+    duration_minutes: int,
+    language: str = "vi",
+) -> bool:
+    """Check that a generated opening includes the reviewed plan and avoids age questions."""
+    lang = "vi" if str(language).lower().startswith("vi") else "en"
+    normalized = " ".join(str(text or "").casefold().split())
+    required = (
+        str(candidate_name or "").strip().casefold(),
+        str(target_role or "").strip().casefold(),
+        _opening_round_label(interview_round, lang).casefold(),
+    )
+    if not all(value and value in normalized for value in required):
+        return False
+    try:
+        minutes = max(1, int(duration_minutes))
+    except (TypeError, ValueError):
+        minutes = 40
+    duration_present = (
+        f"{minutes} phút" in normalized
+        if lang == "vi"
+        else re.search(rf"\b{minutes}\s*(?:minutes?|mins?)\b", normalized) is not None
+    )
+    if not duration_present:
+        return False
+    introductions = (
+        ("giới thiệu", "tự giới thiệu")
+        if lang == "vi"
+        else ("introduce yourself", "tell me about yourself", "introduce your")
+    )
+    if not any(phrase in normalized for phrase in introductions):
+        return False
+    asks_age = (
+        any(phrase in normalized for phrase in ("bao nhiêu tuổi", "mấy tuổi", "tuổi của bạn", "năm sinh"))
+        if lang == "vi"
+        else re.search(r"\bhow old are you\b|\bwhat(?:'s| is) your age\b", normalized) is not None
+    )
+    if asks_age:
+        return False
+    return True
 
 DialogueCompletedCallback = Callable[[str], Awaitable[None]]
 TurnCompletedCallback = Callable[[str, int, SessionState], Awaitable[None]]
@@ -152,7 +266,10 @@ class InteractiveSubagentRunner:
         """Assemble the interviewer system prompt for the active stage."""
         self._load_blueprints()
         return self.context_assembler.assemble_prompt(
-            spec=self._cached_spec or {},
+            spec={
+                **(self._cached_spec or {}),
+                "interview_language": workspace_interview_language(self.workspace),
+            },
             stage=self.stage_director.get_current_stage(state) or {},
             profile=self._cached_profile,
             company_intel=self._cached_intel,
@@ -179,6 +296,7 @@ class InteractiveSubagentRunner:
         self, state: SessionState, turn_number: int, final_user_content: str
     ) -> tuple:
         """Return (messages, provenance) for a turn using the speaker builder when configured."""
+        # Nhánh tương thích cũ trả prompt chuỗi; nhánh speaker trả messages và provenance của directive.
         if self.context_builder is None:
             return (
                 [
@@ -285,6 +403,7 @@ class InteractiveSubagentRunner:
             if watchdog is not None:
                 watchdog.cancel()
 
+        # Gom token đã phát thành artifact; interruption có output vẫn là lượt có nội dung để lưu.
         outcome["text"] = "".join(tokens)
         outcome["tool_calls"] = tool_calls
         if outcome["status"] == "ok" and not outcome["text"].strip():
@@ -329,10 +448,13 @@ class InteractiveSubagentRunner:
 
         messages, provenance = self.build_messages(state, 0, OPENING_INSTRUCTION)
         outcome: Dict[str, Any] = {}
+        generated_events: List[LoopEvent] = []
         async for event in self._generate(session_id, turn_id, messages, cancellation_token, outcome, **kwargs):
-            yield event
+            generated_events.append(event)
 
         if outcome["status"] == "failed":
+            for event in generated_events:
+                yield event
             yield self._event(
                 session_id,
                 turn_id,
@@ -340,6 +462,48 @@ class InteractiveSubagentRunner:
                 {"code": TURN_FAILED_CODE, "retryable": True, "cause": outcome.get("error_code")},
             )
             return
+
+        def artifact_payload(path: str) -> Dict[str, Any]:
+            value = self._read_json_safe(path, default={})
+            if isinstance(value, dict) and isinstance(value.get("payload"), dict):
+                return value["payload"]
+            return value if isinstance(value, dict) else {}
+
+        profile = artifact_payload("context/candidate_profile.json")
+        brief = artifact_payload("context/interview_brief.json")
+        form = artifact_payload("inputs/form_input.json")
+        stage_plan = artifact_payload("context/stage_plan.json")
+        round_data = brief.get("interview_round") or {}
+        duration_data = brief.get("duration") or {}
+        target_data = brief.get("target") or {}
+        candidate_name = str(profile.get("candidate_name") or form.get("candidate_name") or "")
+        target_role = str(form.get("target_role") or target_data.get("role") or "")
+        interview_round = str(round_data.get("value") or stage_plan.get("interview_round") or "combined")
+        duration_minutes = duration_data.get("planned_minutes") or stage_plan.get("planned_minutes") or 40
+        language = workspace_interview_language(self.workspace)
+        if not opening_meets_protocol(
+            outcome["text"],
+            candidate_name=candidate_name,
+            target_role=target_role,
+            interview_round=interview_round,
+            duration_minutes=duration_minutes,
+            language=language,
+        ):
+            outcome["text"] = build_opening_fallback(
+                candidate_name=candidate_name,
+                target_role=target_role,
+                interview_round=interview_round,
+                duration_minutes=duration_minutes,
+                language=language,
+            )
+            outcome["status"] = "ok"
+            generated_events = [
+                self._event(session_id, turn_id, LoopEventType.RESPONSE_TOKEN, {"token": outcome["text"]})
+            ]
+            logger.info("Generated opening omitted required plan details; deterministic opening used")
+
+        for event in generated_events:
+            yield event
 
         await asyncio.to_thread(
             self.workspace.write_artifact,
@@ -496,6 +660,7 @@ class InteractiveSubagentRunner:
             },
         )
 
+        # Chấm câu trả lời này phải dùng câu hỏi ở lượt trước, không phải câu hỏi vừa sinh ra.
         # Enqueue assessment before advancing the turn so a crash in between is retried
         # idempotently (same message_id -> same job_id and input).
         if self.assessment_queue is not None:

@@ -72,9 +72,14 @@ async def test_profiler_grounds_stage_plan_with_retrieved_knowledge(tmp_path):
     rubric_ids = {c["competency_id"] for c in rubric["competencies"]}
 
     plan = ws.read_json("context/stage_plan.json")
-    assert [s["stage_id"] for s in plan["stages"]] == ["warmup", "technical", "design", "close"]
+    assert plan["stages"][0]["stage_id"] == "opening"
+    assert plan["stages"][-1]["stage_id"] == "candidate_questions"
+    assert {s["stage_type"] for s in plan["stages"]} >= {
+        "warmup", "technical", "system_design", "behavioral", "wrapup"
+    }
     assert {cid for s in plan["stages"] for cid in s["criteria"]} == rubric_ids
-    assert all(s["question_candidates"] for s in plan["stages"])
+    assert all(s["question_candidates"] for s in plan["stages"][1:-1])
+    assert plan["stages"][-1]["question_candidates"]
 
     # Retrieval queries never carry candidate identity
     assert retrieval.queries
@@ -105,7 +110,7 @@ async def test_profiler_degrades_when_retrieval_fails(tmp_path):
     assert not ws.exists("context/rubric.json")
 
     plan = ws.read_json("context/stage_plan.json")
-    assert all("criteria" not in s for s in plan["stages"])
+    assert all(not s["criteria"] for s in plan["stages"])
 
 
 @pytest.mark.asyncio
@@ -170,7 +175,9 @@ async def test_profiler_generates_required_artifacts(tmp_path):
     assert spec["artifact_type"] == "interview_spec"
 
     plan = ws.read_json("context/stage_plan.json")
-    assert len(plan["stages"]) == 1
+    assert plan["stages"][0]["stage_id"] == "opening"
+    assert plan["stages"][-1]["stage_id"] == "candidate_questions"
+    assert len(plan["stages"]) >= 4
     assert plan["artifact_type"] == "stage_plan"
 
 
@@ -315,25 +322,37 @@ async def test_safe_web_search_enforces_timeout_and_max_bytes():
     assert tool.timeout == 3.0
     assert tool.max_bytes == 50
 
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.content = b"A" * 200  # 200 bytes, exceeding max_bytes=50
+    class FakeStreamResponse:
+        status_code = 200
+        headers = {"content-type": "text/plain"}
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.get.return_value = mock_resp
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"A" * 200  # One chunk exceeds max_bytes=50.
+
+    mock_resp = FakeStreamResponse()
+    mock_stream = MagicMock()
+    mock_stream.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_stream.__aexit__ = AsyncMock(return_value=None)
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.stream.return_value = mock_stream
 
     with patch("httpx.AsyncClient", return_value=mock_client):
         with patch("core.profiler.tools.validate_outbound_url", return_value=True):
             res = await tool.execute({"query": "recon", "target_url": "https://example.com/api"})
             assert res["status"] == "success"
             assert res["truncated"] is True
-            assert res["total_bytes"] == 200
+            assert res["total_bytes_read"] == 50
             assert len(res["content"]) <= 50
 
 
 @pytest.mark.asyncio
-async def test_gather_recon_coordinates_tools(tmp_path):
-    """Verify ProfilerAgent._gather_recon coordinates both MarketIntelTool and SafeWebSearchTool."""
+async def test_gather_recon_reports_unavailable_when_search_is_not_configured(tmp_path):
+    """An unconfigured web-search provider is visible instead of being treated as source evidence."""
     ws = SessionWorkspace(session_id="sess_p6", root_path=tmp_path / "sess_p6")
     ws.initialize()
 
@@ -342,7 +361,6 @@ async def test_gather_recon_coordinates_tools(tmp_path):
 
     recon = await profiler._gather_recon("Google", "Senior SRE", workspace=ws)
     assert recon is not None
-    assert "market_intel" in recon
-    assert recon["market_intel"]["company"] == "Google"
     assert "web_recon" in recon
-    assert len(recon["web_recon"]) > 0
+    assert recon["web_recon"] == []
+    assert recon["web_recon_status"] == "unavailable"

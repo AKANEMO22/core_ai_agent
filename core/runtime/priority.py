@@ -4,6 +4,12 @@ Every answer triggers the speaker and, at the same moment, background work (eval
 orchestration). On a shared provider those calls compete with the speaker exactly when time to
 first token matters. Background calls therefore wait (bounded) until no speaker generation is in
 flight before starting; calls already streaming are not interrupted.
+
+
+Luồng sử dụng: Các wrapper provider giúp ưu tiên câu nói trực tiếp của interviewer khi có nhiều agent chạy.
+API tạo HotPathGate chung; speaker đánh dấu đang sinh câu, BackgroundLLMClient chờ gate
+trong thời gian hữu hạn trước khi gọi model. HedgedLLMClient có thể mở request thứ hai
+nếu chunk đầu chậm, chọn stream thắng và đóng stream còn lại; đầu ra vẫn là IterationChunk.
 """
 
 import asyncio
@@ -64,6 +70,7 @@ class BackgroundLLMClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> AsyncIterator[IterationChunk]:
+        # Hết thời gian chờ vẫn gọi model để tác vụ nền không bị bỏ đói khi speaker chạy liên tục.
         await self.gate.wait_idle(self.max_wait_seconds)
         async for chunk in self.inner.stream_chat(messages=messages, tools=tools, **kwargs):
             yield chunk
@@ -113,6 +120,7 @@ class HedgedLLMClient:
             stream = self.inner.stream_chat(messages=messages, tools=tools, **kwargs)
             return stream, asyncio.ensure_future(stream.__anext__())
 
+        # Chỉ tranh chunk đầu; chọn xong sẽ tiếp tục đúng stream đó thay vì ghép nội dung hai request.
         racers = [start()]
         winner: Optional[tuple] = None
         try:

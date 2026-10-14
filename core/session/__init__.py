@@ -1,4 +1,9 @@
-"""Session management package for state FSM lifecycle, CAS transitions, event store, and idempotency."""
+"""Cổng import cho các thành phần quản lý phiên: trạng thái, nhật ký sự kiện và chống xử lý lặp.
+
+API/controller và các tác vụ nền dùng những lớp này để đọc trạng thái, cập nhật qua CAS,
+lưu sự kiện rồi phát lại khi client kết nối lại. File này chỉ gom API công khai;
+không khởi tạo Redis hay tự chạy vòng đời phiên khi import.
+"""
 
 from core.session.events import (
     EventNotFoundError,

@@ -1,4 +1,10 @@
-"""OpenAI provider adapter: streaming, tool-call assembly, deadlines, retries and cancellation."""
+"""OpenAI provider adapter: streaming, tool-call assembly, deadlines, retries and cancellation.
+
+Luồng sử dụng: Adapter backend qua AsyncOpenAI/Chat Completions, được API chọn và truyền cho các agent.
+Nhận chat messages và khai báo tool, chuyển SSE thành IterationChunk dùng chung trong runtime.
+Delta tool được ghép theo index trước khi giao tool_calls hoàn chỉnh; adapter xử lý timeout,
+retry mở request và tham số gateway từ chối, đồng thời đóng stream khi consumer dừng.
+"""
 
 import asyncio
 import json
@@ -141,6 +147,7 @@ class OpenAIRuntimeLLMClient:
     async def _open_stream(self, create_kwargs: Dict[str, Any]) -> Any:
         attempt = 0
         model_name = str(create_kwargs.get("model"))
+        # Cache theo model vì các model dùng chung gateway có thể chấp nhận tham số khác nhau.
         for param in self._unsupported_params.get(model_name, ()):
             create_kwargs.pop(param, None)
         while True:
@@ -184,6 +191,7 @@ class OpenAIRuntimeLLMClient:
                     yield chunk
             finally:
                 await inner.aclose()  # closes the HTTP stream when the consumer stops early
+            # Chỉ retry phản hồi rỗng; đã phát token/tool thì kết thúc để không nhân đôi nội dung.
             if produced:
                 return
             if attempt < self.max_retries:
@@ -245,6 +253,7 @@ class OpenAIRuntimeLLMClient:
                     if reasoning:
                         yield IterationChunk(reasoning_summary=reasoning)
 
+                    # Một tên/arguments có thể bị cắt thành nhiều delta; chưa parse JSON cho tới finish_reason.
                     for tc in getattr(delta, "tool_calls", None) or []:
                         idx = getattr(tc, "index", 0)
                         entry = tool_calls_accumulator.setdefault(

@@ -1,4 +1,10 @@
-"""Redis Streams assessment queue producer, consumer group manager, and dead-letter queue."""
+"""Redis Streams assessment queue producer, consumer group manager, and dead-letter queue.
+
+Biên giới Redis của luồng đánh giá: enqueue, đọc consumer group, ACK và retry.
+Producer đưa AssessmentJob vào stream; worker/pool đọc lại payload để chấm, còn
+các set theo session lưu job_id đã gửi/hoàn tất/lỗi cho barrier tổng hợp báo cáo.
+Retry chờ trong sorted set; job hết lượt thử nằm ở dead-letter stream để xử lý lại.
+"""
 
 import asyncio
 import hashlib
@@ -94,6 +100,7 @@ class RedisAssessmentQueue:
             token = await lease.acquire(key, self.mutation_lock_ttl_ms)
             if token is None:
                 await asyncio.sleep(0.01)
+        # Lease dùng chung với xóa phiên; gia hạn để các thao tác I/O chưa xong không mất khóa.
         renewal = asyncio.create_task(self._renew_mutation_lease(key, token))
         try:
             yield
@@ -171,6 +178,7 @@ class RedisAssessmentQueue:
         if "schema_version" not in job_dict:
             job_dict["schema_version"] = "1.0"
 
+        # job_id nhận diện lượt/rubric, còn input_sha256 phân biệt nội dung câu trả lời thay đổi.
         session_id = job_dict.setdefault("session_id", "default_sess")
         turn_id = job_dict.get("turn_id", "turn_001")
         rubric_version = job_dict.get("rubric_version", "rubric_v1")
@@ -239,6 +247,7 @@ class RedisAssessmentQueue:
         Returns:
             List[Tuple[str, Dict[str, Any]]]: List of (message_id, parsed_job_dict).
         """
+        # Dấu > lấy message mới của group; pending từ consumer chết được lấy bằng claim_idle_jobs.
         streams_arg = {self.stream_key: ">"}
         block_val = block_ms if block_ms > 0 else None
         response = await self.redis_client.xreadgroup(
@@ -353,6 +362,7 @@ class RedisAssessmentQueue:
 
     async def promote_due_retries(self, limit: int = 100) -> int:
         """Move retry jobs whose backoff elapsed back onto the stream. Safe to run concurrently."""
+        # Sorted set dùng thời điểm được phép thử lại làm score; pool gọi hàm này định kỳ.
         due = await self.redis_client.zrangebyscore(
             self.delayed_key, "-inf", time.time(), start=0, num=limit
         )
@@ -442,6 +452,7 @@ class RedisAssessmentQueue:
             List[str]: job_ids that were requeued.
         """
         requeued: List[str] = []
+        # Khôi phục budget trước khi enqueue lại; bỏ dấu lỗi để barrier có thể tiếp tục chờ kết quả.
         entries = await self.redis_client.xrange(self.dead_letter_stream_key, "-", "+")
         for entry_id, fields in entries:
             if fields.get("session_id") != session_id:

@@ -1,4 +1,10 @@
-"""Structured (JSON-schema validated) model output with bounded repair."""
+"""Structured (JSON-schema validated) model output with bounded repair.
+
+Luồng sử dụng: Các agent evaluator, guard, claims, followup và orchestration gọi run_structured để lấy dict JSON.
+Messages được bổ sung hợp đồng schema, stream được gom thành chuỗi rồi parse/validate.
+Sai JSON/schema được phản hồi để model sửa trong ngân sách; quá hạn hoặc hết lượt sửa
+thì ném StructuredOutputError. JSON mode của provider chỉ hỗ trợ cú pháp, schema vẫn kiểm tra ở đây.
+"""
 
 import asyncio
 import json
@@ -119,6 +125,7 @@ async def run_structured(
         working = _with_contract(messages)
         last_violations: List[str] = []
         for attempt in range(max_repairs + 1):
+            # Semaphore giới hạn cuộc gọi LLM thực tế, được nhả trước bước parse và validation.
             if semaphore is not None:
                 async with semaphore:
                     text = await _complete(llm, working, **kwargs)
@@ -131,6 +138,7 @@ async def run_structured(
                 data, last_violations = None, ["output is not a JSON object"]
             if not last_violations and data is not None:
                 return data
+            # Phản hồi lỗi schema và phần output trước vào lịch sử để lần sửa có ngữ cảnh cụ thể.
             if attempt < max_repairs:
                 working = working + [
                     {"role": "assistant", "content": text[:4000]},

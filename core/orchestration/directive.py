@@ -1,4 +1,11 @@
-"""Directives: the orchestrator's instruction to the speaker for the next turn."""
+"""Directives: the orchestrator's instruction to the speaker for the next turn.
+
+Hợp đồng giữa orchestrator và speaker: Directive mô tả câu hỏi, criterion,
+chuyển stage hoặc kết thúc cho một lượt cụ thể. DirectiveStore ghi/đọc artifact
+orchestration/directive_{turn}.json; speaker_instruction chỉ đưa hướng dẫn cần
+nói vào prompt, còn reason phục vụ audit. Các hàm fallback chọn câu chưa hỏi
+theo stage plan và ngân sách khi quyết định LLM vắng mặt hoặc không hợp lệ.
+"""
 
 import time
 from dataclasses import asdict, dataclass, field
@@ -42,6 +49,7 @@ class Directive:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Directive":
+        # Bỏ trường lạ khi đọc artifact; kiểm tra quyết định nghiệp vụ nằm ở cổng orchestrator.
         known = {f for f in cls.__dataclass_fields__}
         values = {k: v for k, v in data.items() if k in known}
         values.setdefault("question_text", "")
@@ -57,8 +65,8 @@ class Directive:
             lines.append("- Briefly close the current topic, then move to the next stage.")
             lines.append(f"- Ask: {self.question_text}")
         elif self.mode == "wrap_up":
-            lines.append("- This is the final turn. Briefly acknowledge the answer, thank the candidate,")
-            lines.append("  and say feedback will follow. Do not ask another question.")
+            lines.append("- This is the final turn. Briefly acknowledge the answer, thank the candidate, and close.")
+            lines.append("  Do not promise a decision, timeline, or next step unless verified context provides it. Do not ask another question.")
             lines.append(f"- Closing line to adapt: {self.question_text}")
             return "\n".join(lines)
         elif self.mode == "redirect":
@@ -156,6 +164,7 @@ def plan_fallback(
     stage's first unasked question, or `wrap_up` on the final stage. Otherwise the next unasked
     key question of the current stage.
     """
+    # Fallback phải biết lượt kế tiếp có hết ngân sách không trước khi chọn câu trong stage hiện tại.
     _, stage, next_stage = stage_position(stages, current_stage_id)
     if is_final_turn_of_stage(stage, stage_turns_used):
         if next_stage is not None:
@@ -164,7 +173,7 @@ def plan_fallback(
             return opening
         return Directive(
             mode="wrap_up",
-            question_text="Thank you for your time today. That concludes the interview; you will receive feedback soon.",
+            question_text="Thank you for your time today. That concludes the interview.",
             reason=reason,
             generated_by="fallback",
             degraded=True,

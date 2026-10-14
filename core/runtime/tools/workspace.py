@@ -2,6 +2,12 @@
 
 Agents never choose filesystem paths for writes: the path is derived from the artifact type,
 and the payload is validated against that type's JSON schema.
+
+
+Luồng sử dụng: Tool cho agent truy cập artifact của phiên qua SessionWorkspace thay vì thao tác file tùy ý.
+ReadArtifactTool nhận path trong prefix cho phép, trả content có giới hạn kèm status/truncated.
+WriteArtifactTool nhận loại/payload, kiểm schema rồi suy ra path từ context do runtime cấp;
+model không chọn đường dẫn ghi. RuntimeTool bọc các hàm này để đưa kết quả trở lại chat.
 """
 
 import json
@@ -78,6 +84,7 @@ class ReadArtifactTool(RuntimeTool):
                 return {"status": "not_found", "path": normalized}
             if normalized.endswith(".json"):
                 data = self.workspace.read_json(normalized)
+                # Artifact có envelope thì chỉ trả payload nghiệp vụ, giảm metadata trong context model.
                 data = data.get("payload", data) if isinstance(data, dict) else data
                 text = json.dumps(data, ensure_ascii=False, default=str)
             else:
@@ -122,6 +129,7 @@ class WriteArtifactTool(RuntimeTool):
         if errors:
             return {"status": "invalid", "errors": errors[:5]}
         try:
+            # Context như turn_number do caller cấp; thiếu context trả lỗi thay vì để model quyết định path.
             rel_path = path_factory(payload, self.context)
         except (KeyError, ValueError, TypeError):
             return {"status": "error", "error": "runtime context missing for this artifact type"}

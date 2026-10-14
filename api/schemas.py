@@ -2,7 +2,7 @@
 
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.runtime.types import LoopEvent, LoopEventType
@@ -19,15 +19,45 @@ class CreateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     candidate_name: str = Field(..., description="Full name of the interview candidate")
-    experience_years: float = Field(default=0.0, description="Years of professional experience")
+    experience_years: Optional[float] = Field(default=None, description="Years of professional experience")
     target_company: str = Field(default="Target Company", description="Target employer for interview")
     target_role: str = Field(default="Senior Software Engineer", description="Target job role")
     skills: List[str] = Field(default_factory=list, description="Primary technical and domain skills")
     session_id: Optional[str] = Field(default=None, description="Optional custom session identifier")
-    cv_text: Optional[str] = Field(default=None, description="Optional resume or CV plain text content")
-    job_description: Optional[str] = Field(default=None, description="Optional target job description")
+    cv_text: Optional[str] = Field(default=None, max_length=180_000, description="Optional resume or CV plain text content")
+    job_description: Optional[str] = Field(default=None, max_length=180_000, description="Optional target job description")
     interview_format: Optional[str] = Field(default=None, description="Optional interview format guideline")
+    seniority: Optional[Literal["intern", "fresher", "junior", "mid", "senior"]] = Field(
+        default=None, description="Optional IT seniority; omitted values are inferred and surfaced with provenance"
+    )
+    interview_round: Optional[Literal["hr", "technical", "hiring_manager", "combined"]] = Field(
+        default=None, description="Optional interview round; omitted values are inferred and surfaced with provenance"
+    )
+    duration_minutes: Optional[int] = Field(
+        default=None, ge=10, le=120,
+        description="Optional requested interview duration; omitted values are inferred from matching evidence",
+    )
+    interview_language: Literal["vi", "en"] = Field(
+        default="vi", description="Interview conversation language; independent of the interface locale"
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary custom session metadata")
+
+
+class PlanPreferenceRequest(BaseModel):
+    """Optional edits to an inferred interview brief before the first interview turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seniority: Optional[Literal["intern", "fresher", "junior", "mid", "senior"]] = None
+    interview_round: Optional[Literal["hr", "technical", "hiring_manager", "combined"]] = None
+    duration_minutes: Optional[int] = Field(default=None, ge=10, le=120)
+
+
+class ProfileCorrectionRequest(BaseModel):
+    """Candidate-reviewed extraction; kept separate from the original CV file/text."""
+
+    model_config = ConfigDict(extra="forbid")
+    candidate_profile: Dict[str, Any]
 
 
 class CreateSessionResponse(BaseModel):

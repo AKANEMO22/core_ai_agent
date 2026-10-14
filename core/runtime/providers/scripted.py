@@ -4,6 +4,12 @@ Structured prompts end with "Respond with JSON only for `<kind>`". The scripted 
 prompt it receives and returns a valid, deterministic response for that kind, so the full
 pipeline (profiling, brief, speaker, orchestrator, evaluator, planner, guard, claims, summary,
 narrative) runs end to end without a provider.
+
+
+Luồng sử dụng: Provider offline của pipeline phỏng vấn: kế thừa MockLLMClient và chọn phản hồi theo kind trong prompt.
+Đầu vào là messages của agent; handler trả dict JSON dựng sẵn, còn speaker dùng canned_tokens.
+Overrides/level_for cho phép kịch bản mô phỏng khác nhau; dữ liệu này giúp chạy luồng
+phát triển, không phản ánh chất lượng đánh giá của model thật.
 """
 
 import json
@@ -82,8 +88,10 @@ class ScriptedInterviewLLM(MockLLMClient):
         matches = KIND_PATTERN.findall(prompt)
         if not matches:
             return None
+        # Lấy kind cuối vì prompt có thể nhắc kind khác ở phần mô tả hoặc ví dụ trước đó.
         kind = matches[-1]
         self.kind_counts[kind] = self.kind_counts.get(kind, 0) + 1
+        # Kịch bản tùy chỉnh thắng handler mặc định; kind chưa xử lý nhường lại cho mock base.
         if kind in self.overrides:
             return json.dumps(self.overrides[kind](prompt))
         handler = getattr(self, f"_kind_{kind}", None)

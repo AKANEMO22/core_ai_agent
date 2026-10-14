@@ -1,4 +1,10 @@
-"""Isolated session workspace management with atomic writes, artifact envelopes, and path security."""
+"""Isolated session workspace management with atomic writes, artifact envelopes, and path security.
+
+Luồng ghi thường là ``manager.get_or_create_workspace(session_id)`` →
+``workspace.write_artifact(...)``; reader dùng ``read_json`` hoặc ``read_text``.
+Mọi đường dẫn đi qua ``resolve_path`` trước khi chạm filesystem, còn artifact JSON được
+bọc metadata/checksum và thay thế nguyên tử để các thành phần khác có thể đọc an toàn.
+"""
 
 import hashlib
 import json
@@ -24,6 +30,7 @@ def normalize_session_id(session_id: str) -> str:
     Returns:
         str: Sanitized directory name.
     """
+    # Phần dễ đọc chỉ để tra cứu; hash hậu tố phân biệt ID khác nhau bị làm sạch thành cùng chuỗi.
     clean_id = re.sub(r"[^a-zA-Z0-9]+", "_", session_id).strip("_")
     hash_suffix = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
     return f"session_{clean_id}-{hash_suffix}"
@@ -78,6 +85,7 @@ class SessionWorkspace:
 
     def initialize(self) -> None:
         """Create workspace directory structure on disk if not already existing."""
+        # Tạo sẵn các vùng dữ liệu chuẩn để writer không tự chọn vị trí tùy tiện.
         self.root_path.mkdir(parents=True, exist_ok=True)
         for subdir in self.SUBDIRECTORIES:
             (self.root_path / subdir).mkdir(parents=True, exist_ok=True)
@@ -150,10 +158,11 @@ class SessionWorkspace:
         target_path = self.resolve_path(rel_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Checksum luôn tính trên payload logic, không tính timestamp/envelope thay đổi theo lần ghi.
         payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
         checksum = hashlib.sha256(payload_bytes).hexdigest()
 
-        # Build envelope: preserve top-level keys for dicts for easy access
+        # Bọc payload bằng metadata chuẩn; giữ thêm key cấp cao để các reader cũ đọc được.
         if isinstance(payload, dict):
             envelope = dict(payload)
             envelope["payload"] = payload
@@ -166,7 +175,7 @@ class SessionWorkspace:
         envelope["created_at"] = datetime.now(timezone.utc).isoformat()
         envelope["checksum_sha256"] = checksum
 
-        # Write to temporary file in the same directory, fsync, and replace atomically
+        # Temp file cùng thư mục để os.replace nguyên tử trên cùng filesystem; fsync tăng độ bền sau crash.
         temp_file = tempfile.NamedTemporaryFile(
             dir=target_path.parent,
             delete=False,
@@ -218,6 +227,21 @@ class SessionWorkspace:
             self._json_cache[key] = data
             return data
 
+    def delete_artifact(self, rel_path: Union[str, Path]) -> bool:
+        """Remove one workspace artifact through the same traversal-safe path boundary."""
+        key = str(rel_path).replace("\\", "/")
+        target_path = self.resolve_path(rel_path)
+        if not target_path.is_file():
+            self._json_cache.pop(key, None)
+            return False
+        target_path.unlink()
+        self._json_cache.pop(key, None)
+        try:
+            os.utime(self.root_path, None)
+        except OSError:
+            pass
+        return True
+
     def write_text(self, rel_path: Union[str, Path], text: str) -> Path:
         """Atomically write text content (e.g. Markdown reports) to workspace.
 
@@ -231,6 +255,7 @@ class SessionWorkspace:
         target_path = self.resolve_path(rel_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Report Markdown cũng dùng temp + replace để reader không thấy file bị ghi dở.
         temp_file = tempfile.NamedTemporaryFile(
             dir=target_path.parent,
             delete=False,
@@ -257,6 +282,36 @@ class SessionWorkspace:
         except OSError:
             pass
 
+        return target_path
+
+    def write_bytes(self, rel_path: Union[str, Path], content: bytes) -> Path:
+        """Atomically persist an original uploaded file inside the session workspace."""
+        target_path = self.resolve_path(rel_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = tempfile.NamedTemporaryFile(
+            dir=target_path.parent,
+            delete=False,
+            mode="wb",
+            prefix=f".tmp_{target_path.name}_",
+        )
+        try:
+            temp_file.write(content)
+            temp_file.flush()
+            if self.fsync:
+                os.fsync(temp_file.fileno())
+            temp_file.close()
+            os.replace(temp_file.name, target_path)
+        except Exception:
+            if not temp_file.closed:
+                temp_file.close()
+            if os.path.exists(temp_file.name):
+                os.remove(temp_file.name)
+            raise
+        try:
+            os.utime(self.root_path, None)
+        except OSError:
+            pass
+        self._json_cache.pop(str(rel_path).replace("\\", "/"), None)
         return target_path
 
     def read_text(self, rel_path: Union[str, Path]) -> str:
@@ -333,6 +388,7 @@ class SessionWorkspaceManager:
         Returns:
             SessionWorkspace: Initialized session workspace object.
         """
+        # Cache object để tái sử dụng JSON cache; nếu thư mục bị xóa bên ngoài thì dựng lại sandbox.
         if session_id in self._workspaces:
             cached_ws = self._workspaces[session_id]
             if cached_ws.root_path.exists():

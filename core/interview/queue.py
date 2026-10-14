@@ -1,4 +1,11 @@
-"""Assessment queue protocols and in-memory implementation for background evaluation tasks."""
+"""Hợp đồng job và hàng đợi tách chấm điểm khỏi luồng phát câu trả lời.
+
+Runner tạo AssessmentJob từ câu hỏi trước đó, câu trả lời ứng viên, VAD và rubric,
+rồi enqueue; bên đánh giá nền dequeue và chấm theo payload này. job_id nối
+session/turn/rubric để bên xử lý có khóa nhận diện ổn định. Bản InMemoryAssessmentQueue
+chỉ giữ dữ liệu RAM và lịch sử enqueue; nó không tự deduplicate hay bảo đảm phục hồi
+sau restart, vì vậy không nên suy ra độ bền Redis từ hợp đồng này.
+"""
 
 import asyncio
 import time
@@ -103,6 +110,7 @@ class InMemoryAssessmentQueue:
             job_dict["job_id"] = f"{session_id}:{turn_id}:{rubric_v}"
 
         job_id = job_dict["job_id"]
+        # Đây là FIFO RAM: job_id ổn định không đồng nghĩa enqueue tự loại job trùng.
         await self._queue.put(job_dict)
         self._history.append(job_dict)
         return job_id
@@ -125,4 +133,5 @@ class InMemoryAssessmentQueue:
 
     def get_all_jobs(self) -> List[Dict[str, Any]]:
         """Return a copy of all jobs enqueued historically."""
+        # History chứa cả job đã dequeue; nó không phản ánh số tác vụ đang chờ.
         return list(self._history)

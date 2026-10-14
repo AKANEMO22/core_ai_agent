@@ -6,6 +6,9 @@ Predictions: the `decision.json` produced for each session (path or object).
 
 Usage:
     python -m core.simulation.quality --golden golden.jsonl --decisions-dir data/workspaces
+
+CLI đọc golden JSONL và ``reports/decision.json`` theo session ID; exit code 0 nghĩa là các
+quality gate đạt, 1 nghĩa là còn gate chưa đạt. Có thể gọi ``score`` trực tiếp trong Python.
 """
 
 import argparse
@@ -70,12 +73,14 @@ def score(
     `evaluations` (session -> evaluation payloads) enables the invented-evidence rate: the share of
     model quotes that failed verification (`flags.unverified_quotes_dropped`) among all quotes offered.
     """
+    # Chỉ so những session có prediction; custom gates ghi đè ngưỡng release mặc định.
     gates = {**GATES, **(gates or {})}
     matched = [g for g in golden if g["session_id"] in decisions]
     gold_verdicts = [g["gold_verdict"] for g in matched]
     pred_verdicts = [decisions[g["session_id"]]["verdict"] for g in matched]
     kappa = cohen_kappa(gold_verdicts, pred_verdicts) if matched else None
 
+    # MAE chỉ tính tiêu chí có trong gold; prediction thiếu được bỏ qua bởi mean_absolute_error.
     pairs = []
     for g in matched:
         predicted = {c["competency_id"]: c.get("level") for c in decisions[g["session_id"]].get("criteria", [])}
@@ -85,6 +90,7 @@ def score(
     coverage_flags = [not decisions[g["session_id"]].get("must_have_uncovered") for g in matched]
     coverage = round(sum(coverage_flags) / len(coverage_flags), 4) if coverage_flags else None
 
+    # Không có evaluations thì không thể đánh giá quote bịa, nên gate đó được để ngoài report.
     invented_rate = None
     if evaluations is not None:
         offered = dropped = 0
@@ -136,6 +142,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--golden", type=Path, required=True)
     parser.add_argument("--decisions-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    # Exit code 0/1 cho phép CI dùng quality gate trực tiếp trong pipeline release.
     golden = load_golden(args.golden)
     report = score(golden, load_decisions(args.decisions_dir, [g["session_id"] for g in golden]))
     print(json.dumps(report.to_dict(), indent=2))

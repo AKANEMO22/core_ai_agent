@@ -1,4 +1,9 @@
-"""Claim checker: compares CV/profile claims with what the candidate actually said."""
+"""Claim checker: compares CV/profile claims with what the candidate actually said.
+
+Đối chiếu các tuyên bố trong hồ sơ ứng viên với transcript đã lưu theo lượt.
+ClaimChecker.check đọc workspace, gọi LLM theo chu kỳ và kiểm chứng bằng quotes.py;
+kết quả được trả cho bên gọi và lưu orchestration/claims.json để dùng trong báo cáo.
+"""
 
 import asyncio
 import json
@@ -65,6 +70,7 @@ class ClaimChecker:
         self.semaphore = semaphore
 
     async def check(self, workspace: SessionWorkspace, turn_number: int, force: bool = False) -> Dict[str, Any]:
+        # Tái dùng lần kiểm tra trước giữa các mốc để tránh gọi LLM trên mọi lượt.
         previous = _payload(workspace, CLAIMS_PATH)
         profile = _payload(workspace, "context/candidate_profile.json")
         claims = [str(c) for c in (profile.get("claims") or [])][:12]
@@ -73,6 +79,7 @@ class ClaimChecker:
         if not force and previous and turn_number % self.every_n_turns != 0:
             return previous
 
+        # Giữ bản transcript theo số lượt để kiểm chứng đúng nguồn khi model chỉ ra turn.
         answers: Dict[int, str] = {}
         for i in range(1, turn_number + 1):
             content = _payload(workspace, f"turns/turn_{i}_candidate.json").get("content")
@@ -96,9 +103,11 @@ class ClaimChecker:
                 semaphore=self.semaphore,
                 temperature=0.0,
             )
+        # Lỗi JSON/deadline không tạo kết luận mới: giữ kết quả cũ hoặc trạng thái chưa kiểm tra.
         except StructuredOutputError:
             return previous or {"claims": [{"claim": c, "status": "untested"} for c in claims]}
 
+        # Kết luận supported/contradicted chỉ được giữ khi có trích dẫn khớp transcript.
         checked: List[Dict[str, Any]] = []
         for item in result.get("claims", []):
             quote = item.get("evidence_quote")

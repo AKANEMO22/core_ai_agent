@@ -42,7 +42,9 @@ def _runner(tmp_path: Path) -> SimulationRunner:
         )
 
     token = create_service_token(issuer="sim", audience="ai-runtime", secret=settings.JWT_SECRET)
-    return SimulationRunner(factory, token)
+    # One realistic interview plan can exceed 20 exchanges after intro/Q&A reserves and
+    # evidence-driven follow-ups; keep the acceptance harness bounded but long enough to finish.
+    return SimulationRunner(factory, token, max_turns=30)
 
 
 @pytest.mark.asyncio
