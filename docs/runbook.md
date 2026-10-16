@@ -14,6 +14,7 @@ startup fails (`RuntimeError: Unsafe production configuration`) unless:
 | `RETRIEVAL_BACKEND` | a registered production adapter, or `mock` with `ALLOW_MOCK_RETRIEVAL=true` |
 | `PRODUCT_MODE` | `practice` or `hiring_assist` |
 | `REDIS_URL` | reachable Redis with persistence (AOF recommended) on an encrypted volume |
+| `DATABASE_URL` | optional; `postgresql://` URL for the archive catalog and inspector traces (empty = SQLite files). Secret: never logged, shown redacted (`user@host:port/db`) by `/api/v1/inspect/system` |
 
 Key tuning knobs:
 
@@ -104,7 +105,20 @@ Clients that reconnect with an expired cursor receive `resync_required` with a s
 revokes tokens, deletes every Redis key and the workspace, and appends a content-free entry to
 `audit:session_deletions`.
 
-### 5.5 Human review (`PRODUCT_MODE=hiring_assist`)
+### 5.5 Durable stores on PostgreSQL
+With `DATABASE_URL` set, the archive catalog (schema `artifact_archive`) and inspector traces
+(schema `inspect_trace`) use PostgreSQL through a psycopg pool per store
+(`DATABASE_POOL_MIN_SIZE`/`DATABASE_POOL_MAX_SIZE`). Schemas are created idempotently at startup
+and recorded in `<schema>.schema_version`; the role needs `CREATE` on the database for first start.
+Writers are serialized with transaction advisory locks (traces: one per store, like SQLite
+`BEGIN IMMEDIATE`; catalog: one per session). One API process owns a trace schema at a time
+(session advisory lock on a dedicated connection; a second process fails at startup with
+"already has an active core process"). Docker Compose ships a `postgres` service for this.
+To move existing SQLite data, stop the API and run
+`uv run python scripts/migrate_sqlite_to_postgres.py` (idempotent; `--catalog`/`--traces` paths).
+Back up with `pg_dump -n artifact_archive -n inspect_trace`.
+
+### 5.6 Human review (`PRODUCT_MODE=hiring_assist`)
 When `requires_human_review` is true, a reviewer records the final verdict:
 
 ```bash

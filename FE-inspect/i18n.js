@@ -69,7 +69,7 @@
     "Không đọc được run": ["Không đọc được phiên", "Cannot read run"], "Sao chép": "Copy", "Không tải được events": ["Không tải được sự kiện", "Cannot load events"],
     "Không đọc được artifact": ["Không đọc được tệp", "Cannot read artifact"], "Đã sao chép session ID": "Session ID copied", "Trình duyệt không cho phép sao chép": "Browser blocked clipboard access", "Backend phải dùng http hoặc https": "Backend must use http or https",
     "Xem đẹp": "Read", "Nguồn": "Source", "Mở cây": "Expand tree", "Thu cây": "Collapse tree", "Nội dung đã lưu": "Saved content",
-    "Hoàn thành": "Completed", "Đang chạy / chờ": "Running / queued", "Lỗi / gián đoạn": "Failed / interrupted",
+    "Hoàn thành": "Completed", "Đang kết thúc": "Ending", "Không xuất được run": "Cannot export run", "Tải toàn bộ run (JSON)": "Download full run (JSON)", "Đang chạy / chờ": "Running / queued", "Lỗi / gián đoạn": "Failed / interrupted",
   };
   let locale = localStorage.getItem("core-studio-locale") === "en" ? "en" : "vi";
   const t = (key) => {

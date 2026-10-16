@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 MAX_UPLOAD_BYTES = MAX_DOCUMENT_BYTES
+# Bounded wait for cancelled local tasks inside the /cancel request.
+CANCEL_UNWIND_SECONDS = 2.0
 
 SAFE_FAILURE_MESSAGES = {
     "PROFILING_FAILED": "Interview preparation failed. Please create a new session.",
@@ -99,6 +101,17 @@ async def _fail_session(app: Any, session_id: str, failure_code: str) -> None:
 
 
 async def _run_profiling_task(app: Any, session_id: str, workspace: SessionWorkspace) -> None:
+    try:
+        await app.state.cancellations.run(session_id, _run_profiling(app, session_id, workspace), app.state.redis_client)
+    except asyncio.CancelledError:
+        # Session cancellation stops only the child task; cancelling this task is shutdown.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+        return
+
+
+async def _run_profiling(app: Any, session_id: str, workspace: SessionWorkspace) -> None:
     """Run pre-flight profiling under a deadline; READY on success, FAILED otherwise."""
     profiler: Optional[ProfilerAgent] = getattr(app.state, "profiler_agent", None)
     settings = app.state.settings
@@ -641,15 +654,7 @@ async def start_interview(
     await _validate_session_access(request, claims, session_id)
     await _require_state(request, session_id)
     workspace = request.app.state.workspace_mgr.get_or_create_workspace(session_id)
-    brief_path = "context/interview_brief.json"
-    if workspace.exists(brief_path):
-        brief = await asyncio.to_thread(_artifact_payload, workspace, brief_path)
-        if brief.get("status") == "needs_confirmation" and not confirm_limitations:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Review the plan's evidence limitations and confirm before starting",
-            )
-    result = await request.app.state.controller.start_interview(session_id)
+    result = await request.app.state.controller.start_interview(session_id, confirm_limitations=confirm_limitations)
 
     if result.status == "busy":
         return JSONResponse(
@@ -767,8 +772,50 @@ async def cancel_session(
         updated = await _require_state(request, session_id)
         if updated.status != LifecycleStatus.CANCELLED:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Concurrent state change; retry")
+    # CANCELLED is final: fence other processes, let local tasks unwind, then drop RAM markers.
+    pipeline = getattr(app.state, "pipeline", None)
+    if pipeline is not None:
+        await pipeline.stop_work(session_id)
+    await app.state.controller.cancellations.cancel_session_and_wait(session_id, timeout=CANCEL_UNWIND_SECONDS)
+    if pipeline is not None:
+        await pipeline.release_session(session_id)
+    else:
+        app.state.controller.cancellations.forget(session_id)
     await app.state.connection_mgr.publish(session_id, _event(session_id, LoopEventType.SESSION_CANCELLED, {}))
     return CancelSessionResponse(session_id=session_id, status=updated.status, message="Session cancelled successfully")
+
+
+@router.post("/{session_id}/end", summary="Stop session agents and generate the final partial report")
+async def end_session(session_id: str, request: Request,
+    claims: Dict[str, Any] = Depends(require_session_or_service_token)) -> Any:
+    await _validate_session_access(request, claims, session_id)
+    state = await _require_state(request, session_id)
+    if state.status in (LifecycleStatus.CANCELLED, LifecycleStatus.FAILED, LifecycleStatus.EXPIRED):
+        raise HTTPException(status_code=409, detail=f"Cannot end session in status {state.status.value}")
+    ended_statuses = (LifecycleStatus.ENDING, LifecycleStatus.REPORT_READY, LifecycleStatus.ASSESSMENT_FAILED)
+    try:
+        await request.app.state.pipeline.end_session(session_id)
+    except Exception as exc:
+        # Only a persisted ENDING intent can be finished later by retries/the sweep.
+        latest = await _require_state(request, session_id)
+        if latest.status not in ended_statuses or (
+            latest.status == LifecycleStatus.ASSESSMENT_FAILED and not latest.metadata.get("early_ended")
+        ):
+            if isinstance(exc, InvalidStateTransitionError):
+                detail = ("Session changed to a non-reportable terminal state" if latest.status in TERMINAL_STATUSES
+                          else "Concurrent state change; retry")
+                raise HTTPException(status_code=409, detail=detail)
+            logger.error("Ending session failed: %s", sanitize_secrets(str(exc)))
+            raise HTTPException(status_code=503, detail="Session could not be ended; retry")
+        logger.error("Early-end report pending: %s", sanitize_secrets(str(exc)))
+    state = await _require_state(request, session_id)
+    if state.status == LifecycleStatus.REPORT_READY:
+        code, message = 200, "Final report ready"
+    elif state.status == LifecycleStatus.ASSESSMENT_FAILED:
+        code, message = 200, "Session ended; final report failed and requires operator review"
+    else:
+        code, message = 202, "Session ended; final report is processing"
+    return JSONResponse(status_code=code, content={"session_id": session_id, "status": state.status.value, "message": message})
 
 
 @router.post(
@@ -885,6 +932,7 @@ async def _purge_session_contents(app: Any, session_id: str) -> None:
         f"session:{session_id}:turn_lock",
         f"session:{session_id}:blackboard",
         f"session:{session_id}:summary_lock",
+        f"session:{session_id}:work_stopped",
     ]
     await redis.delete(*keys)
     try:

@@ -34,6 +34,11 @@ def _round(value: Any) -> str | None:
 
 def _extract_minutes(text: str) -> tuple[int, int] | None:
     value = text.casefold().replace("–", "-").replace("—", "-").replace(",", ".")
+    ranged = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:-|to|đến)\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|giờ|tiếng|minutes?|mins?|phút)\b", value)
+    if ranged:
+        multiplier = 60 if re.fullmatch(r"hours?|hrs?|giờ|tiếng", ranged.group(3)) else 1
+        low, high = sorted(round(float(ranged.group(i)) * multiplier) for i in (1, 2))
+        return (low, high) if 10 <= low <= high <= 120 else None
     hour = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|giờ|tiếng)\b", value)
     if hour:
         minutes = round(float(hour.group(1)) * 60)
@@ -108,17 +113,68 @@ def _sources(recon_data: dict[str, Any], knowledge: dict[str, Any]) -> list[dict
 
 
 def _source_matches(source: dict[str, Any], company: str, role: str, level: str | None) -> bool:
-    text = " ".join((source.get("title", ""), source.get("snippet", ""), source.get("content_excerpt", ""), source.get("query", ""))).casefold()
+    # Search queries describe what we wanted to find, never what a page establishes.
+    if source.get("source_type") == "framework":
+        return True
+    text = " ".join(str(source.get(key) or "") for key in ("title", "snippet", "content_excerpt")).casefold()
     company_clean = company.strip().casefold()
-    if company_clean and company_clean not in text and source.get("source_type") != "framework":
+    if company_clean and not re.search(r"(?<!\w)" + re.escape(company_clean) + r"(?!\w)", text):
         return False
-    role_words = [word for word in re.findall(r"[a-z0-9+#.]+", role.casefold()) if len(word) > 2]
-    if role_words and not any(word in text for word in role_words) and source.get("source_type") != "framework":
+    role_text = role.casefold()
+    for _, pattern in _LEVEL_TERMS:
+        role_text = pattern.sub(" ", role_text)
+    # Shared words such as 'engineer' or the requested level cannot make a data
+    # analyst page relevant to a software engineer vacancy.
+    generic = {"engineer", "engineering", "developer", "development", "specialist"}
+    role_words = [word for word in re.findall(r"[a-z0-9+#]+", role_text) if len(word) > 2]
+    specific = [word for word in role_words if word not in generic]
+    required = specific or role_words
+    if required and not all(re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", text) for word in required):
         return False
     level_pattern = dict(_LEVEL_TERMS).get(level or "")
-    if level_pattern and any(pattern.search(text) for key, pattern in _LEVEL_TERMS if key != level):
+    if level_pattern and not level_pattern.search(text) and any(pattern.search(text) for key, pattern in _LEVEL_TERMS if key != level):
         return False
     return True
+
+
+def _duration_for_round(source: dict[str, Any], selected_round: str, level: str | None = None) -> tuple[int, int] | None:
+    """Only use durations whose local claim concerns the selected interview round and level."""
+    level_pattern = dict(_LEVEL_TERMS).get(level or "")
+    title = str(source.get("title") or "")
+    text = "\n".join(str(source.get(key) or "") for key in ("content_excerpt", "snippet", "title"))
+    claims: set[tuple[int, int]] = set()
+    for clause in re.split(r"(?<!\d)[.!?;\n]+|[.!?;\n]+(?!\d)|\s+(?:and|while|whereas|còn)\s+", text):
+        duration = _extract_minutes(clause)
+        if not duration:
+            continue
+        if re.search(r"\b(lunch|break|meal|commute|coding challenge deadline|nghỉ trưa|ăn trưa)\b", clause, re.I):
+            continue
+        # A clause about another level (e.g. "Senior interview lasts 90 minutes") is not
+        # timing for the selected level unless it also names the selected level.
+        if level_pattern and not level_pattern.search(clause) and any(
+            pattern.search(clause) for key, pattern in _LEVEL_TERMS if key != level
+        ):
+            continue
+        signals = _round_signal(clause)
+        context = clause if signals else title + " " + clause
+        if not re.search(r"\b(interview|screen|round|coding|phỏng vấn|vòng)\b", context, re.I):
+            continue
+        signals = signals or _round_signal(title)
+        if selected_round == "combined":
+            # A duration for one round does not describe the whole interview.
+            if signals and not re.search(r"\b(combined|overall|total|entire|tổng|toàn bộ)\b", clause, re.I):
+                continue
+        elif signals != {selected_round}:
+            continue
+        claims.add(duration)
+    return next(iter(claims)) if len(claims) == 1 else None
+
+
+def _consistent_durations(entries: list[tuple]) -> bool:
+    return bool(entries) and all(
+        max(abs(left[2][0] - right[2][0]), abs(left[2][1] - right[2][1])) <= 15
+        for left in entries for right in entries
+    )
 
 
 def _round_signal(text: str) -> set[str]:
@@ -212,7 +268,7 @@ def resolve_interview_brief(
             source_text = " ".join((source.get("content_excerpt", ""), source.get("snippet", ""), source.get("title", "")))
             if not source_text.strip():
                 continue
-            duration = _extract_minutes(source_text)
+            duration = _duration_for_round(source, round_value, level)
             if duration:
                 url = str(source.get("url") or "")
                 host = urlparse(url).netloc.casefold()
@@ -220,7 +276,11 @@ def resolve_interview_brief(
                 duration_candidates.append((tier, host, duration, source))
         # Search result snippets are unreviewed. Require independent hosts to agree before using them.
         trusted = [entry for entry in duration_candidates if entry[0] in {"official_verified", "firsthand_reviewed"}]
-        if trusted:
+        duration_range = [30, 45]
+        duration_source = "fallback_30_45_minutes"
+        duration_evidence = []
+        duration_confidence = 0.2
+        if trusted and _consistent_durations(trusted):
             tier_priority = {"official_verified": 0, "firsthand_reviewed": 1}
             trusted.sort(key=lambda item: (tier_priority.get(item[0], 9), item[1], item[2]))
             selected = trusted[0]
@@ -228,45 +288,32 @@ def resolve_interview_brief(
             duration_source = selected[0]
             duration_evidence = [selected[3]["source_id"]]
             duration_confidence = 0.85 if selected[0] == "official_verified" else 0.7
+        elif trusted:
+            limitations.append("Conflicting reviewed duration claims require confirmation; a generic practice duration is proposed.")
         else:
             framework_candidates = [
                 entry for entry in duration_candidates if entry[3].get("source_type") == "framework"
             ]
-            if framework_candidates:
+            unreviewed = [entry for entry in duration_candidates if entry[3].get("source_type") != "framework" and entry[1]]
+            # All matching claims must agree; never cherry-pick two convenient hosts.
+            if len({entry[1] for entry in unreviewed}) >= 2 and _consistent_durations(unreviewed):
+                by_host = {entry[1]: entry for entry in unreviewed}
+                agreeing = list(by_host.values())
+                duration_range = [round(sum(entry[2][i] for entry in agreeing) / len(agreeing)) for i in (0, 1)]
+                duration_source = "independent_unreviewed_search_results"
+                duration_evidence = [entry[3]["source_id"] for entry in agreeing]
+                duration_confidence = 0.4
+            elif framework_candidates and _consistent_durations(framework_candidates):
                 selected = framework_candidates[0]
                 duration_range = list(selected[2])
                 duration_source = "framework"
                 duration_evidence = [selected[3]["source_id"]]
                 duration_confidence = 0.55
-            else:
-                by_host: dict[str, list[tuple[int, int, dict[str, Any]]]] = {}
-                for _, host, value, source in duration_candidates:
-                    if host:
-                        by_host.setdefault(host, []).append((value[0], value[1], source))
-                agreeing = []
-                hosts = list(by_host)
-                for index, host in enumerate(hosts):
-                    for other in hosts[index + 1:]:
-                        left, right = by_host[host][0], by_host[other][0]
-                        if max(abs(left[0] - right[0]), abs(left[1] - right[1])) <= 15:
-                            agreeing = [left, right]
-                            break
-                    if agreeing:
-                        break
-                if agreeing:
-                    low = round((agreeing[0][0] + agreeing[1][0]) / 2)
-                    high = round((agreeing[0][1] + agreeing[1][1]) / 2)
-                    duration_range = [low, high]
-                    duration_source = "independent_unreviewed_search_results"
-                    duration_evidence = [entry[2]["source_id"] for entry in agreeing]
-                    duration_confidence = 0.4
-                else:
-                    duration_range = [30, 45]
-                    duration_source = "fallback_30_45_minutes"
-                    duration_evidence = []
-                    duration_confidence = 0.2
-                    if duration_candidates:
-                        limitations.append("A single unreviewed duration result was not treated as company policy.")
+                limitations.append("Duration uses a generic interview framework, not verified company policy.")
+            if unreviewed and not _consistent_durations(unreviewed):
+                limitations.append("Conflicting unreviewed duration claims were not used to infer company timing.")
+            elif unreviewed and duration_source != "independent_unreviewed_search_results":
+                limitations.append("A single unreviewed duration result was not treated as company policy.")
     else:
         duration_range = [requested_minutes, requested_minutes]
         duration_source = "user_selected"
@@ -316,6 +363,8 @@ def shape_stage_plan(stage_plan: Any, brief: dict[str, Any], candidate_profile: 
     round_value = brief.get("interview_round", {}).get("value", "combined")
     level = brief.get("seniority", {}).get("value")
     minutes = int(brief.get("duration", {}).get("planned_minutes") or 40)
+    # Opening, at least one body stage and Q&A each need one whole minute.
+    minutes = max(3, minutes)
     keep_types = {
         "hr": {"warmup", "behavioral", "wrapup"},
         "technical": {"warmup", "technical", "system_design", "behavioral", "wrapup"},
@@ -426,16 +475,34 @@ def shape_stage_plan(stage_plan: Any, brief: dict[str, Any], candidate_profile: 
         stage["turns"] = int(stage.get("target_turns") or 1)
 
     reserve = min(max(2, round(minutes * 0.15)), max(2, minutes - 2))
-    main_minutes = max(1, minutes - reserve)
+    opening_minutes = max(1, round(minutes * 0.05))
+    main_minutes = minutes - reserve - opening_minutes
+    if main_minutes < 1:
+        # Very short plans: shrink the Q&A reserve so at least one body minute remains.
+        reserve = max(1, minutes - opening_minutes - 1)
+        main_minutes = minutes - reserve - opening_minutes
     main = stages[1:-1]
+    # Keep one minute per stage even for an overlong model proposal. Merge excess
+    # stages' goals into the final body stage rather than inventing extra time.
+    if len(main) > main_minutes:
+        retained = main[:main_minutes]
+        for extra in main[main_minutes:]:
+            retained[-1]["goals"].extend(extra.get("goals") or [])
+        stages = [opening, *retained, candidate_questions]
+        main = retained
     weight_total = sum(max(1, int(stage["target_turns"])) for stage in main) or 1
     for stage in stages:
         if stage["stage_id"] == "opening":
-            stage["time_budget_minutes"] = max(1, round(minutes * 0.05))
+            stage["time_budget_minutes"] = opening_minutes
         elif stage["stage_id"] == "candidate_questions":
             stage["time_budget_minutes"] = reserve
-    for stage in main:
-        stage["time_budget_minutes"] = max(1, round(main_minutes * max(1, int(stage["target_turns"])) / weight_total))
+    remaining = main_minutes - len(main)
+    shares = [remaining * max(1, int(stage["target_turns"])) / weight_total for stage in main]
+    budgets = [1 + int(share) for share in shares]
+    for index in sorted(range(len(main)), key=lambda i: shares[i] % 1, reverse=True)[:main_minutes - sum(budgets)]:
+        budgets[index] += 1
+    for stage, budget in zip(main, budgets):
+        stage["time_budget_minutes"] = budget
     shaped = dict(source)
     shaped.update({
         "stages": stages,
@@ -444,6 +511,6 @@ def shape_stage_plan(stage_plan: Any, brief: dict[str, Any], candidate_profile: 
         "duration_range_minutes": brief.get("duration", {}).get("range_minutes"),
         "duration_source": brief.get("duration", {}).get("source"),
         "estimated_turns": sum(int(stage["target_turns"]) for stage in stages),
-        "time_allocation_basis": "approximate stage budgets derived at two minutes per answer turn; interactive runtime enforces turn counts, not a wall-clock deadline",
+        "time_allocation_basis": "stage budgets sum to the planned duration, including introduction and reserved candidate Q&A; turn estimates assume two minutes per answer",
     })
     return shaped

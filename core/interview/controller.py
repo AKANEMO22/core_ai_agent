@@ -10,6 +10,8 @@ và payload hash để tránh gọi LLM lại cho một câu trả lời đã ho
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import time
 import uuid
@@ -37,6 +39,9 @@ logger = logging.getLogger(__name__)
 RunnerFactory = Callable[[str], Awaitable[Optional[InteractiveSubagentRunner]]]
 AfterTurnHook = Callable[[str, int], Awaitable[Any]]
 SessionHook = Callable[[str], Awaitable[Any]]
+
+# Throttle for the per-token durable stop-fence check in _consume.
+FENCE_CHECK_INTERVAL_SECONDS = 0.1
 
 
 @dataclass
@@ -132,6 +137,7 @@ class InterviewSessionController:
         turn_lock_ttl_ms: int = 60000,
         metrics: Optional[Any] = None,
         hot_path_gate: Optional[Any] = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.state_store = state_store
         self.publisher = publisher
@@ -146,6 +152,7 @@ class InterviewSessionController:
         self.turn_lock_ttl_ms = turn_lock_ttl_ms
         self.metrics = metrics
         self.hot_path_gate = hot_path_gate
+        self.clock = clock
         self.after_turn_hooks: List[AfterTurnHook] = []
         self.dialogue_completed_hooks: List[SessionHook] = []
         self._background: set = set()
@@ -159,7 +166,7 @@ class InterviewSessionController:
         return f"session:{session_id}:turn_lock"
 
     def _spawn(self, session_id: str, coro: Awaitable[Any], name: str) -> asyncio.Task:
-        task = asyncio.create_task(coro, name=name)
+        task = asyncio.create_task(self.cancellations.run(session_id, coro, self.lease.redis), name=name)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
         self.cancellations.register_task(session_id, task)
@@ -205,14 +212,28 @@ class InterviewSessionController:
         first_token_seen = False
         gate = self.hot_path_gate.hot() if self.hot_path_gate is not None else contextlib.nullcontext()
         async with gate:
-            await self._consume(session_id, events, accepted_at, summary)
+            try:
+                await self.cancellations.run(session_id, self._consume(session_id, events, accepted_at, summary), self.lease.redis)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                summary["status"] = "interrupted"
         if self.metrics is not None:
             self.metrics.observe("turn_duration_seconds", time.perf_counter() - accepted_at)
         return summary
 
     async def _consume(self, session_id: str, events: Any, accepted_at: float, summary: Dict[str, Any]) -> None:
         first_token_seen = False
+        last_fence_check = float("-inf")
         async for event in events:
+            # Tokens check the durable fence at most every FENCE_CHECK_INTERVAL; lifecycle events
+            # always check it. CancellationRegistry.run polls the same fence concurrently.
+            now = time.monotonic()
+            if event.type != LoopEventType.RESPONSE_TOKEN or now - last_fence_check >= FENCE_CHECK_INTERVAL_SECONDS:
+                last_fence_check = now
+                if await self.lease.redis.exists(f"session:{session_id}:work_stopped"):
+                    summary["status"] = "ended"
+                    return
             await self.publisher.publish(session_id, event)
             if event.type == LoopEventType.RESPONSE_TOKEN and not first_token_seen:
                 first_token_seen = True
@@ -223,6 +244,13 @@ class InterviewSessionController:
             elif event.type == LoopEventType.TURN_COMPLETE:
                 summary["status"] = "interrupted" if event.payload.get("interrupted") else "completed"
                 summary["turn_number"] = event.payload.get("turn_number")
+
+    @staticmethod
+    def _ended(turn_id: Optional[str]) -> TurnRequestResult:
+        return TurnRequestResult(
+            status="rejected", turn_id=turn_id, error_code="SESSION_ENDED",
+            message="The session was ended; the final report is being prepared.",
+        )
 
     async def _replay(self, session_id: str, turn_id: str) -> TurnRequestResult:
         events = await self.publisher.event_store.get_turn_events(session_id, turn_id)
@@ -307,7 +335,7 @@ class InterviewSessionController:
     # Opening
     # ------------------------------------------------------------------
 
-    async def start_interview(self, session_id: str) -> TurnRequestResult:
+    async def start_interview(self, session_id: str, *, confirm_limitations: bool = False) -> TurnRequestResult:
         """Start the interview: READY → STAGE_ACTIVE and stream the opening question (turn 0).
 
         Idempotent: once the opening exists, repeated calls replay its events.
@@ -329,6 +357,21 @@ class InterviewSessionController:
             if runner is None:
                 return TurnRequestResult(status="rejected", turn_id=turn_id, error_code="RUNNER_UNAVAILABLE")
 
+            # The controller owns this guard: REST, WebSocket and internal callers share it.
+            brief = {}
+            if runner.workspace.exists("context/interview_brief.json"):
+                brief = await asyncio.to_thread(runner.workspace.read_json, "context/interview_brief.json")
+                brief = brief.get("payload", brief)
+            digest = hashlib.sha256(json.dumps(brief, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+            accepted_confirmation = state.metadata.get("plan_confirmation") or {}
+            if brief.get("status") == "needs_confirmation" and (
+                accepted_confirmation.get("brief_sha256") != digest and confirm_limitations is not True
+            ):
+                return TurnRequestResult(
+                    status="rejected", turn_id=turn_id, error_code="PLAN_CONFIRMATION_REQUIRED",
+                    message="Review the current plan's evidence limitations and confirm before starting",
+                )
+
             if state.status == LifecycleStatus.STAGE_ACTIVE and (
                 state.current_turn > 0 or runner.workspace.exists("turns/turn_0_interviewer.json")
             ):
@@ -336,11 +379,20 @@ class InterviewSessionController:
             if state.status == LifecycleStatus.READY:
                 stages = runner.stage_director.stages
                 first_stage = stages[0]["stage_id"] if stages else "warmup"
+                metadata = dict(state.metadata)
+                started_at = self.clock()
+                metadata["interview_started_at"] = started_at
+                minutes = (brief.get("duration") or {}).get("planned_minutes")
+                if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and 0 < minutes <= 120:
+                    metadata["interview_deadline_at"] = started_at + minutes * 60
+                if confirm_limitations is True:
+                    metadata["plan_confirmation"] = {"brief_sha256": digest, "accepted_at": started_at}
                 state = await self.state_store.atransition(
                     state,
                     expected_version=state.state_version,
                     new_status=LifecycleStatus.STAGE_ACTIVE,
                     current_stage_id=first_stage,
+                    metadata=metadata,
                 )
             elif state.status != LifecycleStatus.STAGE_ACTIVE:
                 code = "PROFILING_IN_PROGRESS" if state.status in (
@@ -365,6 +417,8 @@ class InterviewSessionController:
             finally:
                 self.generation_slots.release()
                 self.cancellations.finish_generation(session_id, token)
+            if summary["status"] == "ended":
+                return self._ended(turn_id)
             if summary["status"] == "failed":
                 return TurnRequestResult(status="failed", turn_id=turn_id, error_code="TURN_FAILED")
             return TurnRequestResult(status=summary["status"], turn_id=turn_id)
@@ -493,6 +547,8 @@ class InterviewSessionController:
                 self.generation_slots.release()
                 self.cancellations.finish_generation(session_id, token)
 
+            if summary["status"] == "ended":
+                return self._ended(turn_id)
             if summary["status"] == "failed":
                 return TurnRequestResult(status="failed", turn_id=turn_id, error_code="TURN_FAILED")
 

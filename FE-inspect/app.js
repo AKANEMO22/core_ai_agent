@@ -1,8 +1,8 @@
 (async () => {
   "use strict";
   // A cached pre-localization HTML page may still load this script without the new helpers.
-  if (!window.CoreInspectI18n) await import("./i18n.js?v=20261013-ux2");
-  if (!window.CoreInspectViewers) await import("./viewers.js?v=20261013-ux2");
+  if (!window.CoreInspectI18n) await import("./i18n.js?v=20261014-ux3");
+  if (!window.CoreInspectViewers) await import("./viewers.js?v=20261014-ux3");
   const i18n = window.CoreInspectI18n, t = i18n.t, viewers = window.CoreInspectViewers;
   const $ = (selector) => document.querySelector(selector);
   const state = {
@@ -12,10 +12,10 @@
     storage: null, revision: null, tab: "flow", selection: null, collapsed: new Set(),
     zoom: 1, timelineZoom: 1, dataModes: new Map(), jsonOpen: new Map(), eventSearch: "", generation: 0, busy: false, traceBusy: false, runsBusy: false,
     runLimit: 200, runTotal: 0, runQuery: "", runQueryRevision: 0, instances: [], eventsMore: false, eventsBusy: false,
-    lastDetailFetch: 0, connected: false, artifactRequest: 0, artifactContent: null,
+    lastDetailFetch: 0, connected: false, artifactRequest: 0, artifactContent: null, connectTimer: null, connectAttempts: 0, eventIndex: [],
   };
   const colors = { agent: "#7950d1", llm: "#147da2", tool: "#bd7b16", retrieval: "#169478", task: "#657b9e", operation: "#657b9e", run: "#4163e8" };
-  const labels = { INITIALIZED: "Khởi tạo", PROFILING: "Chuẩn bị", READY: "Sẵn sàng", STAGE_ACTIVE: "Đang chạy", STAGE_TRANSITIONING: "Chuyển giai đoạn", DIALOGUE_COMPLETED: "Kết thúc hội thoại", ASSESSING: "Đánh giá", REPORT_READY: "Hoàn tất", FAILED: "Lỗi", ASSESSMENT_FAILED: "Lỗi đánh giá", CANCELLED: "Đã hủy", EXPIRED: "Hết hạn", ARCHIVED: "Đã lưu", running: "Đang chạy", completed: "Hoàn tất", failed: "Lỗi", cancelled: "Đã hủy", abandoned: "Gián đoạn", timeout: "Timeout", queued: "Chờ chạy", degraded: "Suy giảm" };
+  const labels = { INITIALIZED: "Khởi tạo", PROFILING: "Chuẩn bị", READY: "Sẵn sàng", STAGE_ACTIVE: "Đang chạy", STAGE_TRANSITIONING: "Chuyển giai đoạn", DIALOGUE_COMPLETED: "Kết thúc hội thoại", ASSESSING: "Đánh giá", ENDING: "Đang kết thúc", REPORT_READY: "Hoàn tất", FAILED: "Lỗi", ASSESSMENT_FAILED: "Lỗi đánh giá", CANCELLED: "Đã hủy", EXPIRED: "Hết hạn", ARCHIVED: "Đã lưu", running: "Đang chạy", completed: "Hoàn tất", failed: "Lỗi", cancelled: "Đã hủy", abandoned: "Gián đoạn", timeout: "Timeout", queued: "Chờ chạy", degraded: "Suy giảm" };
   const complete = new Set(["REPORT_READY", "ARCHIVED", "completed"]);
   const failed = new Set(["FAILED", "ASSESSMENT_FAILED", "failed", "timeout", "abandoned", "degraded"]);
   const inactive = new Set(["CANCELLED", "EXPIRED", "cancelled"]);
@@ -146,15 +146,18 @@
     } catch (error) {
       if (generation !== state.generation) return;
       connection(false, t("Không đọc được core"));
+      if (!state.connectTimer) { const delay = Math.min(30000, 2000 * 2 ** state.connectAttempts); state.connectAttempts += 1; state.connectTimer = setTimeout(connect, delay); }
       if (!state.runs.length) replace($("#run-list"), `<p class="error-message">${esc(error.message)}</p>`);
     } finally { state.runsBusy = false; if (queryRevision !== state.runQueryRevision && generation === state.generation) refreshRuns(); }
   }
+  const eventKey = (event) => String(event.event_id ?? event.id ?? `seq:${event.sequence}`);
+  function indexEvents() { state.eventIndex = (state.detail?.events || []).map((event) => [event, JSON.stringify(event).toLowerCase()]); }
   function ingestDetail(detail) {
     const oldEvents = state.detail?.events || [];
     const all = new Map([...oldEvents, ...(detail.events || [])].map((event) => [event.event_id || event.id || event.sequence, event]));
     detail.events = Array.from(all.values()).sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0));
     state.eventsMore = typeof detail.summary?.event_count === "number" ? detail.summary.event_count > detail.events.length : Boolean(detail.events_truncated);
-    state.detail = detail;
+    state.detail = detail; indexEvents();
     state.instances = detail.trace?.instances || [];
     state.spans = Array.isArray(detail.spans) ? detail.spans : state.spans;
     state.coverage = detail.trace?.coverage || (state.spans.length ? "legacy_partial" : "not_recorded");
@@ -186,6 +189,7 @@
     const session = detail.session || {}, row = state.runs.find((run) => run.session_id === state.selected) || {};
     const form = session.form_input || session.input || {}, status = session.lifecycle_status || session.status || row.status;
     $("#run-title").textContent = session.candidate_name || form.candidate_name || row.candidate_name || state.selected;
+    document.title = `${$("#run-title").textContent} · Core Studio`;
     $("#run-role").textContent = session.target_role || form.target_role || row.target_role || t("Vai trò chưa ghi");
     $("#run-status").className = `badge ${statusClass(status)}`; $("#run-status").textContent = statusLabel(status);
     $("#run-created").textContent = date(session.created_at || row.created_at);
@@ -281,10 +285,11 @@
     }
   }
   function renderEvents() {
-    const events = (state.detail?.events || []).map((event, index) => ({ event, index })).filter(({ event }) => event.type !== "reasoning_summary").filter(({ event }) => JSON.stringify(event).toLowerCase().includes(state.eventSearch.toLowerCase()));
+    const query = state.eventSearch.toLowerCase();
+    const events = state.eventIndex.filter(([event, text]) => event.type !== "reasoning_summary" && text.includes(query)).map(([event]) => ({ event, key: eventKey(event) }));
     $("#event-visible").textContent = `${events.length} / ${state.detail.events?.length || 0} ${t("đã tải")}`;
     $("#load-events").classList.toggle("hidden", !state.eventsMore); $("#load-events").disabled = state.eventsBusy;
-    replace($("#event-list"), events.length ? events.map(({ event, index }) => `<button class="event-item ${state.selection?.type === "event" && state.selection.id === index ? "selected" : ""}" data-event="${index}"><span class="event-seq">${esc(event.sequence ?? event.seq ?? "—")}</span><div class="event-main"><b>${esc(event.type || event.name || "Event")}</b><small>${esc(short(stringify(event.payload ?? event.data ?? event), 190))}</small></div><time class="event-time">${esc(date(event.timestamp || event.created_at))}</time></button>`).join("") : `<p class="empty-small">${esc(t("Không có event khớp bộ lọc."))}</p>`);
+    replace($("#event-list"), events.length ? events.map(({ event, key }) => `<button class="event-item ${state.selection?.type === "event" && state.selection.id === key ? "selected" : ""}" data-event="${esc(key)}"><span class="event-seq">${esc(event.sequence ?? event.seq ?? "—")}</span><div class="event-main"><b>${esc(event.type || event.name || "Event")}</b><small>${esc(short(stringify(event.payload ?? event.data ?? event), 190))}</small></div><time class="event-time">${esc(date(event.timestamp || event.created_at))}</time></button>`).join("") : `<p class="empty-small">${esc(t("Không có event khớp bộ lọc."))}</p>`);
   }
   function structuredView(value, key, format = "json") {
     const mode = state.dataModes.get(key) || "read", source = stringify(value) ?? "";
@@ -308,7 +313,7 @@
       const scopeLabels = { application: t("Application · dùng chung toàn tiến trình"), session: t("Session · tồn tại trong phiên"), delegated_call: t("Delegated call · được tạo cho lời gọi") };
       replace($("#detail-panel"), `<div class="detail-head" style="border-top-color:${colors[span.kind] || colors.task}"><div class="detail-kicker"><span style="color:${colors[span.kind] || colors.task}">${esc((span.kind || "span").toUpperCase())}</span><span class="badge ${statusClass(span.status)}">${esc(statusLabel(span.status))}</span></div><h3>${esc(span.name || span.agent || "Span")}</h3><div class="detail-id">${esc(span.span_id)}</div></div><section class="detail-section"><h4>${esc(t("Call lifecycle"))}</h4>${facts([[t("Agent"), span.agent], [t("Instance ID"), span.instance_id], [t("Lifetime scope"), scopeLabels[span.lifetime_scope] || span.lifetime_scope], [t("Parent"), parent?.name || (span.parent_span_id ? `${t("Parent chưa tải")}: ${span.parent_span_id}` : t("Root · không có parent"))], [t("Scheduled"), date(span.scheduled_at, true)], [t("Started"), date(span.started_at, true)], [t("Ended"), date(span.ended_at, true)], [t("Duration"), elapsed(span)], [t("Queue time"), queueTime], [t("Sequence"), span.sequence]])}</section>${instance ? `<section class="detail-section"><h4>${esc(t("Agent instance · observation & release"))}</h4>${facts([[t("Registry status"), instance.status], [t("Observed"), date(instance.observed_at, true)], [t("Released"), instance.end_time_known === false ? t("Không biết thời điểm · process restart") : date(instance.ended_at, true)], [t("Release reason"), instance.end_reason], [t("Scope"), scopeLabels[instance.lifetime_scope] || instance.lifetime_scope], [t("Process ID"), instance.process_id]])}<p class="data-missing">${esc(t("Observed là thời điểm runtime ghi nhận instance. Released là lúc registry trả instance; không phải thời điểm constructor hay destructor."))}</p></section>` : ""}${span.error ? dataSection(t("Error"), span.error, "error") : ""}${dataSection(t("Input"), span.inputs)}${dataSection(t("Output"), span.outputs)}${dataSection(t("Attributes"), span.attributes)}<section class="detail-section"><p class="data-missing">${esc(t("Timing lấy từ timestamp của backend. Ký hiệu ↻ là thời gian đang chạy tính từ started_at đã ghi. Task chỉ có scheduled_at đang chờ chạy; UI không tạo started_at."))}</p></section>`);
     } else if (selection.type === "event") {
-      const event = state.detail?.events?.[selection.id]; if (!event) return;
+      const event = state.detail?.events?.find((item) => eventKey(item) === selection.id); if (!event) return;
       replace($("#detail-panel"), `<div class="detail-head"><div class="detail-kicker">${esc(t("EVENT"))}</div><h3>${esc(event.type || "Event")}</h3><div class="detail-id">${esc(event.id || event.event_id || "")}</div></div><section class="detail-section">${facts([[t("Sequence"), event.sequence ?? event.seq], [t("Timestamp"), date(event.timestamp || event.created_at, true)]])}</section>${dataSection(t("Event payload"), event)}`);
     } else if (selection.type === "artifact") {
       const artifact = state.detail.artifacts?.find((item) => item.path === selection.id);
@@ -326,7 +331,7 @@
       if (!state.selection && state.spans.length) state.selection = { type: "span", id: state.spans.find((span) => !span.parent_span_id)?.span_id || state.spans[0].span_id };
       if (result.events) {
         const merged = new Map([...(state.detail.events || []), ...result.events].map((event) => [event.event_id || event.id || event.sequence, event]));
-        state.detail.events = Array.from(merged.values()).sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0));
+        state.detail.events = Array.from(merged.values()).sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0)); indexEvents();
       }
       renderHeading(); renderContent(); renderDetails(); polling(true, `${t("Đã đồng bộ")} ${new Date().toLocaleTimeString(i18n.dateLocale)}`);
       if (Date.now() - state.lastDetailFetch > 7000) {
@@ -340,6 +345,7 @@
     } finally { if (generation === state.generation) state.traceBusy = false; }
   }
   async function connect() {
+    clearTimeout(state.connectTimer); state.connectTimer = null;
     const generation = ++state.generation; state.config = null; state.connected = false; state.selected = null; state.detail = null; state.spans = []; state.selection = null; state.traceBusy = false; state.runs = []; state.runsBusy = false;
     $("#run-workspace").classList.add("hidden"); $("#empty-workspace").classList.remove("hidden");
     $("#connection").textContent = t("Đang kết nối core…"); $("#connection").className = "connection";
@@ -350,10 +356,14 @@
       $("#storage-label").textContent = `${t("Lưu trữ")}: ${config.storage || t("chưa xác định")}`;
       $("#provider-label").textContent = `${config.provider || t("Provider chưa cấu hình")}${config.provider_model ? ` · ${config.provider_model}` : ""}${config.real_provider === false ? ` · ${t("không phải provider thật")}` : ""}`;
       connection(true, state.base === location.origin ? t("Core cùng địa chỉ") : new URL(state.base).host);
+      state.connectAttempts = 0;
       await refreshRuns();
     } catch (error) {
       if (generation !== state.generation) return;
       connection(false, t("Không kết nối được")); replace($("#run-list"), `<p class="error-message">${esc(error.message)}</p><p class="empty-small">${esc(t("Mở cài đặt nâng cao nếu backend yêu cầu service token."))}</p>`);
+      // Keep retrying with backoff so a restarted core is picked up without a manual reload.
+      const delay = Math.min(30000, 2000 * 2 ** state.connectAttempts); state.connectAttempts += 1;
+      state.connectTimer = setTimeout(connect, delay);
     }
   }
   $("#run-list").addEventListener("click", (event) => { const button = event.target.closest("[data-run]"); if (button) selectRun(button.dataset.run); });
@@ -377,7 +387,7 @@
         const result = await request(`/api/v1/inspect/runs/${encodeURIComponent(id)}/events?after_sequence=${after}&limit=1000`);
         if (generation !== state.generation) return;
         const merged = new Map([...(state.detail.events || []), ...(result.events || [])].map((item) => [item.event_id || item.id || item.sequence, item]));
-        state.detail.events = Array.from(merged.values()).sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0)); state.eventsMore = result.has_more;
+        state.detail.events = Array.from(merged.values()).sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0)); indexEvents(); state.eventsMore = result.has_more;
         renderEvents();
       } catch (error) { if (generation === state.generation) toast(`${t("Không tải được events")}: ${error.message}`); }
       finally { state.eventsBusy = false; if (state.tab === "events" && $("#event-list")) renderEvents(); }
@@ -387,7 +397,7 @@
     if (collapse) { state.collapsed.has(collapse.dataset.collapse) ? state.collapsed.delete(collapse.dataset.collapse) : state.collapsed.add(collapse.dataset.collapse); renderContent(); return; }
     const span = event.target.closest("[data-span]"), item = event.target.closest("[data-event]"), artifact = event.target.closest("[data-artifact]");
     if (span) state.selection = { type: "span", id: span.dataset.span };
-    else if (item) state.selection = { type: "event", id: Number(item.dataset.event) };
+    else if (item) state.selection = { type: "event", id: item.dataset.event };
     else if (artifact) {
       state.selection = { type: "artifact", id: artifact.dataset.artifact }; state.artifactContent = null;
       const id = state.selected, path = artifact.dataset.artifact, generation = state.generation, requestId = ++state.artifactRequest;
@@ -462,12 +472,32 @@
     if (token) sessionStorage.setItem("core-studio-token", token); else sessionStorage.removeItem("core-studio-token");
     $("#settings-dialog").close(); connect();
   }
-  $("#settings-form").addEventListener("submit", (event) => { event.preventDefault(); const base = $("#base-url").value.trim(); const parsed = new URL(base); if (!["http:", "https:"].includes(parsed.protocol)) return toast(t("Backend phải dùng http hoặc https")); saveSettings(base, $("#service-token").value.trim()); });
+  $("#settings-form").addEventListener("submit", (event) => { event.preventDefault(); const base = $("#base-url").value.trim(); let parsed; try { parsed = new URL(base); } catch { return toast(t("Backend phải dùng http hoặc https")); } if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) return toast(t("Backend phải dùng http hoặc https")); saveSettings(base, $("#service-token").value.trim()); });
   $("#use-local").addEventListener("click", () => saveSettings(location.origin, ""));
   window.addEventListener("storage", (event) => {
     if (event.key === "core-studio-locale") setLocale(event.newValue);
     if (event.key === "core-studio-base-url" && event.newValue && event.newValue !== state.base) { state.base = event.newValue; state.token = sessionStorage.getItem("core-studio-token") || ""; connect(); }
   });
+  $("#export-run").addEventListener("click", async () => {
+    const id = state.selected; if (!id) return;
+    try {
+      const data = await request(`/api/v1/inspect/runs/${encodeURIComponent(id)}/export`);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+      const link = document.createElement("a"); link.href = url; link.download = `run_${id}.json`;
+      document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { toast(`${t("Không xuất được run")}: ${error.message}`); }
+  });
+  // Arrow keys move the selection through the visible flow/waterfall rows.
+  $("#content-pane").addEventListener("keydown", (event) => {
+    if (!["ArrowDown", "ArrowUp"].includes(event.key) || !["flow", "waterfall"].includes(state.tab) || event.target.matches("input, textarea, select")) return;
+    const { rows } = hierarchy(); if (!rows.length) return;
+    const current = rows.findIndex(({ span }) => state.selection?.type === "span" && state.selection.id === span.span_id);
+    const next = rows[Math.max(0, Math.min(rows.length - 1, current + (event.key === "ArrowDown" ? 1 : -1)))];
+    event.preventDefault(); state.selection = { type: "span", id: next.span.span_id }; renderContent(); renderDetails();
+    const node = Array.from($("#content-pane").querySelectorAll("[data-span]")).find((el) => el.dataset.span === next.span.span_id);
+    node?.focus({ preventScroll: true }); node?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) pollTrace(); });
   setInterval(pollTrace, 1800); setInterval(() => { if (!document.hidden && state.connected) refreshRuns(); }, 7000);
   connect();
 })();

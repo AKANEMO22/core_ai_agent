@@ -85,6 +85,16 @@ class Settings(BaseSettings):
         ge=1024 * 1024,
         description="Maximum expanded workspace bytes accepted during archive restore",
     )
+    DATABASE_URL: str = Field(
+        default="",
+        repr=False,
+        description=(
+            "postgresql:// URL for the archive catalog and inspector trace store; empty keeps the "
+            "SQLite files. Contains credentials: never log it (use core.storage.database.redact_database_url)"
+        ),
+    )
+    DATABASE_POOL_MIN_SIZE: int = Field(default=1, ge=0, le=100, description="Minimum pooled connections per store")
+    DATABASE_POOL_MAX_SIZE: int = Field(default=10, ge=1, le=200, description="Maximum pooled connections per store")
     OBJECT_STORE_ENDPOINT: str = Field(default="")
     OBJECT_STORE_ACCESS_KEY: str = Field(default="")
     OBJECT_STORE_SECRET_KEY: str = Field(default="")
@@ -372,6 +382,8 @@ def validate_settings(settings: Settings) -> List[str]:
         errors.append("PRODUCT_MODE must be 'practice' or 'hiring_assist'")
     if not settings.REDIS_URL:
         errors.append("REDIS_URL is required")
+    if settings.DATABASE_URL and not settings.DATABASE_URL.split(":", 1)[0].lower().startswith("postgres"):
+        errors.append("DATABASE_URL must be a postgresql:// URL when set")
     if settings.ARTIFACT_ARCHIVE_ENABLED:
         errors.append(
             "ARTIFACT_ARCHIVE_ENABLED is not available in production until durable user identity and owner authorization are configured"

@@ -116,7 +116,7 @@ class AssessorWorkerPool:
                     self._in_flight += 1
                     try:
                         # Worker chịu trách nhiệm ACK/retry và artifact; pool chỉ quản lý vòng đọc cùng bộ đếm.
-                        await self.worker._process_job_data(self.group_name, message_id, job_data)
+                        await self.worker._process_job_data(self.group_name, message_id, job_data, consumer_name=consumer)
                         self._processed += 1
                     finally:
                         self._in_flight -= 1

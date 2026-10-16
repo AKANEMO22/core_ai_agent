@@ -139,6 +139,22 @@ async def test_narrative_removes_unverifiable_citations_and_falls_back():
     assert fallback["source"] == "template" and "PASS" in fallback["summary"]
 
 
+def test_pass_requires_minimum_rubric_coverage():
+    rubric = {
+        "pass_threshold": 3.0,
+        "competencies": [
+            {"competency_id": "a", "weight": 0.2, "must_have": False, "pass_level": 3},
+            {"competency_id": "b", "weight": 0.4, "must_have": False, "pass_level": 3},
+            {"competency_id": "c", "weight": 0.4, "must_have": False, "pass_level": 3},
+        ],
+    }
+    thin = compute_decision(rubric, [_eval("t1", {"a": 4, "b": None, "c": None})], DecisionConfig())
+    assert thin["verdict"] == NEEDS_REVIEW
+    assert any("insufficient coverage" in r for r in thin["verdict_reasons"])
+    broad = compute_decision(rubric, [_eval("t1", {"a": 4, "b": 4, "c": None})], DecisionConfig())
+    assert broad["verdict"] == PASS
+
+
 def _run_interview(tmp_path: Path, product_mode: str, level: int) -> Any:
     settings = get_settings().model_copy(update={
         "RETRIEVAL_BACKEND": "mock",
@@ -186,11 +202,11 @@ def test_report_api_exposes_verdict_decision_and_review(tmp_path: Path, product_
         body = res.json()
         assert res.status_code == 200, body
         assert body["verdict"] == verdict and body["decision"]["verdict"] == verdict, body["decision"]
-        assert "Verdict" in body["report_markdown"]
+        assert "Kết luận" in body["report_markdown"]  # default interview language: vi
         if product_mode == "hiring_assist":
-            assert "support, not replace" in body["final_assessment"]["disclaimer"]
+            assert "hỗ trợ chứ không thay thế" in body["final_assessment"]["disclaimer"]
         else:
-            assert "coaching feedback" in body["final_assessment"]["disclaimer"]
+            assert "góp ý do AI tạo ra" in body["final_assessment"]["disclaimer"]
 
         ws_dir = app.state.workspace_mgr.get_or_create_workspace(sid)
         raw = ws_dir.read_text("reports/decision.json")

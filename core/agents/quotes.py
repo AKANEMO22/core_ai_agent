@@ -41,16 +41,18 @@ def verify_quote(quote: str, source: str, min_words: int = 3) -> bool:
     segments = [s for s in segments if s]
     if sum(len(s.split()) for s in segments) < min_words:
         return False
-    haystack = _strip_fillers(normalize_for_match(source))
+    # Pad with spaces so every match must start and end on a word boundary: "use redis cache"
+    # must not match inside "abuse redis caches".
+    haystack = " " + _strip_fillers(normalize_for_match(source)) + " "
     if len(segments) == 1:
-        return segments[0] in haystack
+        return f" {segments[0]} " in haystack
     # Di chuyển vị trí tìm kiếm về phía trước để không đảo thứ tự các mảnh trích dẫn.
     position = 0
     for segment in segments:
         if len(segment.split()) < 2:
             return False
-        found = haystack.find(segment, position)
+        found = haystack.find(f" {segment} ", position)
         if found < 0:
             return False
-        position = found + len(segment)
+        position = found + len(segment) + 1
     return True

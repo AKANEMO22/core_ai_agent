@@ -70,6 +70,29 @@ uv run uvicorn api.main:build_default_app --factory --reload
 APP_ENV=production uv run uvicorn api.main:build_default_app --factory --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
+### Durable storage: SQLite (default) or PostgreSQL
+
+The artifact archive catalog and the inspector trace store are SQLite files by default
+(`ARTIFACT_ARCHIVE_CATALOG_PATH`, `<WORKSPACE_ROOT_BASE>/.inspect/traces.sqlite3`). Set
+`DATABASE_URL=postgresql://user:password@host:5432/db` to keep both in PostgreSQL instead
+(schemas `artifact_archive` and `inspect_trace`, created idempotently at startup and versioned in
+each schema's `schema_version` table). Pool size: `DATABASE_POOL_MIN_SIZE` / `DATABASE_POOL_MAX_SIZE`
+(per store). URL-encode special characters in the password; the URL is never logged. The RAG
+index/cache stays in SQLite (it is derived, per-container data). Copy existing SQLite rows once
+with the API stopped (idempotent, `ON CONFLICT DO NOTHING`):
+
+```bash
+DATABASE_URL=postgresql://... uv run python scripts/migrate_sqlite_to_postgres.py   --catalog data/archive/catalog.sqlite3 --traces data/workspaces/.inspect/traces.sqlite3
+```
+
+PostgreSQL store tests run only when `TEST_DATABASE_URL` is set:
+
+```bash
+docker run -d --rm --name dpl-pg-test -e POSTGRES_PASSWORD=test -p 127.0.0.1:55432:5432 postgres:17-alpine
+TEST_DATABASE_URL=postgresql://postgres:test@127.0.0.1:55432/postgres uv run pytest tests/integration/test_postgres_stores.py
+docker stop dpl-pg-test
+```
+
 ## Core Studio: FE-test and FE-inspect
 
 Two separate frontends share the core API and persisted workspaces:
@@ -79,12 +102,25 @@ Two separate frontends share the core API and persisted workspaces:
 - `FE-inspect/` at `/inspect/` is read-only: recorded agent call tree/flow, waterfall, input,
   output, usage, errors, events, artifacts and observed agent instance lifetimes.
 
+FE-test provides **Kết thúc và tạo báo cáo** for ending a session early. It calls
+`POST /api/v1/sessions/{session_id}/end` with the existing session or service bearer token.
+The core stops session work, rejects further turns, and starts final summary/report generation
+from saved evidence without waiting for unfinished assessments. The early-end report records
+incomplete evidence and uses `NEEDS_REVIEW`; it does not score answers that were never evaluated.
+The FE opens the saved report when it becomes ready. The separate **Hủy phiên** action cancels
+the session without requesting a report.
+
 ```bash
 docker compose up --build -d
 # Test:    http://127.0.0.1:8001/test/
 # Inspect: http://127.0.0.1:8001/inspect/
 # Redis UI: http://127.0.0.1:5540/
 ```
+
+Compose also runs `postgres` (postgres:17-alpine, `postgres_data` volume, bound to
+`127.0.0.1:${DPL_POSTGRES_PORT:-5432}`) and points the app's `DATABASE_URL` at it, so the archive
+catalog and inspector traces live there. Override `POSTGRES_USER`, `POSTGRES_PASSWORD` and
+`POSTGRES_DB` in `.env`; the defaults are local development credentials only.
 
 Redis Insight is preconfigured with the `dpl-pvan` connection to `redis:6379`, database 0.
 On first use, complete Redis Insight's welcome/terms screen to enable connection discovery.

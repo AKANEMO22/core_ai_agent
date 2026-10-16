@@ -68,6 +68,7 @@ class SpeakerContextBuilder:
         self._profile: Optional[Dict[str, Any]] = None
         self._company_recon: Optional[Dict[str, Any]] = None
         self._company_intel: Optional[Dict[str, Any]] = None
+        self._evidence: Optional[Dict[str, Dict[str, Any]]] = None
 
     def _read(self, rel: str) -> Dict[str, Any]:
         try:
@@ -166,6 +167,10 @@ class SpeakerContextBuilder:
         if candidates:
             frame.append("- Retrieved evidence-grounded question candidates (ask one at a time and adapt):")
             frame.extend(f"  {index}. {question}" for index, question in enumerate(candidates, 1))
+        evidence_lines = self._evidence_lines(stage)
+        if evidence_lines:
+            frame.append("- Submitted claims behind the CV/JD probes (unverified; ask about them, never state them as confirmed):")
+            frame.extend(evidence_lines)
         if stage.get("stage_id") == "candidate_questions":
             frame.extend([
                 "- This is the final candidate-questions and closing stage.",
@@ -177,6 +182,41 @@ class SpeakerContextBuilder:
             frame.append("- Competencies to gather evidence for: " + ", ".join(str(label) for label in labels))
         sections.append("\n".join(frame))
         return "\n\n".join(sections), (playbook.ref if playbook else None)
+
+    def _evidence_lines(self, stage: Dict[str, Any]) -> List[str]:
+        """Facts behind the selected CV/JD probes (this stage first), labelled as unverified claims."""
+        if self._evidence is None:
+            plan = self._read("context/stage_plan.json").get("evidence_plan") or {}
+            records = {
+                str(record.get("evidence_id")): record
+                for record in plan.get("evidence") or []
+                if isinstance(record, dict) and record.get("evidence_id")
+            }
+            self._evidence = {"records": records, "selected": [
+                str(evidence_id)
+                for probe in plan.get("selected_probes") or [] if isinstance(probe, dict)
+                for evidence_id in probe.get("evidence_ids") or []
+            ]}
+        current = [
+            str(evidence_id)
+            for item in stage.get("question_candidates") or [] if isinstance(item, dict)
+            for evidence_id in item.get("evidence_ids") or []
+        ]
+        lines: List[str] = []
+        for evidence_id in dict.fromkeys(current + self._evidence["selected"]):
+            record = self._evidence["records"].get(evidence_id)
+            if record is None:
+                continue
+            facts = record.get("facts")
+            if isinstance(facts, dict):
+                details = "; ".join(
+                    f"{key}: {', '.join(str(v) for v in value) if isinstance(value, list) else value}"
+                    for key, value in facts.items()
+                )
+            else:
+                details = str(facts)
+            lines.append(f"  - [{record.get('source_status', 'unverified')}] {record.get('section', '')}: {details[:400]}")
+        return lines[:12]
 
     def _summary(self) -> Dict[str, Any]:
         return self._read(SUMMARY_PATH)

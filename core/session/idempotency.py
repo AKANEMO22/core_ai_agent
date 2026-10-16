@@ -516,6 +516,22 @@ class RedisLease:
         acquired = await self.redis.set(key, token, nx=True, px=ttl_ms)
         return token if acquired else None
 
+    async def renew(self, key: str, token: str, ttl_ms: int) -> bool:
+        async with self.redis.pipeline(transaction=True) as pipe:
+            try:
+                await pipe.watch(key)
+                owner = await pipe.get(key)
+                if isinstance(owner, bytes):
+                    owner = owner.decode()
+                if owner != token:
+                    return False
+                pipe.multi()
+                pipe.pexpire(key, ttl_ms)
+                await pipe.execute()
+                return True
+            except WatchError:
+                return False
+
     async def release(self, key: str, token: str) -> bool:
         """Release the lease only if it is still held with this token."""
         async with self.redis.pipeline(transaction=True) as pipe:

@@ -7,7 +7,7 @@ Registry chỉ giữ trạng thái RAM, không truyền tín hiệu hủy giữa
 """
 
 import asyncio
-from typing import Dict, Optional, Set
+from typing import Any, Awaitable, Dict, Optional, Set
 
 
 class CancellationRegistry:
@@ -61,6 +61,28 @@ class CancellationRegistry:
         bucket = self._tasks.setdefault(session_id, set())
         bucket.add(task)
         task.add_done_callback(lambda t: bucket.discard(t))
+        if self.is_session_cancelled(session_id):
+            task.cancel()
+
+    async def run(self, session_id: str, coro: Awaitable[Any], redis: Any) -> Any:
+        """Track a child operation and observe the durable stop fence across processes."""
+        task = asyncio.create_task(coro)
+        self.register_task(session_id, task)
+        try:
+            while not task.done():
+                if await redis.exists(f"session:{session_id}:work_stopped", f"session:{session_id}:revoked"):
+                    self.cancel_session(session_id)
+                    break
+                await asyncio.wait({task}, timeout=0.05)
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            # A fence seen here marks the session in this process; drop the marker once nothing
+            # is left running, because the durable fence (not RAM) keeps refusing new work.
+            if self.is_session_cancelled(session_id):
+                self.release_if_idle(session_id)
 
     def cancel_session(self, session_id: str) -> int:
         """Cancel the generation and all tracked tasks; refuse new work. Returns tasks cancelled."""
@@ -85,6 +107,16 @@ class CancellationRegistry:
     def is_session_cancelled(self, session_id: str) -> bool:
         """True after cancel_session."""
         return session_id in self._cancelled_sessions
+
+    def release_if_idle(self, session_id: str) -> bool:
+        """Forget a session once no tracked task or generation token is still live."""
+        if any(not task.done() for task in self._tasks.get(session_id, set())):
+            return False
+        token = self._tokens.get(session_id)
+        if token is not None and not token.is_set():
+            return False
+        self.forget(session_id)
+        return True
 
     def forget(self, session_id: str) -> None:
         """Drop all state for a session (after deletion or terminal completion)."""

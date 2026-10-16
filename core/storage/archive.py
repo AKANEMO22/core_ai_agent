@@ -13,13 +13,45 @@ import tempfile
 import threading
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from core.storage.artifacts import ObjectStore
 
+if TYPE_CHECKING:
+    from core.storage.database import Database
+
 logger = logging.getLogger(__name__)
+
+#: Postgres catalog schema, versioned by core.storage.database.Database.ensure_schema.
+POSTGRES_MIGRATIONS: dict[int, list[str]] = {
+    1: [
+        """CREATE TABLE IF NOT EXISTS archive_sessions (
+               session_id TEXT PRIMARY KEY,
+               owner_id TEXT NOT NULL,
+               state TEXT NOT NULL,
+               current_revision BIGINT,
+               updated_at DOUBLE PRECISION NOT NULL,
+               error TEXT,
+               metadata_json TEXT NOT NULL DEFAULT '{}'
+           )""",
+        """CREATE TABLE IF NOT EXISTS archive_revisions (
+               session_id TEXT NOT NULL REFERENCES archive_sessions(session_id),
+               revision BIGINT NOT NULL,
+               object_key TEXT NOT NULL UNIQUE,
+               sha256 TEXT NOT NULL,
+               size_bytes BIGINT NOT NULL,
+               version_id TEXT,
+               status TEXT NOT NULL,
+               archived_at DOUBLE PRECISION,
+               error TEXT,
+               PRIMARY KEY (session_id, revision)
+           )""",
+        "CREATE INDEX IF NOT EXISTS archive_sessions_state_updated ON archive_sessions(state, updated_at DESC)",
+    ],
+}
 
 
 class ArchiveError(RuntimeError):
@@ -49,15 +81,25 @@ class ArtifactArchive:
         *,
         object_store: ObjectStore,
         bucket: str,
-        catalog_path: str | Path,
+        catalog_path: str | Path | None = None,
         max_restore_bytes: int = 512 * 1024 * 1024,
+        database: "Database | None" = None,
     ) -> None:
+        """Use ``database`` (PostgreSQL) when given, else the SQLite file at ``catalog_path``."""
         self.object_store = object_store
         self.bucket = bucket
-        self.catalog_path = Path(catalog_path).resolve()
+        self.database = database
+        self.backend = "postgres" if database is not None else "sqlite"
         self.max_restore_bytes = max_restore_bytes
         self._locks_guard = threading.Lock()
         self._session_locks: dict[str, threading.Lock] = {}
+        if database is not None:
+            self.catalog_path = None
+            database.ensure_schema(POSTGRES_MIGRATIONS)
+            return
+        if catalog_path is None:
+            raise ValueError("catalog_path is required without a PostgreSQL database")
+        self.catalog_path = Path(catalog_path).resolve()
         self.catalog_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_catalog()
 
@@ -74,6 +116,23 @@ class ArtifactArchive:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA synchronous=FULL")
         return connection
+
+    @contextmanager
+    def _transaction(self, session_id: str | None = None) -> Iterator[Any]:
+        """One catalog transaction.
+
+        SQLite serializes writers on the database file. On PostgreSQL a per-session
+        advisory lock gives the same read-compute-write atomicity (e.g. allocating the
+        next revision) across processes; it is released at commit/rollback.
+        """
+        if self.database is None:
+            with self._connect() as connection:
+                yield connection
+            return
+        with self.database.connection() as connection:
+            if session_id is not None:
+                connection.lock(f"archive:{session_id}")
+            yield connection
 
     def _initialize_catalog(self) -> None:
         with self._connect() as connection:
@@ -120,8 +179,8 @@ class ArtifactArchive:
     def _session_digest(session_id: str) -> str:
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
-    def _current(self, session_id: str) -> sqlite3.Row | None:
-        with self._connect() as connection:
+    def _current(self, session_id: str) -> Any | None:
+        with self._transaction() as connection:
             return connection.execute(
                 """SELECT s.owner_id, s.state, s.current_revision, r.object_key, r.sha256,
                           r.size_bytes, r.status
@@ -150,7 +209,7 @@ class ArtifactArchive:
         return bool(row and row["state"] != "deleted")
 
     def list_archived_sessions(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             rows = connection.execute(
                 """SELECT session_id, owner_id, updated_at, metadata_json FROM archive_sessions
                    WHERE state IN ('archived', 'stale') ORDER BY updated_at DESC"""
@@ -230,14 +289,14 @@ class ArtifactArchive:
                         and existing["size_bytes"] == size_bytes
                     ):
                         if existing["state"] == "stale":
-                            with self._connect() as connection:
+                            with self._transaction(session_id) as connection:
                                 connection.execute(
                                     "UPDATE archive_sessions SET state='archived', updated_at=?, error=NULL WHERE session_id=?",
                                     (time.time(), session_id),
                                 )
                         return self.status(session_id) or {"state": "archived"}
 
-                with self._connect() as connection:
+                with self._transaction(session_id) as connection:
                     row = connection.execute(
                         "SELECT owner_id, state, current_revision FROM archive_sessions WHERE session_id=?",
                         (session_id,),
@@ -277,7 +336,7 @@ class ArtifactArchive:
                     self._mark_failed(session_id, revision, str(exc))
                     raise ArchiveError("Workspace archive upload failed") from exc
                 now = time.time()
-                with self._connect() as connection:
+                with self._transaction(session_id) as connection:
                     connection.execute(
                         "UPDATE archive_revisions SET status='archived', archived_at=?, version_id=?, error=NULL WHERE session_id=? AND revision=?",
                         (now, stored.version_id, session_id, revision),
@@ -308,7 +367,7 @@ class ArtifactArchive:
 
     def _mark_failed(self, session_id: str, revision: int, error: str) -> None:
         clean_error = error[:500]
-        with self._connect() as connection:
+        with self._transaction(session_id) as connection:
             connection.execute(
                 "UPDATE archive_revisions SET status='failed', error=? WHERE session_id=? AND revision=?",
                 (clean_error, session_id, revision),
@@ -416,7 +475,7 @@ class ArtifactArchive:
             self._delete_session_locked(session_id, owner_id)
 
     def _delete_session_locked(self, session_id: str, owner_id: str) -> None:
-        with self._connect() as connection:
+        with self._transaction(session_id) as connection:
             row = connection.execute(
                 "SELECT owner_id, state FROM archive_sessions WHERE session_id=?", (session_id,)
             ).fetchone()
@@ -435,7 +494,7 @@ class ArtifactArchive:
                 )
         prefix = f"sessions/{self._session_digest(session_id)}/"
         self.object_store.delete_prefix(self.bucket, prefix)
-        with self._connect() as connection:
+        with self._transaction(session_id) as connection:
             connection.execute(
                 "UPDATE archive_revisions SET status='deleted' WHERE session_id=?", (session_id,)
             )

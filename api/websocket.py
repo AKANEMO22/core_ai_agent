@@ -12,7 +12,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from pydantic import ValidationError
 
 from api.auth import AuthError, verify_service_token, verify_session_token
-from api.schemas import CandidateAnswerMessage
+from api.schemas import CandidateAnswerMessage, StartInterviewMessage
 from core.observability import session_ref
 from core.runtime.agent import sanitize_secrets
 from core.runtime.types import LoopEvent, LoopEventType
@@ -441,7 +441,12 @@ async def websocket_session_stream(websocket: WebSocket, session_id: str) -> Non
                 if controller is None:
                     await lease.send_text(_control_frame(session_id, LoopEventType.ERROR, {"code": "RUNNER_UNAVAILABLE"}))
                     continue
-                _spawn(controller.start_interview(session_id))
+                try:
+                    start_msg = StartInterviewMessage.model_validate(payload)
+                except ValidationError:
+                    await lease.send_text(_control_frame(session_id, LoopEventType.ERROR, {"code": "INVALID_MESSAGE"}))
+                    continue
+                _spawn(controller.start_interview(session_id, confirm_limitations=start_msg.confirm_limitations))
             elif msg_type in ("candidate_answer", "turn_submit"):
                 if getattr(settings, "STUDIO_REQUIRE_REAL_PROVIDER", False) and (settings.INSPECTOR_ENABLED or settings.TEST_UI_ENABLED) and (
                     not app.state.studio_execution_allowed(session_id)

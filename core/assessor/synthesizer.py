@@ -7,13 +7,16 @@ trước khi chuyển REPORT_READY và phát event. ReviewService lưu ý kiến
 """
 
 import asyncio
+import html
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from core.agents.narrative import NarrativeWriter
+from core import report_language as report_i18n
 from core.assessor.decision import (
     NEEDS_REVIEW,
     DecisionConfig,
@@ -23,10 +26,14 @@ from core.assessor.decision import (
 )
 from core.assessor.queue import (
     completed_assessments_key,
+    enqueued_assessments_key,
     expected_assessments_key,
     failed_assessments_key,
 )
 from core.orchestration.coverage import load_evaluations
+from core.orchestration.directive import asked_question_ids
+from core.language import workspace_interview_language
+from core.profiler.evidence import evidence_coverage
 from core.observability import session_ref
 from core.runtime.agent import sanitize_secrets
 from core.runtime.client import RuntimeLLMClient
@@ -38,18 +45,26 @@ from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
 
 logger = logging.getLogger(__name__)
 
-DISCLAIMER_TEXT = (
-    "This report is AI-generated coaching feedback for practice and preparation purposes only. "
-    "It does not constitute an employment decision, hiring recommendation, qualification guarantee, "
-    "or formal assessment."
-)
-HIRING_ASSIST_DISCLAIMER = (
-    "This report is an AI-assisted assessment intended to support, not replace, a human hiring "
-    "decision. A qualified reviewer must confirm the outcome before it is used; it is not an "
-    "employment decision on its own."
-)
+DISCLAIMER_TEXT = report_i18n.DISCLAIMERS["en"]["practice"]
+HIRING_ASSIST_DISCLAIMER = report_i18n.DISCLAIMERS["en"]["hiring_assist"]
 DECISION_PATH = "reports/decision.json"
 REVIEW_PATH = "reports/review.json"
+
+
+def _members(values: Any) -> set:
+    return {v.decode() if isinstance(v, bytes) else str(v) for v in (values or ())}
+
+
+def _escape_transcript_for_prompt(text: str) -> str:
+    """Candidate speech is data: neutralize markup so it cannot close the <transcript> block."""
+    return html.escape(text, quote=False)
+
+
+def _markdown_literal_block(text: str) -> str:
+    """Render untrusted text as a fenced block no inner backtick run can terminate."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
 
 
 class AssessmentBarrierError(Exception):
@@ -115,13 +130,21 @@ class ReportSynthesizer:
     async def check_barrier(
         self, session_id: str, expected_assessments: Optional[int] = None
     ) -> Tuple[bool, int, int, int]:
-        """Barrier: completed >= expected and failed == 0, with expected known (0 allowed).
+        """Barrier: every enqueued job_id completed, failed == 0, with expected known (0 allowed).
+
+        Job IDs, not counts, are compared: a stray or stale completed ID cannot stand in for
+        an enqueued job that is still outstanding.
 
         Returns:
             Tuple[bool, int, int, int]: (is_ready, completed, failed, expected).
         """
-        completed_count = await self.redis_client.scard(completed_assessments_key(session_id))
-        failed_count = await self.redis_client.scard(failed_assessments_key(session_id))
+        enqueued_ids = _members(await self.redis_client.smembers(enqueued_assessments_key(session_id)))
+        completed_ids = _members(await self.redis_client.smembers(completed_assessments_key(session_id)))
+        failed_ids = _members(await self.redis_client.smembers(failed_assessments_key(session_id)))
+        failed_count = len(failed_ids)
+        outstanding = enqueued_ids - completed_ids - failed_ids
+        # Without an enqueued set (legacy bookkeeping) fall back to counting completions.
+        completed_count = len(completed_ids & enqueued_ids) if enqueued_ids else len(completed_ids)
 
         # expected chưa biết khác với 0: không được phát report chỉ vì chưa có counter.
         expected = expected_assessments
@@ -136,7 +159,13 @@ class ReportSynthesizer:
             elif state and "expected_assessment_count" in state.metadata:
                 expected = int(state.metadata["expected_assessment_count"])
 
-        is_ready = failed_count == 0 and expected is not None and expected >= 0 and completed_count >= expected
+        is_ready = (
+            failed_count == 0
+            and not outstanding
+            and expected is not None
+            and expected >= 0
+            and completed_count >= expected
+        )
         return is_ready, completed_count, failed_count, (expected or 0)
 
     def _versions(self, workspace: SessionWorkspace, rubric: Dict[str, Any], evaluations: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -172,7 +201,7 @@ class ReportSynthesizer:
             ],
         }
 
-    async def synthesize(self, session_id: str, expected_assessments: Optional[int] = None) -> Dict[str, Any]:
+    async def synthesize(self, session_id: str, expected_assessments: Optional[int] = None, *, early_end: bool = False) -> Dict[str, Any]:
         """Synthesize decision, assessment and report after verifying the barrier.
 
         Raises:
@@ -180,7 +209,7 @@ class ReportSynthesizer:
         """
         # Chờ đủ kết quả assessment trước khi tạo verdict để báo cáo không phản ánh trạng thái xử lý dở dang.
         is_ready, completed, failed, expected = await self.check_barrier(session_id, expected_assessments)
-        if not is_ready:
+        if not is_ready and not early_end:
             if failed > 0:
                 raise AssessmentBarrierError(
                     f"Assessment barrier blocked for session '{session_id}': {failed} evaluation(s) failed permanently."
@@ -190,6 +219,8 @@ class ReportSynthesizer:
             )
 
         ws = self._get_workspace(session_id)
+        # Báo cáo dùng ngôn ngữ phỏng vấn đã chọn khi tạo phiên, không theo locale giao diện.
+        language = workspace_interview_language(ws)
         evaluations = load_evaluations(ws)
         rubric = _payload(ws, "context/rubric.json")
         rubric_source = "retrieved"
@@ -198,6 +229,10 @@ class ReportSynthesizer:
 
         # Quyết định tính bằng code trước; narrative không được tự sửa verdict hay điểm.
         decision = compute_decision(rubric, evaluations, self.decision_config, self._versions(ws, rubric, evaluations))
+        if early_end:
+            decision["verdict"] = NEEDS_REVIEW
+            decision["requires_human_review"] = True
+            decision["verdict_reasons"].append("Session ended early; incomplete evidence requires human review")
         # Rubric dự phòng chỉ phục vụ tương thích; thiếu rubric truy xuất buộc người duyệt xác nhận.
         if rubric_source == "legacy" and decision["verdict"] != NEEDS_REVIEW:
             decision["verdict"] = NEEDS_REVIEW
@@ -209,15 +244,22 @@ class ReportSynthesizer:
             if path.name.endswith("_candidate.json"):
                 candidate_texts.append(str(ws.read_json(path.relative_to(ws.root_path).as_posix()).get("content", "")))
         notebook = ws.read_text("context/interview_notebook.md") if ws.exists("context/interview_notebook.md") else ""
+        if early_end:
+            notebook += "\n\nSession ended early. Saved candidate transcript below may be unassessed; summarize factual claims only, never infer completed evaluations:\n<transcript>\n" + _escape_transcript_for_prompt("\n".join(candidate_texts)[:40000]) + "\n</transcript>"
+            if ws.exists("turns/rolling_summary.json"):
+                notebook += "\nFinal dialogue summary: " + json.dumps(ws.read_json("turns/rolling_summary.json"), ensure_ascii=False)
         claims = _payload(ws, "orchestration/claims.json")
-        narrative = await self.narrative_writer.write(decision, evaluations, candidate_texts, notebook, claims)
+        narrative = await self.narrative_writer.write(
+            decision, evaluations, candidate_texts, notebook, claims, language=language
+        )
 
         mode = self.decision_config.product_mode
-        disclaimer = HIRING_ASSIST_DISCLAIMER if mode == "hiring_assist" else DISCLAIMER_TEXT
+        disclaimer = report_i18n.disclaimer(language, mode)
         content_scores = [e["content_score"] for e in evaluations if isinstance(e.get("content_score"), (int, float))]
         comm_scores = [e["communication_score"] for e in evaluations if isinstance(e.get("communication_score"), (int, float))]
         covered = [c for c in decision["criteria"] if c["covered"]]
         confidence = round(len(covered) / len(decision["criteria"]), 3) if decision["criteria"] else None
+        probe_coverage = evidence_coverage(_payload(ws, "context/stage_plan.json"), asked_question_ids(ws))
 
         final_assessment: Dict[str, Any] = {
             "schema_version": "2.0",
@@ -225,6 +267,7 @@ class ReportSynthesizer:
             "synthesized_at": time.time(),
             "disclaimer": disclaimer,
             "product_mode": mode,
+            "report_language": language,
             "verdict": decision["verdict"],
             "requires_human_review": decision["requires_human_review"],
             "metrics": {
@@ -236,16 +279,13 @@ class ReportSynthesizer:
                 "total_turns_evaluated": len(evaluations),
                 "criteria_coverage": confidence,
                 "confidence_score": confidence,
-                "limitations": [
-                    "Scores reflect evidence in this mock interview's transcript only.",
-                    "Transcripts come from speech recognition and may contain errors.",
-                    "Delivery metrics (pace, pauses) are descriptive and never scored.",
-                ],
+                "limitations": report_i18n.base_limitations(language),
             },
             "criteria": decision["criteria"],
             "uncovered_criteria": decision["uncovered_criteria"],
             "narrative": narrative,
             "claims": claims.get("claims", []),
+            "cv_jd_evidence_coverage": probe_coverage,
             "demonstrated_strengths": narrative.get("strengths", []),
             "improvement_areas": narrative.get("improvements", []),
             "recommended_curriculum": narrative.get("study_plan", []),
@@ -259,12 +299,34 @@ class ReportSynthesizer:
                 for e in evaluations
             ],
         }
-        report_markdown = self._render_markdown(decision, narrative, final_assessment, rubric, evaluations, claims)
+        if early_end:
+            final_assessment["early_ended"] = True
+            final_assessment["assessment_progress"] = {"completed": completed, "failed": failed, "expected": expected}
+            final_assessment["metrics"]["limitations"].append(report_i18n.early_end_limitation(language))
+        report_markdown = self._render_markdown(
+            decision, narrative, final_assessment, rubric, evaluations, claims, language=language
+        )
+        if early_end:
+            text = report_i18n.labels(language)
+            report_markdown = f"## {text['early_title']}\n\n{text['early_body']}\n\n" + report_markdown
+            # Candidate text is untrusted: a literal block keeps it from injecting Markdown/HTML structure.
+            report_markdown += f"\n\n## {text['saved_transcript']}\n\n" + "\n\n".join(
+                _markdown_literal_block(text) for text in candidate_texts
+            )
 
         # Lưu đủ đầu ra trước khi chuyển trạng thái/phát event để người đọc thấy file báo cáo.
+        if self.state_manager is not None:
+            current = await self.state_manager.aget(session_id)
+            allowed = LifecycleStatus.ENDING if early_end else LifecycleStatus.ASSESSING
+            if current is None or current.status != allowed:
+                raise AssessmentBarrierError("Report synthesis superseded by a session lifecycle change")
         await asyncio.to_thread(ws.write_text, DECISION_PATH, decision_json(decision))
         await asyncio.to_thread(
             ws.write_artifact, "reports/final_assessment.json", artifact_type="final_assessment", payload=final_assessment
+        )
+        await asyncio.to_thread(
+            ws.write_artifact, "reports/cv_jd_evidence_coverage.json",
+            artifact_type="cv_jd_evidence_coverage", payload=probe_coverage,
         )
         await asyncio.to_thread(ws.write_text, "reports/interview_report.md", report_markdown)
 
@@ -279,7 +341,7 @@ class ReportSynthesizer:
         }
         if self.state_manager is not None:
             state = await self.state_manager.aget(session_id)
-            if state and state.status == LifecycleStatus.ASSESSING:
+            if state and state.status == (LifecycleStatus.ENDING if early_end else LifecycleStatus.ASSESSING):
                 await self.state_manager.atransition(
                     state,
                     expected_version=state.state_version,
@@ -322,74 +384,79 @@ class ReportSynthesizer:
         rubric: Dict[str, Any],
         evaluations: List[Dict[str, Any]],
         claims: Dict[str, Any],
+        language: str = "en",
     ) -> str:
         anchors = {c["competency_id"]: c.get("anchors", {}) for c in rubric.get("competencies", []) if c.get("competency_id")}
-        verdict_label = {"PASS": "Ready (pass)", "FAIL": "Not yet ready (fail)", "NEEDS_REVIEW": "Needs human review"}
+        text = report_i18n.labels(language)
+        score = decision["weighted_score"] if decision["weighted_score"] is not None else "n/a"
         lines = [
-            "# AI Interview Practice & Coaching Report",
+            f"# {text['title']}",
             "",
             "> [!IMPORTANT]",
-            f"> **Disclaimer:** {final_assessment['disclaimer']}",
+            f"> **{text['disclaimer']}:** {final_assessment['disclaimer']}",
             "",
-            "## 1. Outcome",
+            f"## {text['outcome']}",
             "",
-            f"- **Verdict:** {verdict_label.get(decision['verdict'], decision['verdict'])}",
-            f"- **Weighted score:** {decision['weighted_score'] if decision['weighted_score'] is not None else 'n/a'} "
-            f"/ 4 (pass threshold {decision['pass_threshold']}, borderline ±{decision['borderline_band']})",
+            f"- **{text['verdict']}:** {text.get(decision['verdict'], decision['verdict'])}",
+            f"- **{text['weighted_score']}:** {score} "
+            + text["score_detail"].format(threshold=decision["pass_threshold"], band=decision["borderline_band"]),
         ]
-        lines += [f"- {reason}" for reason in decision["verdict_reasons"]]
+        lines += [f"- {report_i18n.localize_reason(reason, language)}" for reason in decision["verdict_reasons"]]
         if decision["requires_human_review"]:
-            lines.append("- A human reviewer must confirm this outcome.")
-        lines += ["", "## 2. Summary", "", narrative.get("summary", ""), ""]
+            lines.append(f"- {text['human_confirm']}")
+        lines += ["", f"## {text['summary']}", "", narrative.get("summary", ""), ""]
 
-        lines += [
-            "## 3. Criteria",
-            "",
-            "| Criterion | Weight | Must-have | Level (1-4) | Evidence weight (sum of confidence) | Meets bar |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
+        lines += [f"## {text['criteria']}", "", text["criteria_header"], "| :--- | :--- | :--- | :--- | :--- | :--- |"]
         for c in decision["criteria"]:
-            level = "insufficient evidence" if not c["covered"] else f"{c['level']}"
+            level = text["insufficient"] if not c["covered"] else f"{c['level']}"
             lines.append(
-                f"| {c['name']} | {c['weight']} | {'yes' if c['must_have'] else 'no'} | {level} | "
-                f"{c['confidence']} | {'yes' if c['meets_bar'] else 'no'} |"
+                f"| {c['name']} | {c['weight']} | {text['yes'] if c['must_have'] else text['no']} | {level} | "
+                f"{c['confidence']} | {text['yes'] if c['meets_bar'] else text['no']} |"
             )
         lines.append("")
 
         findings = {f.get("competency_id"): f for f in narrative.get("criterion_findings", [])}
-        lines += ["## 4. Findings by criterion", ""]
+        lines += [f"## {text['findings']}", ""]
         for c in decision["criteria"]:
             lines.append(f"### {c['name']}")
             finding = findings.get(c["competency_id"], {})
-            lines.append(finding.get("finding") or ("Not enough evidence was gathered." if not c["covered"] else ""))
+            lines.append(finding.get("finding") or (text["not_enough"] if not c["covered"] else ""))
             if c["covered"] and c["level"] is not None:
                 anchor = anchors.get(c["competency_id"], {}).get(str(int(round(c["level"]))))
                 if anchor:
-                    lines.append(f"- Closest level description: {anchor}")
+                    lines.append(f"- {text['closest_level']}: {anchor}")
             for quote in (finding.get("quotes") or [])[:2]:
                 lines.append(f"> \"{quote}\"")
             lines.append("")
 
-        lines += ["## 5. Strengths", ""] + [f"- {s}" for s in narrative.get("strengths", [])] + [""]
-        lines += ["## 6. Areas to improve", ""] + [f"- {s}" for s in narrative.get("improvements", [])] + [""]
-        lines += ["## 7. Study plan", ""] + [f"{i}. {s}" for i, s in enumerate(narrative.get("study_plan", []), 1)] + [""]
+        lines += [f"## {text['strengths']}", ""] + [f"- {s}" for s in narrative.get("strengths", [])] + [""]
+        lines += [f"## {text['improvements']}", ""] + [f"- {s}" for s in narrative.get("improvements", [])] + [""]
+        lines += [f"## {text['study_plan']}", ""] + [f"{i}. {s}" for i, s in enumerate(narrative.get("study_plan", []), 1)] + [""]
 
         claim_items = claims.get("claims", [])
         if claim_items:
-            lines += ["## 8. CV claims checked", "", "| Claim | Status |", "| :--- | :--- |"]
+            lines += [f"## {text['claims']}", "", text["claims_header"], "| :--- | :--- |"]
             lines += [f"| {c.get('claim')} | {c.get('status')} |" for c in claim_items]
             lines.append("")
         if decision["uncovered_criteria"]:
-            lines += ["## 9. Not covered in this interview", ""]
+            lines += [f"## {text['uncovered']}", ""]
             lines += [f"- {cid}" for cid in decision["uncovered_criteria"]]
             lines.append("")
 
-        lines += ["## 10. Delivery observations (not scored)", ""]
+        lines += [f"## {text['delivery']}", ""]
         for e in evaluations:
             note = (e.get("delivery_observations") or {}).get("observations")
             if note:
                 lines.append(f"- {e.get('turn_id')}: {note}")
-        lines += ["", "## 11. Limitations", ""] + [f"- {l}" for l in final_assessment["metrics"]["limitations"]] + [""]
+        lines += ["", f"## {text['limitations']}", ""] + [f"- {l}" for l in final_assessment["metrics"]["limitations"]] + [""]
+        probes = final_assessment.get("cv_jd_evidence_coverage") or {}
+        lines += [
+            f"## {text['probes']}", "",
+            text["probes_note"],
+            f"- {text['asked_probes']}: {', '.join(probes.get('asked_probe_ids') or []) or text['none']}",
+            f"- {text['unasked_probes']}: {', '.join(probes.get('unasked_probe_ids') or []) or text['none']}",
+            f"- {text['omitted_evidence']}: {', '.join(probes.get('omitted_evidence_ids') or []) or text['none']}", "",
+        ]
         return "\n".join(lines)
 
     async def _publish(self, session_id: str, event_type: LoopEventType, payload: Dict[str, Any]) -> None:

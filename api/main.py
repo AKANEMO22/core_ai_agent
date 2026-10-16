@@ -58,11 +58,15 @@ from core.session.events import SessionEventStore
 from core.session.idempotency import MessageLedger, RedisIdempotencyStore, RedisLease, TokenBucket
 from core.session.store import RedisSessionStateStore
 from core.storage import ArtifactArchive, S3ObjectStore
+from core.storage.database import Database
 from core.workspace.cleanup import WorkspaceCleanupManager
 from core.workspace.retention import RetentionService
 from core.workspace.session import SessionWorkspaceManager, normalize_session_id
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for /end waiting on an in-flight turn/assessment lock; the ENDING sweep retries.
+END_PREPARE_LOCK_TIMEOUT_SECONDS = 5.0
 
 DEFAULT_STAGES = [
     {"stage_id": "warmup", "name": "Warmup", "target_turns": 2},
@@ -126,6 +130,21 @@ def create_app(
     ws_base_path.mkdir(parents=True, exist_ok=True)
     workspace_mgr = SessionWorkspaceManager(root_base=str(ws_base_path), fsync=app_settings.WORKSPACE_FSYNC)
     cleanup_mgr = WorkspaceCleanupManager(root_base=str(ws_base_path))
+    # Durable stores: PostgreSQL when DATABASE_URL is set, otherwise local SQLite files.
+    owned_databases: list[Database] = []
+
+    def open_store_database(schema: str) -> Optional[Database]:
+        if not app_settings.DATABASE_URL:
+            return None
+        database = Database(
+            app_settings.DATABASE_URL,
+            schema=schema,
+            min_size=app_settings.DATABASE_POOL_MIN_SIZE,
+            max_size=app_settings.DATABASE_POOL_MAX_SIZE,
+        )
+        owned_databases.append(database)
+        return database
+
     active_artifact_archive = artifact_archive
     if active_artifact_archive is None and app_settings.ARTIFACT_ARCHIVE_ENABLED:
         if not all(
@@ -148,6 +167,7 @@ def create_app(
             bucket=app_settings.ARTIFACT_ARCHIVE_BUCKET,
             catalog_path=app_settings.ARTIFACT_ARCHIVE_CATALOG_PATH,
             max_restore_bytes=app_settings.ARTIFACT_ARCHIVE_MAX_RESTORE_BYTES,
+            database=open_store_database("artifact_archive"),
         )
     if app_settings.APP_ENV.strip().lower() == "production" and active_artifact_archive is not None:
         raise RuntimeError(
@@ -155,7 +175,9 @@ def create_app(
         )
     studio_enabled = app_settings.INSPECTOR_ENABLED or app_settings.TEST_UI_ENABLED
     strict_studio = studio_enabled and app_settings.STUDIO_REQUIRE_REAL_PROVIDER
-    inspect_trace_recorder = RuntimeTraceRecorder(workspace_mgr) if studio_enabled else None
+    inspect_trace_recorder = (
+        RuntimeTraceRecorder(workspace_mgr, database=open_store_database("inspect_trace")) if studio_enabled else None
+    )
 
     # 3. Durable session primitives
     metrics = build_default_metrics()
@@ -462,6 +484,37 @@ def create_app(
     controller.dialogue_completed_hooks.append(persist_blackboard)
     controller.dialogue_completed_hooks.append(pipeline.on_dialogue_completed)
 
+    async def prepare_ended_report(session_id: str) -> None:
+        # Stop child agent calls, never cancel shared WebSocket/request/pool tasks.
+        controller.cancel_session(session_id)
+        worker.cancellations.cancel_session(session_id)
+        await cancellations.cancel_session_and_wait(session_id)
+        await worker.cancellations.cancel_session_and_wait(session_id)
+        # A remote gateway observes the durable fence before releasing its turn lease. The wait is
+        # bounded so /end answers promptly; on timeout the ENDING sweep retries this preparation.
+        async with contextlib.AsyncExitStack() as locks:
+            await asyncio.wait_for(
+                locks.enter_async_context(assessment_queue.session_mutation(session_id, purpose="turn_lock")),
+                timeout=END_PREPARE_LOCK_TIMEOUT_SECONDS,
+            )
+            await asyncio.wait_for(
+                locks.enter_async_context(assessment_queue.session_mutation(session_id)),
+                timeout=END_PREPARE_LOCK_TIMEOUT_SECONDS,
+            )
+            workspace = workspace_mgr.get_or_create_workspace(session_id)
+            turns = [int(path.name.split("_")[1]) for path in workspace.list_artifacts("turns")
+                if path.name.startswith("turn_") and path.name.split("_")[1].isdigit()]
+            await summarizer.update(session_id, workspace, max(turns, default=0))
+        runners.evict(session_id)
+
+    async def forget_ended_session(session_id: str) -> None:
+        # The durable fence and final status now refuse new work; drop per-process markers.
+        cancellations.forget(session_id)
+        worker.cancellations.forget(session_id)
+
+    pipeline.end_prepare = prepare_ended_report
+    pipeline.end_finished = forget_ended_session
+
     background_tasks: Dict[str, asyncio.Task] = {}
 
     async def _retention_loop() -> None:
@@ -496,6 +549,8 @@ def create_app(
             await worker_pool.stop(grace_seconds=30.0)
             if inspect_trace_recorder is not None:
                 await inspect_trace_recorder.close()
+            for database in owned_databases:
+                await asyncio.to_thread(database.close)
 
     app = FastAPI(
         title="AI Interview Platform Core Engine",
@@ -574,6 +629,8 @@ def create_app(
     app.state.hot_path_gate = hot_path_gate
     app.state.hooks = hooks
     app.state.inspect_trace_recorder = inspect_trace_recorder
+    app.state.storage_backend = "postgres" if app_settings.DATABASE_URL else "sqlite"
+    app.state.databases = owned_databases
     app.state.studio_real_provider = not isinstance(active_llm, (MockLLMClient, UnconfiguredLLMClient))
     def studio_execution_allowed(session_id=None):
         if not app.state.studio_real_provider or knowledge_service.backend_name == "mock":
@@ -609,7 +666,7 @@ def create_app(
 
     @app.get("/health/ready", tags=["health"])
     async def health_ready() -> Any:
-        """Readiness: Redis, workspace write, assessor heartbeat and provider configuration."""
+        """Readiness: Redis, Postgres (if configured), workspace write, assessor heartbeat and provider configuration."""
         details: Dict[str, Any] = {}
         is_ready = True
 
@@ -628,6 +685,20 @@ def create_app(
         except Exception as e:
             details["workspace"] = f"unwritable: {sanitize_secrets(str(e))}"
             is_ready = False
+
+        if owned_databases:
+            def ping_databases() -> None:
+                for database in owned_databases:
+                    with database.connection() as connection:
+                        connection.execute("SELECT 1")
+
+            try:
+                await asyncio.wait_for(asyncio.to_thread(ping_databases), timeout=3)
+                details["database"] = "connected"
+            except Exception as e:
+                # Exceptions from the pool never carry the URL; sanitize anyway.
+                details["database"] = f"unreachable: {sanitize_secrets(type(e).__name__)}"
+                is_ready = False
 
         if app_settings.ASSESSOR_POOL_SIZE > 0 and worker_pool.status()["running_tasks"] > 0:
             healthy = details.get("redis") == "connected" and await worker_pool.is_healthy()

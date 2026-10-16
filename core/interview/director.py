@@ -7,7 +7,8 @@ Các hàm trả snapshot từ CAS của state store; chúng không sinh câu h�
 và không tự viết report. max_extra_turns chặn việc gia hạn stage vô hạn.
 """
 
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from core.runtime.agent import sanitize_secrets
 from core.session.state import (
@@ -37,6 +38,7 @@ class StageDirector:
         stages: List[Dict[str, Any]],
         state_mgr: SessionStateStore,
         max_extra_turns: int = 1,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         """Initialize the stage director.
 
@@ -49,6 +51,7 @@ class StageDirector:
         self.stages = stages
         self.state_mgr = state_mgr
         self.max_extra_turns = max(0, int(max_extra_turns))
+        self.clock = clock
         self._stages_by_id: Dict[str, Dict[str, Any]] = {
             s["stage_id"]: s for s in stages if "stage_id" in s
         }
@@ -70,6 +73,38 @@ class StageDirector:
         if not stage_id:
             return None
         return self._stages_by_id.get(stage_id)
+
+    def elapsed_budget_target(self, state: SessionState) -> Optional[Dict[str, Any]]:
+        """Reserve the final Q&A at an answer boundary, never interrupt candidate input.
+
+        A time budget is an upper planning bound. Turn budgets can finish a quick
+        interview earlier; there is no minimum wait or attempt to fill wall time.
+        """
+        deadline = state.metadata.get("interview_deadline_at")
+        if not isinstance(deadline, (float, int)):
+            return None
+        current_index = self.get_stage_index(state)
+        for index, stage in enumerate(self.stages):
+            if stage.get("stage_type") == "candidate_questions" or stage.get("stage_id") == "candidate_questions":
+                if index <= current_index:
+                    return None
+                reserve = stage.get("planned_minutes", stage.get("duration_minutes", 2))
+                try:
+                    reserve_seconds = max(30.0, min(600.0, float(reserve) * 60))
+                except (TypeError, ValueError):
+                    reserve_seconds = 120.0
+                if self.clock() >= deadline - reserve_seconds:
+                    return stage
+        return None
+
+    async def advance_to_budget_target(self, state: SessionState, stage: Dict[str, Any]) -> SessionState:
+        """Commit the Q&A invitation after recording/scoring the accepted answer."""
+        metadata = dict(state.metadata)
+        metadata["elapsed_budget_transition"] = {"from_stage": state.current_stage_id, "to_stage": stage["stage_id"], "at": self.clock()}
+        return await self.state_mgr.atransition(
+            state, expected_version=state.state_version, current_stage_id=stage["stage_id"],
+            is_stage_complete=False, metadata=metadata,
+        )
 
     def get_stage_by_id(self, stage_id: str) -> Optional[Dict[str, Any]]:
         """Look up a stage configuration dictionary by its unique stage_id."""

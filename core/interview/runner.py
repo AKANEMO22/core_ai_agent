@@ -13,6 +13,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from core.language import workspace_interview_language
@@ -293,9 +294,16 @@ class InteractiveSubagentRunner:
         return plan_fallback(self.stage_director.stages, state.current_stage_id, used, asked)
 
     def build_messages(
-        self, state: SessionState, turn_number: int, final_user_content: str
+        self, state: SessionState, turn_number: int, final_user_content: str,
+        budget_stage: Optional[Dict[str, Any]] = None,
     ) -> tuple:
-        """Return (messages, provenance) for a turn using the speaker builder when configured."""
+        """Return (messages, provenance) for a turn using the speaker builder when configured.
+
+        `budget_stage` (elapsed-time budget) makes this response open that stage instead of
+        following the current stage's directive.
+        """
+        if budget_stage is not None:
+            state = replace(state, current_stage_id=budget_stage["stage_id"])
         # Nhánh tương thích cũ trả prompt chuỗi; nhánh speaker trả messages và provenance của directive.
         if self.context_builder is None:
             return (
@@ -305,7 +313,14 @@ class InteractiveSubagentRunner:
                 ],
                 {},
             )
-        directive = self.resolve_directive(state, turn_number)
+        if budget_stage is not None:
+            directive = fallback_directive(
+                budget_stage, asked_question_ids(self.workspace),
+                reason="elapsed interview budget reserves candidate Q&A",
+            )
+            directive.mode = "transition"
+        else:
+            directive = self.resolve_directive(state, turn_number)
         stage = self.stage_director.get_current_stage(state) or {}
         context = self.context_builder.build(stage, turn_number - 1, directive, final_user_content)
         return context.messages, {
@@ -614,7 +629,9 @@ class InteractiveSubagentRunner:
             )
         )
 
-        messages, provenance = self.build_messages(state, turn_number, candidate_answer)
+        # Deadline reached: this answer is still scored in its stage, the response invites Q&A.
+        budget_stage = self.stage_director.elapsed_budget_target(state)
+        messages, provenance = self.build_messages(state, turn_number, candidate_answer, budget_stage=budget_stage)
         directive: Optional[Directive] = provenance.get("directive")
         outcome: Dict[str, Any] = {}
         try:
@@ -652,7 +669,7 @@ class InteractiveSubagentRunner:
                 "turn_number": turn_number,
                 "role": "interviewer",
                 "session_id": session_id,
-                "stage_id": state.current_stage_id,
+                "stage_id": budget_stage["stage_id"] if budget_stage is not None else state.current_stage_id,
                 "content": outcome["text"],
                 "interrupted": interrupted,
                 "timestamp": time.time(),
@@ -695,7 +712,7 @@ class InteractiveSubagentRunner:
 
         prev_stage_id = state.current_stage_id
         # A transition directive means this response already moved on to the next stage.
-        transition_requested = directive is not None and directive.mode == "transition"
+        transition_requested = budget_stage is None and directive is not None and directive.mode == "transition"
         # An extension directive asked another question of this stage, so the stage stays open.
         extend_stage = (
             directive is not None and directive.extend_stage and directive.mode in ("follow_up", "next_question")
@@ -703,7 +720,21 @@ class InteractiveSubagentRunner:
         state = await self.stage_director.record_turn(
             state, complete_stage=transition_requested, tool_calls=outcome["tool_calls"], extend_stage=extend_stage
         )
-        if state.is_stage_complete:
+        if budget_stage is not None:
+            state = await self.stage_director.advance_to_budget_target(state, budget_stage)
+            yield self._event(
+                session_id,
+                turn_id,
+                LoopEventType.STAGE_TRANSITION,
+                {
+                    "from_stage": prev_stage_id,
+                    "to_stage": state.current_stage_id,
+                    "is_curriculum_complete": False,
+                    "new_status": state.status.value,
+                    "reason": "elapsed_budget",
+                },
+            )
+        elif state.is_stage_complete:
             state = await self.stage_director.advance_stage(state)
             yield self._event(
                 session_id,

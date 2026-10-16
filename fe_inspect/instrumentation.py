@@ -17,9 +17,9 @@ _current: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("core_
 class RuntimeTraceRecorder:
     """SQLite is authoritative; context variables carry only the active span identity."""
 
-    def __init__(self, workspace_mgr: Any) -> None:
+    def __init__(self, workspace_mgr: Any, database: Any = None) -> None:
         self.workspace_mgr = workspace_mgr
-        self.store = TraceStore(workspace_mgr.root_base)
+        self.store = TraceStore(workspace_mgr.root_base, database=database)
         self.provider_metadata = {}
 
     def read(self, session_id: str) -> list[dict]:

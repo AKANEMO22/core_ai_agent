@@ -245,7 +245,7 @@ def test_websocket_stream_turn_and_envelope_structure(tmp_path):
         assert pong["type"] == "pong"
 
         # 2. Start the interview (opening question, turn 0)
-        ws.send_json({"type": "start_interview"})
+        ws.send_json({"type": "start_interview", "confirm_limitations": True})
         opening = _drain_until(ws, ("turn_complete", "error"))
         assert opening[0]["type"] == "interview_started"
         assert opening[-1]["type"] == "turn_complete"
@@ -339,7 +339,7 @@ def test_websocket_multi_turn_monotonic_sequence(tmp_path):
         f"/ws/sessions/{sess_id}/stream",
         headers={"Authorization": f"Bearer {sess_token}"},
     ) as ws:
-        ws.send_json({"type": "start_interview"})
+        ws.send_json({"type": "start_interview", "confirm_limitations": True})
         _drain_until(ws, ("turn_complete", "error"))
 
         # Turn 1
@@ -398,7 +398,7 @@ def test_websocket_start_interview_gates_answers_and_is_idempotent(tmp_path):
     service_headers = {"Authorization": f"Bearer {service_token}"}
     create_res = client.post(
         "/api/v1/sessions",
-        json={"candidate_name": "Ready State Candidate"},
+        json={"candidate_name": "Ready State Candidate", "target_role": "Senior Backend Engineer"},
         headers=service_headers,
     )
     sess_id = create_res.json()["session_id"]

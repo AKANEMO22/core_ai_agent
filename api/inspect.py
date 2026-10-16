@@ -27,6 +27,14 @@ def _recorder(request: Request):
     return recorder
 
 
+def _storage(request: Request) -> str:
+    """The durable trace backend actually in use ("postgres" or "sqlite")."""
+    recorder = request.app.state.inspect_trace_recorder
+    if recorder is not None:
+        return recorder.store.backend
+    return getattr(request.app.state, "storage_backend", "sqlite")
+
+
 def _read_json(workspace: SessionWorkspace, relative: str) -> Optional[dict]:
     try:
         data = json.loads(workspace.resolve_path(relative).read_text(encoding="utf-8"))
@@ -84,7 +92,7 @@ async def _state(request: Request, session_id: str) -> tuple[Optional[dict], str
         request.state.inspect_redis_error = str(exc) or type(exc).__name__
         snapshot = dict(archived or {"session_id": session_id, "status": "ARCHIVED"})
         snapshot["state_refresh_error"] = sanitize_payload(str(exc) or type(exc).__name__)
-        return snapshot, "sqlite" if archived else "not_recorded"
+        return snapshot, store.backend if archived else "not_recorded"
     if live is not None:
         snapshot = live.to_dict()
         if archived and archived.get("_inspect_provider"):
@@ -93,7 +101,7 @@ async def _state(request: Request, session_id: str) -> tuple[Optional[dict], str
             # Archive only observed authoritative state, including legacy sessions.
             await asyncio.to_thread(store.save_state, snapshot)
         return sanitize_payload(snapshot), "redis"
-    return archived, "sqlite" if archived else "not_recorded"
+    return archived, store.backend if archived else "not_recorded"
 
 
 async def _events(request: Request, session_id: str, after_sequence: int = 0, limit: int = 5000):
@@ -129,7 +137,7 @@ async def config(request: Request):
     return {"local_token_enabled": bool(settings.INSPECTOR_LOCAL_AUTH and settings.APP_ENV.lower() != "production"),
             "provider": provider["client"], "provider_model": provider["model"],
             "real_provider": provider["real_provider"] and provider["retrieval_backend"] != "mock",
-            "retrieval_backend": provider["retrieval_backend"], "storage": "sqlite",
+            "retrieval_backend": provider["retrieval_backend"], "storage": _storage(request),
             "test_ui_enabled": settings.TEST_UI_ENABLED,
             "execution_enabled": provider["real_provider"] and provider["retrieval_backend"] != "mock"}
 
@@ -152,7 +160,7 @@ async def system(request: Request):
     return {"service": "AI Interview Core", "environment": app.state.settings.APP_ENV,
             "provider": provider["client"], "provider_model": provider["model"],
             "real_provider": provider["real_provider"], "retrieval_backend": provider["retrieval_backend"],
-            "storage": "sqlite", "trace_database": str(_recorder(request).store.path),
+            "storage": _storage(request), "trace_database": _recorder(request).store.location,
             "active_connections": app.state.connection_mgr.active_connection_count(),
             "assessor_pool": app.state.worker_pool.status()}
 
@@ -200,7 +208,7 @@ async def runs(request: Request, q: str = Query("", max_length=160), limit: int 
                     "verdict": review.get("final_verdict") or decision.get("verdict")})
         rows.append(row)
     return {"runs": sorted(rows, key=lambda row: row.get("updated_at") or 0, reverse=True),
-            "total": len(candidates), "offset": offset, "limit": limit, "storage": "sqlite"}
+            "total": len(candidates), "offset": offset, "limit": limit, "storage": store.backend}
 
 
 @router.get("/runs/{session_id}/trace", dependencies=[Depends(require_service_token)])
@@ -214,7 +222,7 @@ async def events(session_id: str, request: Request, after_sequence: int = Query(
                  limit: int = Query(1000, ge=1, le=5000)):
     await _workspace(request, session_id)
     rows = await _events(request, session_id, after_sequence, limit)
-    return {"events": rows, "storage": "sqlite", "next_sequence": rows[-1]["sequence"] if rows else after_sequence,
+    return {"events": rows, "storage": _storage(request), "next_sequence": rows[-1]["sequence"] if rows else after_sequence,
             "has_more": len(rows) == limit}
 
 

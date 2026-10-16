@@ -1,8 +1,9 @@
 """Pre-flight Reconnaissance Profiler Agent coordinating inputs, research tools, and blueprint synthesis.
 
 Pipeline chuẩn bị phiên trước khi speaker bắt đầu: run_profiling đọc form/CV
-trong workspace, lấy recon và knowledge rồi lần lượt tạo company_intel,
-candidate_profile, interview_spec và stage_plan (hoặc nhận trọn bộ từ LLM).
+trong workspace, tạo candidate_profile trước, dùng role/skills/kinh nghiệm từ
+profile để lấy recon và knowledge (RAG), rồi tạo company_intel, interview_spec
+và stage_plan (hoặc nhận trọn bộ từ LLM).
 Knowledge thành công sẽ dùng để neo tiêu chí/câu hỏi và ghi thêm rubric;
 retrieval lỗi được ghi degraded để tách khỏi kết quả profiling. Đầu vào ứng viên
 được bọc untrusted trong prompt và thông báo lỗi được che dữ liệu cá nhân.
@@ -19,6 +20,7 @@ from typing import Any, Dict, List, Optional
 from core.language import interview_language_instruction, workspace_interview_language
 from core.profiler.brief import resolve_interview_brief, shape_stage_plan
 from core.profiler.documents import DocumentExtractionError, extract_document_text
+from core.profiler.evidence import attach_evidence_probes
 from core.profiler.prompts import (
     PROFILER_SYSTEM_PROMPT,
     build_candidate_profile_prompt,
@@ -107,22 +109,72 @@ def _shape_and_ground_stage_plan(
     knowledge: Dict[str, Any],
     *,
     knowledge_ok: bool,
+    job_description: Optional[str] = None,
 ) -> Any:
-    """Ground assessable stages after shaping while keeping opening and Q&A unscored."""
+    """Ground assessable stages after shaping while keeping opening and Q&A unscored.
+
+    CV/JD evidence probes are attached after grounding on both the grounded and the
+    degraded (knowledge unavailable) path.
+    """
     shaped = shape_stage_plan(stage_plan, brief, candidate_profile)
+    profile = candidate_profile if isinstance(candidate_profile, dict) else {}
     if not knowledge_ok or not isinstance(shaped, dict) or not isinstance(shaped.get("stages"), list):
-        return shaped
+        return attach_evidence_probes(shaped, profile, job_description)
     stages = shaped["stages"]
     if len(stages) < 2:
-        return shaped
+        return attach_evidence_probes(shaped, profile, job_description)
     body = ground_stage_plan({"stages": stages[1:-1]}, knowledge)
     if not isinstance(body, dict) or not isinstance(body.get("stages"), list):
-        return shaped
-    return {
+        return attach_evidence_probes(shaped, profile, job_description)
+    grounded = {
         **shaped,
         "stages": [stages[0], *body["stages"], stages[-1]],
         "rubric_version": body.get("rubric_version", knowledge.get("rubric", {}).get("rubric_version")),
     }
+    return attach_evidence_probes(grounded, profile, job_description)
+
+
+def _profile_target_role(candidate_profile: Dict[str, Any]) -> Optional[str]:
+    """Role the CV supports: a stated objective first, else the most recent position title."""
+    stated = str(candidate_profile.get("target_role") or "").strip()
+    if stated:
+        return stated
+    experience = candidate_profile.get("experience")
+    if isinstance(experience, list):
+        for item in experience:
+            role = str(item.get("role") or "").strip() if isinstance(item, dict) else ""
+            if role:
+                return role
+    return None
+
+
+def merge_profile_into_form(
+    form_data: Optional[Dict[str, Any]], candidate_profile: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Fill retrieval inputs the form left empty from the extracted candidate profile.
+
+    Explicit form values always win; the profile only supplies what the candidate did not type.
+    """
+    merged = dict(form_data or {})
+    if merged.get("experience_years") is None and candidate_profile.get("experience_years") is not None:
+        merged["experience_years"] = candidate_profile["experience_years"]
+    if not str(merged.get("target_role") or "").strip():
+        role = _profile_target_role(candidate_profile)
+        if role:
+            merged["target_role"] = role
+    if not str(merged.get("target_company") or "").strip() and candidate_profile.get("target_company"):
+        merged["target_company"] = str(candidate_profile["target_company"])
+    existing_skills = merged.get("skills") if isinstance(merged.get("skills"), list) else []
+    profile_skills = candidate_profile.get("skills") if isinstance(candidate_profile.get("skills"), list) else []
+    reviewed_skills = [
+        str(item.get("name") or "").strip() if isinstance(item, dict) else str(item).strip()
+        for item in profile_skills
+    ]
+    merged["skills"] = list(dict.fromkeys(
+        [str(item).strip() for item in existing_skills if str(item).strip()]
+        + [item for item in reviewed_skills if item]
+    ))
+    return merged
 
 
 def _normalize_company_intel(
@@ -436,19 +488,7 @@ class ProfilerAgent:
         candidate_profile: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Re-retrieve and regenerate the plan after candidate-reviewed inputs change."""
-        form_data = dict(form_data)
-        if form_data.get("experience_years") is None and candidate_profile.get("experience_years") is not None:
-            form_data["experience_years"] = candidate_profile["experience_years"]
-        existing_skills = form_data.get("skills") if isinstance(form_data.get("skills"), list) else []
-        profile_skills = candidate_profile.get("skills") if isinstance(candidate_profile.get("skills"), list) else []
-        reviewed_skills = [
-            str(item.get("name") or "").strip() if isinstance(item, dict) else str(item).strip()
-            for item in profile_skills
-        ]
-        form_data["skills"] = list(dict.fromkeys(
-            [str(item).strip() for item in existing_skills if str(item).strip()]
-            + [item for item in reviewed_skills if item]
-        ))
+        form_data = merge_profile_into_form(form_data, candidate_profile)
 
         def payload(path: str) -> Dict[str, Any]:
             if not workspace.exists(path):
@@ -529,6 +569,7 @@ class ProfilerAgent:
             candidate_profile,
             knowledge,
             knowledge_ok=knowledge.get("status") == "ok",
+            job_description=form_data.get("job_description"),
         )
         return {
             "knowledge": knowledge,
@@ -566,23 +607,29 @@ class ProfilerAgent:
                     "session_id": workspace.session_id,
                 }
 
-            # Extract target company and role from inputs with defensive sanitization
-            raw_company = "TechCorp"
-            raw_role = "Senior Software Engineer"
+            # Step 1: Extract candidate_profile first; role, skills and experience for retrieval come from it.
+            profile_prompt = build_candidate_profile_prompt(form_data=form_data, cv_text=cv_text)
+            first_response = await self._query_model(profile_prompt, system_prompt=profiling_system_prompt)
+            required_keys = ("company_intel", "candidate_profile", "interview_spec", "stage_plan")
+            # Có đủ bốn artifact thì dùng bundle; nếu thiếu, các bước sau phải chờ dữ liệu bước trước.
+            bundle = first_response if all(k in first_response for k in required_keys) else None
+            candidate_profile = bundle["candidate_profile"] if bundle else first_response.get("candidate_profile", first_response)
+            if not isinstance(candidate_profile, dict):
+                candidate_profile = {}
 
-            if form_data:
-                raw_company = form_data.get("target_company") or form_data.get("company", raw_company)
-                raw_role = form_data.get("target_role") or form_data.get("role", raw_role)
-            elif cv_text:
+            # Form values win; empty fields (CV-only sessions) are filled from the extracted profile.
+            form_data = merge_profile_into_form(form_data, candidate_profile)
+            raw_company = form_data.get("target_company") or form_data.get("company")
+            raw_role = form_data.get("target_role") or form_data.get("role")
+            if cv_text and not raw_company:
                 comp_match = re.search(r"Target Company:\s*([^\n\r]+)", cv_text, re.IGNORECASE)
-                if comp_match:
-                    raw_company = comp_match.group(1).strip()
+                raw_company = comp_match.group(1).strip() if comp_match else None
+            if cv_text and not raw_role:
                 role_match = re.search(r"Role:\s*([^\n\r]+)", cv_text, re.IGNORECASE)
-                if role_match:
-                    raw_role = role_match.group(1).strip()
+                raw_role = role_match.group(1).strip() if role_match else None
 
             target_company = sanitize_prompt_field(raw_company, default="Target Company")
-            target_role = sanitize_prompt_field(raw_role, default="Senior Software Engineer")
+            target_role = sanitize_prompt_field(raw_role, default="Software Engineer")
 
             # Assemble untrusted candidate context upfront
             candidate_data_parts: List[str] = []
@@ -597,8 +644,7 @@ class ProfilerAgent:
             )
             wrapped_candidate = wrap_untrusted_candidate_data(combined_candidate)
 
-            # Recon và framework retrieval chạy song song; đầu vào ứng viên được đánh dấu untrusted trước khi vào prompt.
-            # Execute safe reconnaissance and knowledge retrieval concurrently
+            # Step 2: Recon và RAG chạy song song, nhưng chỉ sau khi đã có candidate_profile.
             recon_coro = self._gather_recon(target_company, target_role, workspace=workspace)
             knowledge: Optional[Dict[str, Any]] = None
             if self.knowledge_service is not None:
@@ -637,41 +683,25 @@ class ProfilerAgent:
                 corpus_version=corpus_version,
             )
 
-            # Step 1: Generate only source-linked company context; unsupported facts are removed below.
-            company_prompt = build_company_intel_prompt(
-                company_name=target_company,
-                target_role=target_role,
-                recon_data=recon_data,
-                candidate_context=wrapped_candidate,
-                interview_brief=interview_brief,
-            )
-            first_response = await self._query_model(company_prompt, system_prompt=profiling_system_prompt)
-
-            # Check if all-in-one bundle returned
-            required_keys = ("company_intel", "candidate_profile", "interview_spec", "stage_plan")
-            # Có đủ bốn artifact thì dùng bundle; nếu thiếu, các bước sau phải chờ dữ liệu bước trước.
-            if all(k in first_response for k in required_keys):
-                company_intel = _normalize_company_intel(
-                    first_response["company_intel"], target_company, recon_data
-                )
-                candidate_profile = first_response["candidate_profile"]
-                interview_spec = first_response["interview_spec"]
-                stage_plan = first_response["stage_plan"]
+            if bundle:
+                company_intel = _normalize_company_intel(bundle["company_intel"], target_company, recon_data)
+                interview_spec = bundle["interview_spec"]
+                stage_plan = bundle["stage_plan"]
             else:
+                # Step 3: Generate only source-linked company context; unsupported facts are removed below.
+                company_prompt = build_company_intel_prompt(
+                    company_name=target_company,
+                    target_role=target_role,
+                    recon_data=recon_data,
+                    candidate_context=wrapped_candidate,
+                    interview_brief=interview_brief,
+                )
+                company_res = await self._query_model(company_prompt, system_prompt=profiling_system_prompt)
                 company_intel = _normalize_company_intel(
-                    first_response.get("company_intel", first_response), target_company, recon_data
+                    company_res.get("company_intel", company_res), target_company, recon_data
                 )
 
-                # Step 2: Generate candidate profile
-                candidate_prompt = build_candidate_profile_prompt(
-                    form_data=form_data,
-                    cv_text=cv_text,
-                    company_intel=company_intel,
-                )
-                cand_res = await self._query_model(candidate_prompt, system_prompt=profiling_system_prompt)
-                candidate_profile = cand_res.get("candidate_profile", cand_res)
-
-                # Step 3: Generate interview spec
+                # Step 4: Generate interview spec
                 spec_prompt = build_interview_spec_prompt(
                     company_intel=company_intel,
                     candidate_profile=candidate_profile,
@@ -682,7 +712,7 @@ class ProfilerAgent:
                 interview_spec = spec_res.get("interview_spec", spec_res)
                 interview_spec = {**interview_spec, "interview_language": interview_language}
 
-                # Step 4: Generate stage plan
+                # Step 5: Generate stage plan
                 plan_prompt = build_stage_plan_prompt(
                     interview_spec=interview_spec,
                     candidate_profile=candidate_profile,
@@ -718,6 +748,7 @@ class ProfilerAgent:
                 candidate_profile,
                 knowledge,
                 knowledge_ok=knowledge_ok,
+                job_description=(form_data or {}).get("job_description"),
             )
 
             recon_data.setdefault("web_recon", [])

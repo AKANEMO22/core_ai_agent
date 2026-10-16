@@ -331,3 +331,53 @@ def test_workspace_root_mtime_touch_on_write(tmp_path: Path):
     assert time.time() - ws.root_path.stat().st_mtime < 5
 
 
+
+
+def test_read_json_returns_isolated_copies_and_write_text_invalidates_cache(tmp_path: Path):
+    """Mutating a read result cannot corrupt the cache; a text overwrite drops the parsed copy."""
+    ws = SessionWorkspace("cache", tmp_path)
+    ws.initialize()
+    ws.write_artifact("context/plan.json", artifact_type="plan", payload={"stages": [{"id": "a"}]})
+    first = ws.read_json("context/plan.json")
+    first["stages"].append({"id": "mutated"})
+    assert ws.read_json("context/plan.json")["stages"] == [{"id": "a"}]
+    ws.write_text("context/plan.json", json.dumps({"stages": []}))
+    assert ws.read_json("context/plan.json") == {"stages": []}
+
+
+def test_atomic_replace_retries_transient_permission_error(tmp_path: Path, monkeypatch):
+    """A reader briefly holding the target open on Windows must not fail the write."""
+    import core.workspace.session as session_module
+
+    ws = SessionWorkspace("retry", tmp_path, fsync=False)
+    ws.initialize()
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(session_module.os, "replace", flaky_replace)
+    ws.write_text("reports/report.md", "hello")
+    assert calls["n"] == 3
+    assert (ws.root_path / "reports" / "report.md").read_text(encoding="utf-8") == "hello"
+    assert not list((ws.root_path / "reports").glob(".tmp_*"))
+
+
+def test_atomic_replace_gives_up_and_cleans_temp_after_retries(tmp_path: Path, monkeypatch):
+    import core.workspace.session as session_module
+
+    ws = SessionWorkspace("retry-fail", tmp_path, fsync=False)
+    ws.initialize()
+    monkeypatch.setattr(session_module.time, "sleep", lambda _s: None)
+
+    def always_locked(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(session_module.os, "replace", always_locked)
+    with pytest.raises(PermissionError):
+        ws.write_artifact("context/x.json", artifact_type="x", payload={"a": 1})
+    assert not list((ws.root_path / "context").glob(".tmp_*"))

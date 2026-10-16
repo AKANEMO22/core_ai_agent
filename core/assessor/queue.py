@@ -88,7 +88,11 @@ class RedisAssessmentQueue:
         return f"session:{session_id}:revoked"
 
     async def is_revoked(self, session_id: str) -> bool:
-        return bool(await self.redis_client.exists(self.revoked_key(session_id)))
+        return bool(await self.redis_client.exists(self.revoked_key(session_id), self.stopped_key(session_id)))
+
+    @staticmethod
+    def stopped_key(session_id: str) -> str:
+        return f"session:{session_id}:work_stopped"
 
     @asynccontextmanager
     async def session_mutation(self, session_id: str, purpose: str = "assessment_lock"):
@@ -138,8 +142,8 @@ class RedisAssessmentQueue:
         while True:
             async with self.redis_client.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(self.revoked_key(session_id))
-                    if await pipe.exists(self.revoked_key(session_id)):
+                    await pipe.watch(self.revoked_key(session_id), self.stopped_key(session_id))
+                    if await pipe.exists(self.revoked_key(session_id), self.stopped_key(session_id)):
                         return None
                     # WATCH buộc mọi enqueue/retry/DLQ dừng nếu DELETE dựng hàng rào.
                     pipe.multi()
@@ -296,27 +300,40 @@ class RedisAssessmentQueue:
         Returns:
             List[Tuple[str, Dict[str, Any]]]: List of reclaimed (message_id, parsed_job_dict).
         """
-        response = await self.redis_client.xautoclaim(
-            self.stream_key,
-            group_name,
-            consumer_name,
-            min_idle_time=min_idle_time_ms,
-            start_id="0-0",
-            count=count,
-        )
-
         results: List[Tuple[str, Dict[str, Any]]] = []
-        if not response or len(response) < 2:
-            return results
-
-        messages = response[1]
-        for msg in messages:
-            if isinstance(msg, (list, tuple)) and len(msg) >= 2:
-                msg_id, fields = msg[0], msg[1]
-                job_data = self._parse_message_fields(fields)
-                results.append((msg_id, job_data))
+        # XAUTOCLAIM scans at most ~count*10 PEL entries per call; follow the returned
+        # cursor so idle jobs behind a long run of fresh pending entries are still reclaimed.
+        cursor: Any = "0-0"
+        while len(results) < count:
+            response = await self.redis_client.xautoclaim(
+                self.stream_key,
+                group_name,
+                consumer_name,
+                min_idle_time=min_idle_time_ms,
+                start_id=cursor,
+                count=count - len(results),
+            )
+            if not response or len(response) < 2:
+                break
+            for msg in response[1]:
+                if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+                    msg_id, fields = msg[0], msg[1]
+                    job_data = self._parse_message_fields(fields)
+                    results.append((msg_id, job_data))
+            cursor = response[0]
+            if isinstance(cursor, bytes):
+                cursor = cursor.decode()
+            if not cursor or cursor == "0-0":
+                break
 
         return results
+
+    async def refresh_claim(self, group_name: str, consumer_name: str, message_id: str) -> None:
+        """Reset a pending job's idle time so a long evaluation is not reclaimed mid-flight."""
+        # XCLAIM to the current owner with min-idle 0 only resets the delivery idle timer.
+        await self.redis_client.xclaim(
+            self.stream_key, group_name, consumer_name, min_idle_time=0, message_ids=[message_id], justid=True
+        )
 
     async def send_to_dead_letter(
         self,
@@ -374,10 +391,10 @@ class RedisAssessmentQueue:
             while True:
                 async with self.redis_client.pipeline(transaction=True) as pipe:
                     try:
-                        await pipe.watch(self.delayed_key, self.stream_key, enqueued_key, self.revoked_key(session_id))
+                        await pipe.watch(self.delayed_key, self.stream_key, enqueued_key, self.revoked_key(session_id), self.stopped_key(session_id))
                         if await pipe.zscore(self.delayed_key, raw) is None:
                             break
-                        revoked = await pipe.exists(self.revoked_key(session_id))
+                        revoked = await pipe.exists(self.revoked_key(session_id), self.stopped_key(session_id))
                         if not revoked:
                             # MULTI không rollback lỗi lệnh: kiểm tra kiểu trước khi xóa retry.
                             for key, expected_type in ((self.stream_key, "stream"), (enqueued_key, "set")):
@@ -455,11 +472,13 @@ class RedisAssessmentQueue:
         # Khôi phục budget trước khi enqueue lại; bỏ dấu lỗi để barrier có thể tiếp tục chờ kết quả.
         entries = await self.redis_client.xrange(self.dead_letter_stream_key, "-", "+")
         for entry_id, fields in entries:
-            if fields.get("session_id") != session_id:
-                continue
             job_data = self._parse_message_fields(fields)
+            if job_data.get("session_id") != session_id:
+                continue
             job_data["retry_count"] = 0
-            await self.enqueue(job_data)
+            # A refused enqueue (revoked/stopped session) must keep the DLQ record.
+            if not await self.enqueue(job_data):
+                continue
             await self.redis_client.xdel(self.dead_letter_stream_key, entry_id)
             await self.redis_client.srem(failed_assessments_key(session_id), job_data.get("job_id", ""))
             requeued.append(job_data.get("job_id", ""))

@@ -50,6 +50,24 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dpl_pvan}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-compose-postgres-password-change-before-use}
+      POSTGRES_DB: ${POSTGRES_DB:-dpl_pvan}
+    ports:
+      - "127.0.0.1:${DPL_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
   app:
     build:
       context: .
@@ -59,21 +77,25 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       APP_ENV: development
       PRODUCT_MODE: practice
       PROFILING_DEADLINE_SECONDS: ${DPL_PROFILING_DEADLINE_SECONDS:-240}
       # Two separate frontends, sharing the real core and durable trace archive.
-      INSPECTOR_ENABLED: ${DPL_INSPECTOR_ENABLED:-true}
+      INSPECTOR_ENABLED: "true"
       INSPECTOR_LOCAL_AUTH: ${DPL_INSPECTOR_LOCAL_AUTH:-true}
-      TEST_UI_ENABLED: ${DPL_TEST_UI_ENABLED:-true}
+      TEST_UI_ENABLED: "true"
       STUDIO_REQUIRE_REAL_PROVIDER: true
       JWT_SECRET: ${DOCKER_JWT_SECRET:-local-compose-development-secret-change-before-production}
       REDIS_URL: redis://redis:6379/0
       WORKSPACE_ROOT_BASE: /data/workspaces
       ARTIFACT_ARCHIVE_ENABLED: "true"
       ARTIFACT_ARCHIVE_BUCKET: user-artifacts
-      ARTIFACT_ARCHIVE_CATALOG_PATH: /data/archive/catalog.sqlite3
+      # Archive catalog + inspector traces live in Postgres; the SQLite catalog path is
+      # unused while DATABASE_URL is set (see scripts/migrate_sqlite_to_postgres.py).
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dpl_pvan}:${POSTGRES_PASSWORD:-local-compose-postgres-password-change-before-use}@postgres:5432/${POSTGRES_DB:-dpl_pvan}
       OBJECT_STORE_ENDPOINT: http://minio:9000
       OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:-dpl-pvan-local}
       OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-local-compose-minio-password-change-before-use}
@@ -94,13 +116,12 @@ services:
     volumes:
       - interview_workspaces:/data/workspaces
       - rag_index:/data/rag
-      - artifact_catalog:/data/archive
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"
+        - "import urllib.request; [urllib.request.urlopen('http://127.0.0.1:8000' + path, timeout=3).close() for path in ('/health/ready', '/inspect/', '/test/')]"
       interval: 10s
       timeout: 5s
       retries: 6
@@ -114,4 +135,7 @@ volumes:
   interview_workspaces:
   rag_index:
   minio_data:
+  # Legacy SQLite catalog volume: no longer mounted by app (DATABASE_URL is set); kept so
+  # existing data can be migrated with scripts/migrate_sqlite_to_postgres.py.
   artifact_catalog:
+  postgres_data:

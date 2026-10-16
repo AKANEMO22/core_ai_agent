@@ -97,6 +97,37 @@ async def test_invented_quotes_leave_the_criterion_unscored(workspace: SessionWo
     assert result["flags"]["unverified_quotes_dropped"] == 1
 
 
+def test_quote_verification_requires_word_boundaries():
+    source = "Some teams abuse redis caches for queues, then we use redis cache invalidation."
+    assert not verify_quote("use redis caches", "Some teams abuse redis caches for queues.")
+    assert verify_quote("use redis cache", source)
+    assert not verify_quote("abuse redis ... caches for", "we abuse redis carefully; small caches format")
+    assert verify_quote("abuse redis ... caches for queues", source)
+
+
+@pytest.mark.asyncio
+async def test_partly_unverified_quotes_halve_confidence(workspace: SessionWorkspace):
+    def mixed(prompt: str) -> Dict[str, Any]:
+        return {
+            "criteria": [{
+                "competency_id": "be_distributed_systems", "status": "scored", "level": 3, "confidence": 0.8,
+                "rationale": "x", "evidence_quotes": [
+                    "idempotency keys stored in Postgres", "I designed fencing tokens for every lock",
+                ],
+            }],
+            "content_score": 7, "communication_score": 7, "strengths": [], "improvements": [],
+        }
+
+    llm = ScriptedInterviewLLM(overrides={"criterion_evaluation": mixed})
+    result = await CriterionEvaluator(llm, lambda sid: workspace).evaluate_turn(
+        question="q", candidate_text=ANSWER, rubric_target=["be_distributed_systems"], session_id="s", turn_id="turn_001",
+    )
+    item = result["criteria"][0]
+    assert item["status"] == "scored" and len(item["evidence"]) == 1
+    assert item["confidence"] == 0.4
+    assert result["flags"]["unverified_quotes_dropped"] == 1
+
+
 @pytest.mark.asyncio
 async def test_evaluator_raises_on_invalid_output_and_uses_legacy_without_rubric(tmp_path: Path, workspace: SessionWorkspace):
     with pytest.raises(StructuredOutputError):

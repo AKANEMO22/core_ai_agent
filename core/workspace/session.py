@@ -6,17 +6,51 @@ Mọi đường dẫn đi qua ``resolve_path`` trước khi chạm filesystem, c
 bọc metadata/checksum và thay thế nguyên tử để các thành phần khác có thể đọc an toàn.
 """
 
+import copy
 import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from config.settings import get_settings
 from core.workspace.security import validate_path_safety
+
+
+_PATH_LOCKS: Dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+_REPLACE_ATTEMPTS = 10
+
+
+def _path_lock(target_path: Path) -> threading.Lock:
+    """Serialize writers of one destination so temp+replace sequences do not interleave."""
+    key = os.path.normcase(str(target_path))
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = _PATH_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _replace_with_retry(source: str, target: Path) -> None:
+    """``os.replace`` that tolerates transient Windows sharing violations.
+
+    On Windows, replacing a file another handle has open raises PermissionError
+    (WinError 5/32) until the reader closes it; retry briefly before giving up.
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(min(0.05, 0.01 * (attempt + 1)))
 
 
 def normalize_session_id(session_id: str) -> str:
@@ -189,7 +223,8 @@ class SessionWorkspace:
             if self.fsync:
                 os.fsync(temp_file.fileno())
             temp_file.close()
-            os.replace(temp_file.name, target_path)
+            with _path_lock(target_path):
+                _replace_with_retry(temp_file.name, target_path)
         except Exception:
             if not temp_file.closed:
                 temp_file.close()
@@ -203,7 +238,7 @@ class SessionWorkspace:
             pass
 
         key = str(rel_path).replace("\\", "/")
-        self._json_cache[key] = envelope
+        self._json_cache[key] = copy.deepcopy(envelope)
 
         return target_path
 
@@ -217,15 +252,15 @@ class SessionWorkspace:
             dict: Parsed JSON data.
         """
         key = str(rel_path).replace("\\", "/")
+        # Callers receive deep copies so mutating a result can never corrupt the cache.
         if key in self._json_cache:
-            cached = self._json_cache[key]
-            return dict(cached) if isinstance(cached, dict) else cached
+            return copy.deepcopy(self._json_cache[key])
 
         target_path = self.resolve_path(rel_path)
         with open(target_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            self._json_cache[key] = data
-            return data
+        self._json_cache[key] = data
+        return copy.deepcopy(data)
 
     def delete_artifact(self, rel_path: Union[str, Path]) -> bool:
         """Remove one workspace artifact through the same traversal-safe path boundary."""
@@ -269,7 +304,8 @@ class SessionWorkspace:
             if self.fsync:
                 os.fsync(temp_file.fileno())
             temp_file.close()
-            os.replace(temp_file.name, target_path)
+            with _path_lock(target_path):
+                _replace_with_retry(temp_file.name, target_path)
         except Exception:
             if not temp_file.closed:
                 temp_file.close()
@@ -281,6 +317,8 @@ class SessionWorkspace:
             os.utime(self.root_path, None)
         except OSError:
             pass
+        # A text write may overwrite a JSON artifact; never serve the stale parsed copy.
+        self._json_cache.pop(str(rel_path).replace("\\", "/"), None)
 
         return target_path
 
@@ -300,7 +338,8 @@ class SessionWorkspace:
             if self.fsync:
                 os.fsync(temp_file.fileno())
             temp_file.close()
-            os.replace(temp_file.name, target_path)
+            with _path_lock(target_path):
+                _replace_with_retry(temp_file.name, target_path)
         except Exception:
             if not temp_file.closed:
                 temp_file.close()

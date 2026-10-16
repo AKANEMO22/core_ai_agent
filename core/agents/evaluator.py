@@ -209,12 +209,14 @@ class CriterionEvaluator:
                 continue
             # Đối chiếu quote với câu trả lời gốc trước khi cho phép mức điểm tham gia coverage.
             evidence = []
+            criterion_unverified = 0
             for quote in item.get("evidence_quotes") or []:
                 verified = verify_quote(quote, candidate_text)
                 if verified:
                     evidence.append({"quote": quote, "turn_id": turn_id, "verified": True})
                 else:
-                    unverified_total += 1
+                    criterion_unverified += 1
+            unverified_total += criterion_unverified
             # Không giữ mức điểm nếu mọi trích dẫn đều bị loại; confidence thấp vẫn có thể cộng dồn qua nhiều lượt.
             if not evidence:
                 criteria.append(
@@ -229,6 +231,9 @@ class CriterionEvaluator:
                 )
                 continue
             confidence = float(item.get("confidence", 0.0))
+            if criterion_unverified:
+                # Any invented quote makes the model's self-reported confidence suspect.
+                confidence *= 0.5
             criteria.append(
                 {
                     "competency_id": cid,

@@ -25,6 +25,7 @@ class LifecycleStatus(str, Enum):
     STAGE_TRANSITIONING = "STAGE_TRANSITIONING"
     DIALOGUE_COMPLETED = "DIALOGUE_COMPLETED"
     ASSESSING = "ASSESSING"
+    ENDING = "ENDING"
     REPORT_READY = "REPORT_READY"
     ASSESSMENT_FAILED = "ASSESSMENT_FAILED"
     FAILED = "FAILED"
@@ -111,6 +112,18 @@ VALID_TRANSITIONS: Dict[LifecycleStatus, Set[LifecycleStatus]] = {
     LifecycleStatus.FAILED: set(),
     LifecycleStatus.CANCELLED: set(),
     LifecycleStatus.EXPIRED: set(),
+}
+
+# Explicit end closes every active phase, while retaining report generation as the
+# only remaining work. Terminal outcomes cannot be reopened.
+for _status, _destinations in VALID_TRANSITIONS.items():
+    if _status not in TERMINAL_STATUSES:
+        _destinations.add(LifecycleStatus.ENDING)
+# ASSESSMENT_FAILED bounds report retries: an early end that keeps failing goes to operator review.
+VALID_TRANSITIONS[LifecycleStatus.ENDING] = {
+    LifecycleStatus.REPORT_READY,
+    LifecycleStatus.ASSESSMENT_FAILED,
+    LifecycleStatus.CANCELLED,
 }
 
 

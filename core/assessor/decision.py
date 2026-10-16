@@ -7,7 +7,9 @@ Rules (in order):
        below its pass level by at most borderline_band                      -> NEEDS_REVIEW
     3. No covered criterion at all                                          -> NEEDS_REVIEW
     4. |weighted_score - pass_threshold| <= borderline_band                 -> NEEDS_REVIEW
-    5. weighted_score >= pass_threshold                                     -> PASS, else FAIL
+    5. weighted_score >= pass_threshold but covered criteria carry less than
+       min_coverage_weight of the rubric weight                             -> NEEDS_REVIEW
+    6. weighted_score >= pass_threshold                                     -> PASS, else FAIL
 
 `weighted_score` is the weight-renormalized mean of final levels over covered criteria, where a
 criterion's final level is the confidence-weighted mean of its evidence levels.
@@ -41,6 +43,8 @@ class DecisionConfig:
 
     min_confidence: float = 0.6
     borderline_band: float = 0.25
+    # Share of total rubric weight that covered criteria must carry before a PASS is issued.
+    min_coverage_weight: float = 0.5
     product_mode: str = "practice"
 
 
@@ -88,6 +92,7 @@ def compute_decision(
     uncovered: List[str] = []
     weighted_sum = 0.0
     weight_total = 0.0
+    rubric_weight_total = 0.0
     # Must-have được xét trước điểm trung bình; điểm cao ở tiêu chí khác không thể bù cho tiêu chí bắt buộc thiếu.
     for cid in sorted(coverage):
         item = coverage[cid]
@@ -103,6 +108,8 @@ def compute_decision(
                 must_have_borderline.append(cid)
             else:
                 must_have_failed.append(cid)
+        if item.weight > 0:
+            rubric_weight_total += item.weight
         if covered and level is not None and item.weight > 0:
             weighted_sum += level * item.weight
             weight_total += item.weight
@@ -126,6 +133,7 @@ def compute_decision(
 
     # Mẫu số chỉ gồm trọng số của tiêu chí đủ bằng chứng, không coi thiếu dữ liệu là điểm 0.
     weighted_score = _round(weighted_sum / weight_total) if weight_total > 0 else None
+    coverage_share = weight_total / rubric_weight_total if rubric_weight_total > 0 else 0.0
     reasons: List[str] = []
     if must_have_failed:
         verdict = FAIL
@@ -145,6 +153,13 @@ def compute_decision(
         verdict = NEEDS_REVIEW
         reasons.append(
             f"weighted score {weighted_score} within ±{config.borderline_band} of threshold {pass_threshold}"
+        )
+    elif weighted_score >= pass_threshold and coverage_share < config.min_coverage_weight:
+        # A high mean over a thin slice of the rubric is not evidence of passing it.
+        verdict = NEEDS_REVIEW
+        reasons.append(
+            f"covered criteria carry {_round(coverage_share)} of rubric weight "
+            f"(< {config.min_coverage_weight}); insufficient coverage to pass"
         )
     elif weighted_score >= pass_threshold:
         verdict = PASS
@@ -184,6 +199,7 @@ def compute_decision(
         "pass_threshold": pass_threshold,
         "borderline_band": config.borderline_band,
         "min_confidence": config.min_confidence,
+        "covered_weight_share": _round(coverage_share),
         "scale": {"min": 1, "max": 4},
         "criteria": criteria,
         "uncovered_criteria": uncovered,

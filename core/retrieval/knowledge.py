@@ -31,7 +31,7 @@ _LEVEL_PATTERNS = (
 
 _ROLE_FAMILY_PATTERNS = (
     ("frontend", re.compile(r"\b(front[\s-]?end|react|vue|angular|ui engineer|web developer)\b")),
-    ("backend", re.compile(r"\b(back[\s-]?end|server|api|platform|distributed|microservices?)\b")),
+    ("backend", re.compile(r"\b(back[\s-]?end|full[\s-]?stack|product engineer|growth engineer|server|api|distributed|microservices?)\b")),
     ("data", re.compile(r"\b(data engineer|data analyst|data scientist|machine learning|\bml\b|\bai\b|analytics|\bdba\b)\b")),
     ("qa", re.compile(r"\b(qa|qc|quality assurance|test engineer|software tester|automation tester)\b")),
     ("devops", re.compile(r"\b(devops|sre|cloud engineer|platform operations)\b")),
@@ -297,8 +297,8 @@ class InterviewKnowledgeService:
             "rubric": rubric,
             "question_bank": question_bank,
             "question_bank_status": (
-                "generated_from_candidate_profile_and_jd"
-                if level in {"mid", "senior"} and not any(question_lists)
+                "retrieved_with_authored_scaffolds"
+                if any(chunk.metadata.get("provenance") == "project_authored" for chunks in question_lists for chunk in chunks)
                 else "retrieved"
             ),
             "company_context": company_context,
@@ -389,6 +389,19 @@ class InterviewKnowledgeService:
             "follow_ups": list(meta.get("follow_ups", [])),
             "score": chunk.score,
             "source": chunk.source,
+            # Provenance and calibration let reviewers tell indexed evidence from authored scaffolds.
+            **{
+                key: meta[key]
+                for key in (
+                    "provenance",
+                    "trust",
+                    "calibration_level",
+                    "calibration_expectations",
+                    "selected_role",
+                    "source_levels",
+                )
+                if key in meta
+            },
         }
 
 

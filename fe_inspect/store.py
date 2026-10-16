@@ -1,7 +1,9 @@
 """Durable, content-safe execution records for the inspector.
 
-SQLite is authoritative: every mutation commits before returning, readers see one
-transactional snapshot, and deleted sessions cannot be recreated by late callbacks.
+The database (SQLite by default, PostgreSQL when a ``Database`` is supplied) is
+authoritative: every mutation commits before returning, writers are serialized,
+readers see one transactional snapshot, and deleted sessions cannot be recreated
+by late callbacks.
 """
 
 from __future__ import annotations
@@ -22,7 +24,10 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
+
+if TYPE_CHECKING:
+    from core.storage.database import Database
 
 _PROCESS_ID = f"{os.getpid()}:{uuid.uuid4().hex}"
 _WRITER_HANDLES: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
@@ -167,6 +172,51 @@ def _timestamp(value: Any) -> float | None:
             return None
 
 
+#: PostgreSQL schema (in its own ``inspect_trace`` schema), versioned via schema_version.
+POSTGRES_MIGRATIONS: dict[int, list[str]] = {
+    1: [
+        "CREATE TABLE IF NOT EXISTS revisions (session_id TEXT PRIMARY KEY, revision BIGINT NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS tombstones (session_id TEXT PRIMARY KEY, deleted_at DOUBLE PRECISION NOT NULL)",
+        """CREATE TABLE IF NOT EXISTS archive_metadata (
+               session_id TEXT NOT NULL, key TEXT NOT NULL, body TEXT NOT NULL,
+               PRIMARY KEY (session_id, key))""",
+        """CREATE TABLE IF NOT EXISTS spans (
+               span_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               parent_span_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL,
+               process_id TEXT NOT NULL, sequence BIGINT NOT NULL,
+               revision BIGINT NOT NULL, body TEXT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS spans_session ON spans(session_id, sequence)",
+        "CREATE INDEX IF NOT EXISTS spans_instance ON spans(((body::json)->>'instance_id'))",
+        "CREATE INDEX IF NOT EXISTS spans_open ON spans(process_id) WHERE status IN ('running','queued')",
+        """CREATE TABLE IF NOT EXISTS events (
+               session_id TEXT NOT NULL, event_id TEXT NOT NULL,
+               sequence BIGINT NOT NULL, body TEXT NOT NULL,
+               PRIMARY KEY (session_id, event_id), UNIQUE (session_id, sequence))""",
+        "CREATE TABLE IF NOT EXISTS states (session_id TEXT PRIMARY KEY, body TEXT NOT NULL)",
+        """CREATE TABLE IF NOT EXISTS instances (
+               row_order BIGINT GENERATED ALWAYS AS IDENTITY,
+               instance_id TEXT PRIMARY KEY, session_id TEXT, process_id TEXT NOT NULL,
+               ended_at DOUBLE PRECISION, body TEXT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS instances_session ON instances(session_id)",
+    ],
+}
+_WRITE_LOCK = "inspect_trace:write"
+_OWNER_LOCK = "inspect_trace:owner"
+
+
+class _PgWriterHandle:
+    """Holds the session-level advisory lock that marks the single owner process."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+
+    def __del__(self) -> None:
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+
+
 class SessionDeletedError(ValueError):
     """A tombstoned session rejects late writes permanently."""
 
@@ -174,8 +224,20 @@ class SessionDeletedError(ValueError):
 class TraceStore:
     """Persist observed session/agent/model/tool lifecycles in one SQLite database."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, database: "Database | None" = None) -> None:
+        self.database = database
+        self.backend = "postgres" if database is not None else "sqlite"
+        if database is not None:
+            self.path = None
+            self.location = database.location
+            self._claim_pg_writer()
+            self.process_id = _PROCESS_ID
+            database.ensure_schema(POSTGRES_MIGRATIONS)
+            with self._write() as db:
+                self._recover(db)
+            return
         self.path = Path(root).resolve() / ".inspect" / "traces.sqlite3"
+        self.location = str(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._claim_writer()
         self.process_id = _PROCESS_ID
@@ -214,18 +276,49 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS instances_session ON instances(session_id);
             """)
             db.execute("BEGIN IMMEDIATE")
-            for row in db.execute("SELECT * FROM spans WHERE status IN ('running','queued') AND kind!='run' AND process_id!=?", (self.process_id,)).fetchall():
-                body = json.loads(row["body"])
-                body.update(status="abandoned", ended_at=None, duration_ms=None,
-                            error="Recorder process restarted; the actual execution end time was not observed.")
-                self._write_span(db, body)
-            for row in db.execute("SELECT * FROM instances WHERE ended_at IS NULL AND process_id!=?", (self.process_id,)).fetchall():
-                body = json.loads(row["body"])
-                if body.get("status") != "abandoned":
-                    body.update(status="abandoned", end_reason="process_restart", end_time_known=False)
-                    db.execute("UPDATE instances SET body=? WHERE instance_id=?", (_json(body), body["instance_id"]))
-                    self._revise_instance_sessions(db, body["instance_id"], body.get("session_id"))
+            self._recover(db)
             db.commit()
+
+    def _recover(self, db: Any) -> None:
+        """Mark lifetimes left open by a previous (dead) owner process as abandoned."""
+        for row in db.execute("SELECT * FROM spans WHERE status IN ('running','queued') AND kind!='run' AND process_id!=?", (self.process_id,)).fetchall():
+            body = json.loads(row["body"])
+            body.update(status="abandoned", ended_at=None, duration_ms=None,
+                        error="Recorder process restarted; the actual execution end time was not observed.")
+            self._write_span(db, body)
+        for row in db.execute("SELECT * FROM instances WHERE ended_at IS NULL AND process_id!=?", (self.process_id,)).fetchall():
+            body = json.loads(row["body"])
+            if body.get("status") != "abandoned":
+                body.update(status="abandoned", end_reason="process_restart", end_time_known=False)
+                db.execute("UPDATE instances SET body=? WHERE instance_id=?", (_json(body), body["instance_id"]))
+                self._revise_instance_sessions(db, body["instance_id"], body.get("session_id"))
+
+    def _claim_pg_writer(self) -> None:
+        """PostgreSQL equivalent of the writer file lock: a session-level advisory lock.
+
+        It is held on a dedicated connection for this process's lifetime and released by
+        the server when the process (or its connection) dies, so recovery never marks a
+        still-live owner's work abandoned.
+        """
+        from core.storage.database import advisory_key
+
+        key = "postgres:" + self.database.location
+        with _WRITER_GUARD:
+            if key in _WRITER_HANDLES:
+                self._writer_handle = _WRITER_HANDLES[key]
+                return
+            connection = self.database.dedicated_connection()
+            try:
+                acquired = connection.execute("SELECT pg_try_advisory_lock(%s)", (advisory_key(f"{_OWNER_LOCK}:{self.database.schema}"),)).fetchone()[0]
+            except Exception:
+                connection.close()
+                raise
+            if not acquired:
+                connection.close()
+                raise RuntimeError("Trace archive already has an active core process; run one API process per trace database")
+            handle = _PgWriterHandle(connection)
+            _WRITER_HANDLES[key] = handle
+            self._writer_handle = handle
 
     def _claim_writer(self) -> None:
         """Enforce this core's single-process deployment before recovering lifetimes.
@@ -270,7 +363,11 @@ class TraceStore:
                        (session_id, key, _json(value)))
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Iterator[Any]:
+        if self.database is not None:
+            with self.database.connection() as pg:
+                yield pg
+            return
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
@@ -285,22 +382,26 @@ class TraceStore:
             db.close()
 
     @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
+    def _write(self) -> Iterator[Any]:
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
+            if self.database is not None:
+                # BEGIN IMMEDIATE equivalent: one writer at a time across all processes.
+                db.lock(f"{_WRITE_LOCK}:{self.database.schema}")
+            else:
+                db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()
 
     @staticmethod
-    def _deleted(db: sqlite3.Connection, session_id: str) -> bool:
+    def _deleted(db: Any, session_id: str) -> bool:
         return db.execute("SELECT 1 FROM tombstones WHERE session_id=?", (session_id,)).fetchone() is not None
 
     @staticmethod
-    def _bump(db: sqlite3.Connection, session_id: str) -> int:
-        db.execute("INSERT INTO revisions(session_id,revision) VALUES (?,1) ON CONFLICT(session_id) DO UPDATE SET revision=revision+1", (session_id,))
+    def _bump(db: Any, session_id: str) -> int:
+        db.execute("INSERT INTO revisions(session_id,revision) VALUES (?,1) ON CONFLICT(session_id) DO UPDATE SET revision=revisions.revision+1", (session_id,))
         return int(db.execute("SELECT revision FROM revisions WHERE session_id=?", (session_id,)).fetchone()[0])
 
-    def _write_span(self, db: sqlite3.Connection, body: dict) -> dict:
+    def _write_span(self, db: Any, body: dict) -> dict:
         body["revision"] = self._bump(db, body["session_id"])
         clean = sanitize_payload(body)
         db.execute("""INSERT INTO spans(span_id,session_id,parent_span_id,kind,status,process_id,sequence,revision,body)
@@ -310,7 +411,7 @@ class TraceStore:
                     clean["status"], clean["process_id"], clean["sequence"], clean["revision"], _json(clean)))
         return clean
 
-    def _root(self, db: sqlite3.Connection, session_id: str, started_at: float | None = None) -> dict:
+    def _root(self, db: Any, session_id: str, started_at: float | None = None) -> dict:
         row = db.execute("SELECT body FROM spans WHERE span_id=?", (f"run:{session_id}",)).fetchone()
         if row:
             return json.loads(row[0])
@@ -424,15 +525,26 @@ class TraceStore:
         would make a realtime graph structurally incomplete.
         """
         with self._connect() as db:
-            db.execute("BEGIN")
+            if self.database is not None:
+                db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            else:
+                db.execute("BEGIN")
             revision = db.execute("SELECT revision FROM revisions WHERE session_id=?", (session_id,)).fetchone()
             spans = [json.loads(row[0]) for row in db.execute("SELECT body FROM spans WHERE session_id=? ORDER BY sequence", (session_id,))]
-            instances = [json.loads(row[0]) for row in db.execute("""SELECT body FROM instances WHERE session_id=? OR instance_id IN
-                (SELECT json_extract(body,'$.instance_id') FROM spans WHERE session_id=?) ORDER BY rowid""", (session_id, session_id))]
+            instances = [json.loads(row[0]) for row in db.execute(f"""SELECT body FROM instances WHERE session_id=? OR instance_id IN
+                (SELECT {self._instance_expr} FROM spans WHERE session_id=?) ORDER BY {self._instance_order}""", (session_id, session_id))]
             db.commit()
         return {"session_id": session_id, "spans": spans, "revision": int(revision[0]) if revision else 0,
                 "coverage": "recorded" if any(span["kind"] != "run" for span in spans) else "not_recorded",
-                "storage": "sqlite", "instances": instances}
+                "storage": self.backend, "instances": instances}
+
+    @property
+    def _instance_expr(self) -> str:
+        return "((body::json)->>'instance_id')" if self.database is not None else "json_extract(body,'$.instance_id')"
+
+    @property
+    def _instance_order(self) -> str:
+        return "row_order" if self.database is not None else "rowid"
 
     def span_summary(self, session_id: str) -> dict:
         with self._connect() as db:
@@ -538,8 +650,8 @@ class TraceStore:
             self._revise_instance_sessions(db, instance_id, body.get("session_id"))
             return sanitize_payload(body)
 
-    def _revise_instance_sessions(self, db: sqlite3.Connection, instance_id: str, session_id: str | None) -> None:
-        sessions = {row[0] for row in db.execute("SELECT DISTINCT session_id FROM spans WHERE json_extract(body,'$.instance_id')=?", (instance_id,))}
+    def _revise_instance_sessions(self, db: Any, instance_id: str, session_id: str | None) -> None:
+        sessions = {row[0] for row in db.execute(f"SELECT DISTINCT session_id FROM spans WHERE {self._instance_expr}=?", (instance_id,))}
         if session_id:
             sessions.add(session_id)
         for observed_session in sessions:
@@ -563,6 +675,6 @@ class TraceStore:
 
     def purge_session(self, session_id: str) -> None:
         with self._write() as db:
-            db.execute("INSERT OR IGNORE INTO tombstones(session_id,deleted_at) VALUES (?,?)", (session_id, time.time()))
+            db.execute("INSERT INTO tombstones(session_id,deleted_at) VALUES (?,?) ON CONFLICT(session_id) DO NOTHING", (session_id, time.time()))
             for table in ("spans", "events", "states", "instances", "revisions", "archive_metadata"):
                 db.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))

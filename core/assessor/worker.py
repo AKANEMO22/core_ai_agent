@@ -25,6 +25,7 @@ from core.runtime.agent import sanitize_secrets
 from core.runtime.client import RuntimeLLMClient
 from core.runtime.types import LoopEvent, LoopEventType
 from core.session.events import SessionEventStore
+from core.session.cancellation import CancellationRegistry
 from core.session.state import LifecycleStatus, SessionStateStore
 from core.workspace.session import SessionWorkspace, SessionWorkspaceManager
 
@@ -59,6 +60,7 @@ class AssessorWorker:
         on_assessment_completed: Optional[AssessmentCompletedCallback] = None,
         llm_semaphore: Optional[asyncio.Semaphore] = None,
         retry_base_delay_seconds: float = 1.0,
+        lease_refresh_seconds: float = 15.0,
     ) -> None:
         """Initialize AssessorWorker.
 
@@ -75,6 +77,8 @@ class AssessorWorker:
             on_assessment_completed: Optional callback invoked after each persisted evaluation.
             llm_semaphore: Optional semaphore bounding concurrent evaluator LLM calls.
             retry_base_delay_seconds: Base of the exponential retry backoff.
+            lease_refresh_seconds: How often an in-flight job's pending idle time is reset
+                (so XAUTOCLAIM recovery does not steal a slow but live evaluation).
         """
         self.redis_client = redis_client
         self.queue = queue
@@ -88,6 +92,9 @@ class AssessorWorker:
         self.on_assessment_completed = on_assessment_completed
         self.llm_semaphore = llm_semaphore
         self.retry_base_delay_seconds = retry_base_delay_seconds
+        self.lease_refresh_seconds = lease_refresh_seconds
+        self.cancellations = CancellationRegistry()
+        self._active_jobs: Dict[str, int] = {}
 
     def _get_workspace(self, session_id: str) -> SessionWorkspace:
         """Resolve SessionWorkspace instance for the given session ID."""
@@ -115,7 +122,7 @@ class AssessorWorker:
         if not jobs:
             return False
         message_id, job_data = jobs[0]
-        return await self._process_job_data(group_name, message_id, job_data)
+        return await self._process_job_data(group_name, message_id, job_data, consumer_name=consumer_name)
 
     async def recover_and_process_idle_jobs(
         self,
@@ -133,7 +140,7 @@ class AssessorWorker:
         )
         processed_count = 0
         for msg_id, job_data in claimed:
-            if await self._process_job_data(group_name, msg_id, job_data):
+            if await self._process_job_data(group_name, msg_id, job_data, consumer_name=consumer_name):
                 processed_count += 1
         return processed_count
 
@@ -174,6 +181,15 @@ class AssessorWorker:
         elif self.event_store is not None:
             await self.event_store.append_async(session_id, event)
 
+    async def _keep_claim(self, group_name: str, consumer_name: str, message_id: str) -> None:
+        """Periodically reset the job's idle time while it is being evaluated."""
+        while True:
+            await asyncio.sleep(self.lease_refresh_seconds)
+            try:
+                await self.queue.refresh_claim(group_name, consumer_name, message_id)
+            except Exception as e:
+                logger.warning("Assessment claim refresh failed: %s", sanitize_secrets(str(e)))
+
     async def _evaluate(self, **kwargs: Any) -> Dict[str, Any]:
         if self.llm_semaphore is None:
             return await self.evaluator.evaluate_turn(**kwargs)
@@ -196,8 +212,30 @@ class AssessorWorker:
         group_name: str,
         message_id: str,
         job_data: Dict[str, Any],
+        consumer_name: Optional[str] = None,
     ) -> bool:
         """Process a single assessment job with idempotency, evaluation, persistence and events."""
+        session_id = job_data.get("session_id", "")
+        self._active_jobs[session_id] = self._active_jobs.get(session_id, 0) + 1
+        try:
+            return await self._process_job(group_name, message_id, job_data, consumer_name)
+        finally:
+            remaining = self._active_jobs.get(session_id, 1) - 1
+            if remaining <= 0:
+                # No in-flight job remains: drop RAM cancellation state (the durable Redis
+                # fence is re-checked by every new job) so the registry does not grow forever.
+                self._active_jobs.pop(session_id, None)
+                self.cancellations.forget(session_id)
+            else:
+                self._active_jobs[session_id] = remaining
+
+    async def _process_job(
+        self,
+        group_name: str,
+        message_id: str,
+        job_data: Dict[str, Any],
+        consumer_name: Optional[str],
+    ) -> bool:
         session_id = job_data.get("session_id", "")
         turn_id = job_data.get("turn_id", "")
         job_id = job_data.get("job_id", "")
@@ -255,15 +293,24 @@ class AssessorWorker:
         # Gọi LLM ngoài lease: không giữ khóa phiên suốt thời gian mạng/model xử lý.
         # 3. Evaluate
         try:
-            eval_result = await self._evaluate(
-                question=question,
-                candidate_text=candidate_text,
-                rubric_target=rubric_target,
-                rubric_version=rubric_version,
-                vad_metrics=vad_metrics,
-                session_id=session_id,
-                turn_id=turn_id,
+            keepalive = (
+                asyncio.create_task(self._keep_claim(group_name, consumer_name, message_id))
+                if consumer_name else None
             )
+            try:
+                eval_result = await self.cancellations.run(session_id, self._evaluate(
+                    question=question,
+                    candidate_text=candidate_text,
+                    rubric_target=rubric_target,
+                    rubric_version=rubric_version,
+                    vad_metrics=vad_metrics,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                ), self.redis_client)
+            finally:
+                if keepalive is not None:
+                    keepalive.cancel()
+                    await asyncio.gather(keepalive, return_exceptions=True)
 
             artifact_payload = {
                 "schema_version": eval_result.get("schema_version", "1.0"),
@@ -323,6 +370,27 @@ class AssessorWorker:
                 await self.on_assessment_completed(session_id)
             return True
 
+        except asyncio.CancelledError:
+            # Only a cancellation of this task itself (pool shutdown) propagates. A per-session
+            # cancellation must not terminate the shared pool consumer, even if the stop fence
+            # has already disappeared again (e.g. the session was deleted meanwhile).
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            if await self.queue.is_revoked(session_id):
+                await self.queue.ack_job(group_name, message_id)
+                await self.redis_client.xdel(self.queue.stream_key, message_id)
+                return True
+            async with self.queue.session_mutation(session_id):
+                if await self._discard_if_deleted(session_id, group_name, message_id):
+                    return True
+            # Still live: leave the delivery pending so idle recovery re-evaluates it.
+            logger.warning(
+                "Assessment evaluation cancelled without a stop fence (session %s, %s); left pending",
+                session_ref(session_id),
+                turn_id,
+            )
+            return False
         except Exception as exc:
             async with self.queue.session_mutation(session_id):
                 if await self._discard_if_deleted(session_id, group_name, message_id):
@@ -346,8 +414,10 @@ class AssessorWorker:
                         error_reason=clean_error,
                         message_id=message_id,
                     )
-                    await self.queue.ack_job(group_name, message_id)
+                    # Record the failure before ACK: a crash between the two must leave the job
+                    # redeliverable rather than ACKed but absent from the barrier's failed set.
                     await self.redis_client.sadd(failed_assessments_key(session_id), job_id)
+                    await self.queue.ack_job(group_name, message_id)
 
                     if self.state_manager is not None:
                         try:

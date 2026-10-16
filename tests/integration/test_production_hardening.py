@@ -212,7 +212,7 @@ def test_barge_in_cancels_generation_and_persists_partial_turn(tmp_path: Path) -
     )
     with TestClient(app) as client:
         created = client.post(
-            "/api/v1/sessions", json={"candidate_name": "Barge"}, headers=_headers(settings)
+            "/api/v1/sessions", json={"candidate_name": "Barge", "target_role": "Senior Backend Engineer"}, headers=_headers(settings)
         ).json()
         with client.websocket_connect(
             f"/ws/sessions/{created['session_id']}/stream",

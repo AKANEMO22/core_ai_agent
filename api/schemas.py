@@ -3,7 +3,7 @@
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from core.runtime.types import LoopEvent, LoopEventType
 from core.session.state import LifecycleStatus
@@ -21,7 +21,7 @@ class CreateSessionRequest(BaseModel):
     candidate_name: str = Field(..., description="Full name of the interview candidate")
     experience_years: Optional[float] = Field(default=None, description="Years of professional experience")
     target_company: str = Field(default="Target Company", description="Target employer for interview")
-    target_role: str = Field(default="Senior Software Engineer", description="Target job role")
+    target_role: Optional[str] = Field(default=None, description="Target job role; omitted values are taken from the CV")
     skills: List[str] = Field(default_factory=list, description="Primary technical and domain skills")
     session_id: Optional[str] = Field(default=None, description="Optional custom session identifier")
     cv_text: Optional[str] = Field(default=None, max_length=180_000, description="Optional resume or CV plain text content")
@@ -206,6 +206,13 @@ class ProtocolEnvelope(BaseModel):
             type=event.type,
             payload=event.payload,
         )
+
+
+class StartInterviewMessage(BaseModel):
+    """Explicit current-plan acceptance; strings must never act as consent."""
+
+    type: Literal["start_interview"]
+    confirm_limitations: StrictBool = False
 
 
 class CandidateAnswerMessage(BaseModel):

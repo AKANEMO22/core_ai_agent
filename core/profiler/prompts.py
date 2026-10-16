@@ -195,6 +195,8 @@ Extract each field only when the untrusted input supports it. Keep unknown field
 Expected JSON Schema for `candidate_profile`:
 {{
   "candidate_name": null,
+  "target_role": null,
+  "target_company": null,
   "summary": null,
   "career_goals": [],
   "experience": [{{"role": "", "company": "", "period": "", "responsibilities": [], "results": [], "evidence_ref": ""}}],
@@ -210,6 +212,7 @@ Expected JSON Schema for `candidate_profile`:
   "experience_years": null,
   "missing_or_conflicting_fields": []
 }}
+Set `target_role`/`target_company` only when the input states a desired position or employer (objective, application line); otherwise leave them null.
 Respond with JSON only for `candidate_profile`.
 """
 

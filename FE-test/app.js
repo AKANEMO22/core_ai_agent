@@ -2,7 +2,7 @@
 "use strict";
 (async () => {
   // Recover when an older cached HTML page does not include the locale helper yet.
-  if (!window.CoreTestI18n) await import("./i18n.js?v=20261013-ux2");
+  if (!window.CoreTestI18n) await import("./i18n.js?v=20261014-ux3");
   const $ = (id) => document.getElementById(id);
   const i18n = window.CoreTestI18n;
   const translatedCopy = new Map();
@@ -12,7 +12,7 @@
     translatedCopy.set(text, {source, values});
     return text;
   };
-  const statusLabels = {INITIALIZED:"Đã khởi tạo",PROFILING:"Đang chuẩn bị hồ sơ",READY:"Sẵn sàng",STAGE_ACTIVE:"Đang phỏng vấn",ASSESSING:"Đang đánh giá",SYNTHESIZING:"Đang tổng hợp",REPORT_READY:"Báo cáo sẵn sàng",CANCELLED:"Đã hủy",FAILED:"Thất bại",ASSESSMENT_FAILED:"Đánh giá thất bại",EXPIRED:"Đã hết hạn",ARCHIVED:"Đã lưu trữ",UNKNOWN:"Không rõ"};
+  const statusLabels = {INITIALIZED:"Đã khởi tạo",PROFILING:"Đang chuẩn bị hồ sơ",READY:"Sẵn sàng",STAGE_ACTIVE:"Đang phỏng vấn",STAGE_TRANSITIONING:"Đang chuyển giai đoạn",DIALOGUE_COMPLETED:"Đã xong hội thoại",ASSESSING:"Đang đánh giá",SYNTHESIZING:"Đang tổng hợp",ENDING:"Đang kết thúc và tạo báo cáo",REPORT_READY:"Báo cáo sẵn sàng",CANCELLED:"Đã hủy",FAILED:"Thất bại",ASSESSMENT_FAILED:"Đánh giá thất bại",EXPIRED:"Đã hết hạn",ARCHIVED:"Đã lưu trữ",UNKNOWN:"Không rõ"};
   const statusText = (value) => t(statusLabels[value] || value || "Không rõ");
   const TERMINAL = new Set(["REPORT_READY", "CANCELLED", "FAILED", "EXPIRED", "ASSESSMENT_FAILED", "ARCHIVED"]);
   const state = {
@@ -21,9 +21,11 @@
     id: null, session: null, detail: null, brief: null, artifacts: new Map(), messages: [],
     ws: null, authenticated: false, sequence: 0, events: new Map(), epoch: 0,
     reconnectTimer: null, pollTimer: null, starting: false, busy: false, refreshing: false, creating: false,
-    pending: null, pendingRetryCount: 0, pendingRetryTimer: null,
+    ending: new Map(), reportOpening: null, pending: null, pendingRetryCount: 0, pendingRetryTimer: null,
     connected: false, sourceWarning: "", profile: null, candidateProfile: null,
     runTotal: 0, runQuery: "", runLoading: false, searchTimer: null, runSearchEpoch: 0,
+    report: null, autoStart: null, connectTimer: null, connectAttempts: 0, reconnectAttempts: 0, busyTimer: null,
+    planSyncKey: null, conversationHtml: "", answerEnabled: false, confirming: new Map(), lastHydrate: 0,
   };
   const uuid = () => crypto.randomUUID();
   const sha256 = async (value) => {
@@ -44,7 +46,7 @@
     const d = new Date(typeof value === "number" ? value * 1000 : value);
     return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString(i18n.locale === "vi" ? "vi-VN" : "en-US", {hour:"2-digit",minute:"2-digit"});
   };
-  const badgeClass = (status) => ["STAGE_ACTIVE", "REPORT_READY"].includes(status) ? "active" : ["FAILED", "ASSESSMENT_FAILED", "CANCELLED"].includes(status) ? "error" : ["READY", "PROFILING", "ASSESSING", "SYNTHESIZING"].includes(status) ? "ready" : "";
+  const badgeClass = (status) => ["STAGE_ACTIVE", "REPORT_READY"].includes(status) ? "active" : ["FAILED", "ASSESSMENT_FAILED", "CANCELLED"].includes(status) ? "error" : ["READY", "PROFILING", "STAGE_TRANSITIONING", "DIALOGUE_COMPLETED", "ASSESSING", "SYNTHESIZING", "ENDING"].includes(status) ? "ready" : "";
   function notice(message, isError = false) {
     $("notice").hidden = !message;
     $("notice").textContent = message || "";
@@ -107,7 +109,7 @@
   function renderProvider() {
     $("backend-label").textContent = state.base;
     $("model-label").textContent = state.config?.provider_model || state.config?.provider || t("Chưa xác nhận");
-    $("storage-label").textContent = state.config?.storage === "sqlite" ? t("SQLite + workspace trên đĩa") : state.config?.storage || t("Backend chưa xác nhận lưu trữ");
+    $("storage-label").textContent = state.config?.storage === "sqlite" ? t("SQLite + workspace trên đĩa") : state.config?.storage === "postgres" ? t("PostgreSQL + workspace trên đĩa") : state.config?.storage || t("Backend chưa xác nhận lưu trữ");
     const real = state.config?.real_provider === true;
     $("provider-tag").textContent = real ? t("PROVIDER THỰC") : t("PROVIDER CHƯA SẴN SÀNG");
     $("provider-tag").className = `real-tag${real ? " available" : ""}`;
@@ -119,6 +121,8 @@
     connectionLabel();
   }
   async function connect() {
+    clearTimeout(state.connectTimer);
+    state.connectTimer = null;
     disconnectStream();
     state.connected = false;
     state.config = null;
@@ -129,12 +133,17 @@
       if (!state.token) throw new Error(t("Backend yêu cầu service token. Nhập token trong ‘Kết nối khác’."));
       await refreshRuns(true);
       state.connected = true;
+      state.connectAttempts = 0;
       notice("");
       renderProvider();
       const requested = new URL(location.href).searchParams.get("session_id");
       if (requested) await selectRun(requested);
     } catch (error) {
-      notice(t("Không kết nối được core: {error}",{error:error.message}), true);
+      // Retry automatically so a restarted core is picked up without a manual reload.
+      const delay = Math.min(30000, 2000 * 2 ** state.connectAttempts);
+      state.connectAttempts += 1;
+      notice(t("Không kết nối được core: {error}. Tự thử lại sau {seconds} giây.",{error:error.message,seconds:Math.round(delay / 1000)}), true);
+      state.connectTimer = setTimeout(connect, delay);
       $("run-list").innerHTML = `<p class="sidebar-empty">${t("Chưa đọc được lịch sử từ backend.")}</p>`;
       renderProvider();
     }
@@ -177,6 +186,9 @@
   }
   async function selectRun(id) {
     disconnectStream();
+    if (state.pendingRetryTimer) clearTimeout(state.pendingRetryTimer);
+    state.pendingRetryTimer = null;
+    state.pendingRetryCount = 0;
     state.epoch += 1;
     state.id = id;
     state.detail = null;
@@ -192,6 +204,9 @@
     state.pending = readLocal("pending-answer");
     state.autoStart = null;
     state.sourceWarning = "";
+    state.planSyncKey = null;
+    state.conversationHtml = "";
+    state.reconnectAttempts = 0;
     $("answer").value = localStorage.getItem(key("draft")) || "";
     const url = new URL(location.href);
     url.searchParams.set("session_id", id);
@@ -218,6 +233,7 @@
     if (epoch !== state.epoch) return;
     state.detail = detail;
     state.session = detail.session;
+    state.lastHydrate = Date.now();
     const events = Array.isArray(detail.events) ? detail.events : [];
     events.forEach(ingestEvent);
     const entries = (detail.artifacts || []).filter((a) => /^turns\/turn_\d+_(candidate|interviewer)\.json$/.test(a.path) || ["inputs/form_input.json","context/interview_brief.json","context/candidate_profile.json"].includes(a.path));
@@ -253,6 +269,23 @@
     state.autoStart = null;
     if (TERMINAL.has(state.session.status) || detail.execution_origin === "legacy_simulation") disconnectStream();
     renderSession();
+    if (state.session.status === "REPORT_READY" && state.ending.get(id) === "accepted") await openReport(epoch);
+    else if (TERMINAL.has(state.session.status)) state.ending.delete(id);
+  }
+  function isEnding() { return state.ending.has(state.id) || state.session?.status === "ENDING"; }
+  async function openReport(epoch = state.epoch) {
+    const id = state.id;
+    if (!id || state.reportOpening === id) return;
+    state.reportOpening = id;
+    try {
+      const report = await api(`/api/v1/sessions/${encodeURIComponent(id)}/report`);
+      if (epoch !== state.epoch || id !== state.id) return;
+      state.report = report;
+      renderReport();
+      if (!$("report-dialog").open) $("report-dialog").showModal();
+      state.ending.delete(id);
+      renderSession();
+    } finally { if (state.reportOpening === id) state.reportOpening = null; }
   }
   function ingestEvent(event) {
     if (!event || !event.type || event.type === "reasoning_summary") return;
@@ -282,10 +315,15 @@
     if (!messages.length) {
       const status = state.session?.status;
       const preparing = ["INITIALIZED","PROFILING","READY"].includes(status);
+      state.conversationHtml = "";
       container.innerHTML = `<div class="empty-conversation"><div class="empty-symbol">${preparing ? "↻" : "↗"}</div><h3>${preparing ? t("Core đang chuẩn bị phiên") : t("Chưa có hội thoại đã lưu")}</h3><p>${preparing ? t("Hồ sơ, ngữ cảnh và nội dung phỏng vấn đang được xử lý. Câu hỏi đầu tiên sẽ xuất hiện tại đây.") : t("Phiên này chưa có artifact hội thoại. Trạng thái và chi tiết runtime được lưu tại inspector.")}</p></div>`;
       return;
     }
-    container.innerHTML = messages.map((m) => `<article class="message ${m.role}${m.live ? " live" : ""}"><span class="avatar">${m.role === "candidate" ? t("Bạn") : "C"}</span><div class="message-body"><div class="message-header">${m.role === "candidate" ? t("Bạn") : t("Core · Người phỏng vấn")}<small>${t("Lượt")} ${m.turn} ${shortTime(m.timestamp) ? `· ${escape(shortTime(m.timestamp))}` : ""}${m.live ? t(" · đang truyền trực tiếp") : ""}</small></div><div class="message-content">${escape(m.text)}</div></div></article>`).join("");
+    const html = messages.map((m) => `<article class="message ${m.role}${m.live ? " live" : ""}"><span class="avatar">${m.role === "candidate" ? t("Bạn") : "C"}</span><div class="message-body"><div class="message-header">${m.role === "candidate" ? t("Bạn") : t("Core · Người phỏng vấn")}<small>${t("Lượt")} ${m.turn} ${shortTime(m.timestamp) ? `· ${escape(shortTime(m.timestamp))}` : ""}${m.live ? t(" · đang truyền trực tiếp") : ""}</small></div><div class="message-content">${escape(m.text)}</div></div></article>`).join("");
+    // Polling re-renders often; keep the DOM (and any text selection) when nothing changed.
+    if (html === state.conversationHtml && container.querySelector(".message")) return;
+    state.conversationHtml = html;
+    container.innerHTML = html;
     if (atBottom || state.busy) container.scrollTop = container.scrollHeight;
   }
   function renderSession() {
@@ -322,29 +360,39 @@
           return `<li>${link} <small>(${escape(status)} · ${escape(use)})</small>${excerpt ? `<p>${escape(excerpt)}</p>` : ""}</li>`;
         }).join("")}</ul>`);
       }
-      $("plan-seniority").value = state.profile?.seniority || "";
-      $("plan-round").value = state.profile?.interview_round || "";
-      $("plan-duration").value = state.profile?.duration_minutes ?? "";
+      // Only overwrite the plan form when the saved plan changes, so polling never discards edits in progress.
+      const planSyncKey = JSON.stringify([state.id, state.profile?.seniority, state.profile?.interview_round, state.profile?.duration_minutes]);
+      if (planSyncKey !== state.planSyncKey) {
+        state.planSyncKey = planSyncKey;
+        $("plan-seniority").value = state.profile?.seniority || "";
+        $("plan-round").value = state.profile?.interview_round || "";
+        $("plan-duration").value = state.profile?.duration_minutes ?? "";
+      }
       $("plan-duration").placeholder = String(duration.planned_minutes ?? 40);
-      $("plan-duration-hint").textContent = `${t("Đề xuất hiện tại")}: ${duration.planned_minutes ?? 40} ${t("phút")} · ${escape(duration.source || "—")}`;
-      ["plan-seniority","plan-round","plan-duration","save-plan"].forEach((id) => { $(id).disabled = status !== "READY" || state.starting; });
+      $("plan-duration-hint").textContent = `${t("Đề xuất hiện tại")}: ${duration.planned_minutes ?? 40} ${t("phút")} · ${duration.source || "—"}`;
+      ["plan-seniority","plan-round","plan-duration","save-plan"].forEach((id) => { $(id).disabled = status !== "READY" || state.starting || isEnding(); });
     }
     $("inspect-run").href = state.id ? `/inspect/?session_id=${encodeURIComponent(state.id)}` : "/inspect/";
-    $("start-session").disabled = !canRunSelected() || status !== "READY" || state.starting;
+    $("start-session").disabled = !canRunSelected() || status !== "READY" || state.starting || isEnding();
     $("start-session").textContent = state.starting ? t("Đang tạo câu hỏi…") : t("Bắt đầu phỏng vấn");
-    $("cancel-session").disabled = !s || TERMINAL.has(status);
+    $("cancel-session").disabled = !s || TERMINAL.has(status) || isEnding();
+    if (!state.confirming.has("cancel-session")) $("cancel-session").textContent = t("Hủy phiên");
+    $("end-session").disabled = !s || TERMINAL.has(status) || isEnding() || state.detail?.execution_origin === "legacy_simulation";
+    if (!state.confirming.has("end-session")) $("end-session").textContent = isEnding() ? t("Đang kết thúc và tạo báo cáo…") : t("Kết thúc và tạo báo cáo");
     const latestAnswerTurn = Math.max(-1,...state.messages.filter((m) => m.role === "candidate").map((m) => m.turn));
     const latestQuestionTurn = Math.max(-1,...state.messages.filter((m) => m.role === "interviewer").map((m) => m.turn));
     const hasQuestion = latestQuestionTurn >= 0 && latestQuestionTurn >= latestAnswerTurn;
-    const answerEnabled = canRunSelected() && status === "STAGE_ACTIVE" && state.authenticated && hasQuestion && !state.busy && !state.pending;
+    const answerEnabled = canRunSelected() && status === "STAGE_ACTIVE" && state.authenticated && hasQuestion && !state.busy && !state.pending && !isEnding();
+    state.answerEnabled = answerEnabled;
     $("answer").disabled = !answerEnabled;
     $("send-answer").disabled = !answerEnabled || !$("answer").value.trim();
     $("answer-hint").textContent = state.sourceWarning || (s?.failure_code ? t("Core thất bại: {code}",{code:s.failure_code}) : state.pending ? t("Đang chờ xác nhận từ dữ liệu đã lưu") : state.busy ? t("Core đang xử lý lượt hiện tại…") : answerEnabled ? t("Ctrl / ⌘ + Enter để gửi · lưu ở backend") : !canRun() ? t("Cần provider thật để chạy") : status === "STAGE_ACTIVE" && !state.authenticated ? t("Đang kết nối lại stream…") : TERMINAL.has(status) ? t("Phiên đã kết thúc · hội thoại từ backend") : t("Chờ core sẵn sàng"));
     $("pending-panel").hidden = !state.pending;
     $("pending-text").textContent = state.pending?.accepted ? t("Core đã lưu câu trả lời. Đang chờ câu hỏi tiếp theo; có thể gửi lại cùng ID để khôi phục lượt chưa hoàn tất.") : t("Đã gửi nhưng chưa xác nhận được từ artifact. Chờ hoặc gửi lại cùng ID; không tạo lượt trả lời mới.");
-    $("retry-answer").disabled = !canRunSelected() || !state.authenticated || status !== "STAGE_ACTIVE" || state.busy;
+    $("retry-answer").disabled = !canRunSelected() || !state.authenticated || status !== "STAGE_ACTIVE" || state.busy || isEnding();
     $("show-report").disabled = status !== "REPORT_READY";
-    $("report-hint").textContent = status === "REPORT_READY" ? t("Core đã lưu báo cáo hoàn tất. Mở để đọc kết quả.") : t("Báo cáo xuất hiện khi core hoàn tất đánh giá.");
+    $("download-transcript").disabled = !state.messages.length;
+    $("report-hint").textContent = isEnding() && status !== "REPORT_READY" ? t("Core đang dừng các agent và tổng hợp bằng chứng hiện có. Báo cáo có thể chưa đủ dữ liệu.") : status === "REPORT_READY" ? t("Core đã lưu báo cáo hoàn tất. Mở để đọc kết quả.") : t("Báo cáo xuất hiện khi core hoàn tất đánh giá.");
     const extracted = state.candidateProfile || {};
     const entries = (value) => Array.isArray(value) ? value.slice(0,5) : [];
     const renderItems = (items, formatter) => items.length ? `<ul>${items.map((item) => `<li>${formatter(item)}</li>`).join("")}</ul>` : "";
@@ -357,8 +405,8 @@
       [t("Giải thưởng"), entries(extracted.awards).map((item) => typeof item === "string" ? item : item.name)],
       [t("Chứng chỉ"), entries(extracted.certifications).map((item) => typeof item === "string" ? item : item.name)],
     ].filter(([, items]) => Array.isArray(items) && items.length);
-    $("profile-info").innerHTML = profile ? `<p><strong>${escape(profile.candidate_name)}</strong>${escape(profile.target_role || "")}</p><p>${escape(profile.target_company || "")} · ${escape(profile.experience_years ?? "—")} ${t("năm kinh nghiệm")}</p><p>${escape(extracted.summary || t("Chưa trích xuất được phần tóm tắt."))}</p>${extractedSections.map(([title,items]) => `<div class="profile-extracted"><strong>${escape(title)}</strong>${renderItems(items, (item) => escape(item))}</div>`).join("")}` : t("Chưa đọc được hồ sơ đã lưu.");
-    $("edit-profile").disabled = !profile || !state.candidateProfile || status !== "READY" || state.starting;
+    $("profile-info").innerHTML = profile ? `<p><strong>${escape(profile.candidate_name)}</strong>${profile.target_role ? ` · ${escape(profile.target_role)}` : ""}</p><p>${escape(profile.target_company || "")} · ${escape(profile.experience_years ?? "—")} ${t("năm kinh nghiệm")}</p><p>${escape(extracted.summary || t("Chưa trích xuất được phần tóm tắt."))}</p>${extractedSections.map(([title,items]) => `<div class="profile-extracted"><strong>${escape(title)}</strong>${renderItems(items, (item) => escape(item))}</div>`).join("")}` : t("Chưa đọc được hồ sơ đã lưu.");
+    $("edit-profile").disabled = !profile || !state.candidateProfile || status !== "READY" || state.starting || isEnding();
     renderConversation();
     connectionLabel();
   }
@@ -383,6 +431,7 @@
       try { event = JSON.parse(message.data); } catch { return; }
       if (event.type === "auth_ok") {
         state.authenticated = true;
+        state.reconnectAttempts = 0;
         ws.send(JSON.stringify({type:"replay", last_sequence:state.sequence}));
         renderSession();
         return;
@@ -393,7 +442,7 @@
       if (["error","busy","generation_cancelled"].includes(event.type)) {
         const code = event.payload?.code;
         const transientBusy = event.type === "busy" || ["TURN_IN_PROGRESS","GENERATION_BUSY"].includes(code);
-        if (transientBusy && state.pending && state.pendingRetryCount < 5) {
+        if (transientBusy && !isEnding() && state.pending && state.pendingRetryCount < 5) {
           state.pendingRetryCount += 1;
           state.busy = true;
           if (state.pendingRetryTimer) clearTimeout(state.pendingRetryTimer);
@@ -426,12 +475,16 @@
       state.busy = false;
       renderSession();
       if ([1008,4001,4003,4009].includes(event.code)) { notice(t("Stream bị đóng ({code}): {reason}.",{code:event.code,reason:event.reason || t("kiểm tra token hoặc phiên đang mở ở tab khác")}),true); return; }
-      if (!TERMINAL.has(state.session?.status)) state.reconnectTimer = setTimeout(() => openStream(epoch), 3000);
+      if (!TERMINAL.has(state.session?.status)) {
+        const delay = Math.min(15000, 1000 * 2 ** state.reconnectAttempts);
+        state.reconnectAttempts += 1;
+        state.reconnectTimer = setTimeout(() => openStream(epoch), delay);
+      }
     };
     ws.onerror = () => { if (epoch === state.epoch) notice(t("Không kết nối được stream. Lịch sử vẫn được đọc từ backend."),true); };
   }
   async function startInterview() {
-    if (!state.id || !canRunSelected() || state.session?.status !== "READY" || state.starting) return;
+    if (!state.id || !canRunSelected() || state.session?.status !== "READY" || state.starting || isEnding()) return;
     const id = state.id;
     const epoch = state.epoch;
     state.starting = true;
@@ -456,7 +509,7 @@
     }
   }
   function sendPending(automaticRetry = false) {
-    if (!state.pending || !canRunSelected() || !state.authenticated || state.ws?.readyState !== WebSocket.OPEN) return;
+    if (isEnding() || !state.pending || !canRunSelected() || !state.authenticated || state.ws?.readyState !== WebSocket.OPEN) return;
     if (!automaticRetry) state.pendingRetryCount = 0;
     if (state.pendingRetryTimer) clearTimeout(state.pendingRetryTimer);
     state.pendingRetryTimer = null;
@@ -464,18 +517,33 @@
     state.ws.send(JSON.stringify({...state.pending, type:"candidate_answer", last_sequence:state.sequence}));
     renderSession();
     // Do not send again automatically. Only the operator may retry the same message ID.
-    setTimeout(() => {
+    clearTimeout(state.busyTimer);
+    state.busyTimer = setTimeout(() => {
+      state.busyTimer = null;
       if (state.pending && state.busy) { state.busy = false; renderSession(); }
     }, 60000);
   }
+  const profileFormFields = ["candidate_name", "target_role", "target_company", "experience_years", "skills"];
+  const profileCvFields = ["cv_file", "cv_text"];
+  function syncProfileInputMode() {
+    const useCv = $("profile-input-mode").value === "cv";
+    for (const name of [...profileFormFields, ...profileCvFields]) {
+      const field = $("create-form").elements.namedItem(name);
+      const active = profileCvFields.includes(name) === useCv;
+      field.disabled = !active;
+      field.closest("label").hidden = !active;
+    }
+  }
+  $("profile-input-mode").addEventListener("change", syncProfileInputMode);
+  syncProfileInputMode();
   $("create-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!canRun() || state.creating) return;
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     const payload = {
-      candidate_name:String(form.get("candidate_name")).trim(), target_role:String(form.get("target_role")).trim(),
-      target_company:String(form.get("target_company")).trim(), experience_years:Number(form.get("experience_years")),
+      candidate_name:String(form.get("candidate_name") || "").trim(), target_role:String(form.get("target_role") || "").trim(),
+      target_company:String(form.get("target_company") || "").trim(), experience_years:String(form.get("experience_years") || "").trim() ? Number(form.get("experience_years")) : null,
       seniority:String(form.get("seniority") || "").trim() || null,
       interview_round:String(form.get("interview_round") || "").trim() || null,
       duration_minutes:String(form.get("duration_minutes") || "").trim() ? Number(form.get("duration_minutes")) : null,
@@ -485,7 +553,12 @@
     };
     const cvFile = form.get("cv_file");
     const jdFile = form.get("job_description_file");
-    if (!payload.candidate_name || !payload.target_role || !payload.target_company) return;
+    const useCv = form.get("profile_input_mode") === "cv";
+    if (useCv && !payload.cv_text && !(cvFile instanceof File && cvFile.size)) {
+      notice(t("Hãy tải tệp CV hoặc dán nội dung CV."), true);
+      return;
+    }
+    if (!useCv && (!payload.candidate_name || !payload.target_role || !payload.target_company)) return;
     let creating = false;
     try {
       const maxUploadBytes = 12 * 1024 * 1024;
@@ -521,6 +594,7 @@
       sessionStorage.removeItem(key("pending-create", "new"));
       $("create-dialog").close();
       formElement.reset();
+      syncProfileInputMode();
       await refreshRuns();
       await selectRun(result.session_id);
       notice(t("Core đã chuẩn bị kế hoạch. Hãy xem lại vòng, thời lượng và giới hạn nguồn trước khi bắt đầu."));
@@ -584,24 +658,59 @@
     localStorage.setItem(key("pending-answer"), JSON.stringify(state.pending));
     sendPending();
   });
-  $("answer").addEventListener("input", () => { if (state.id) localStorage.setItem(key("draft"), $("answer").value); renderSession(); });
+  $("answer").addEventListener("input", () => {
+    if (state.id) localStorage.setItem(key("draft"), $("answer").value);
+    $("send-answer").disabled = !state.answerEnabled || !$("answer").value.trim();
+  });
   $("answer").addEventListener("keydown", (event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); $("answer-form").requestSubmit(); } });
-  $("retry-answer").addEventListener("click", sendPending);
+  $("retry-answer").addEventListener("click", () => sendPending(false));
   $("start-session").addEventListener("click", startInterview);
+  // Irreversible actions need a second click within 4 s instead of a blocking browser dialog.
+  function confirmed(buttonId, label) {
+    const button = $(buttonId), pending = state.confirming.get(buttonId);
+    if (pending) clearTimeout(pending.timer);
+    state.confirming.delete(buttonId);
+    button.classList.remove("confirming");
+    if (pending?.id === state.id) return true;
+    const timer = setTimeout(() => { state.confirming.delete(buttonId); button.classList.remove("confirming"); renderSession(); }, 4000);
+    state.confirming.set(buttonId, {id:state.id, timer});
+    button.classList.add("confirming");
+    button.textContent = t(label);
+    return false;
+  }
   $("cancel-session").addEventListener("click", async () => {
     if (!state.id || $("cancel-session").disabled) return;
+    if (!confirmed("cancel-session", "Nhấn lại để hủy phiên")) return;
     $("cancel-session").disabled = true;
     try { await api(`/api/v1/sessions/${encodeURIComponent(state.id)}/cancel`, {method:"POST"}); await hydrate(); notice(t("Core đã hủy phiên. Dữ liệu đã lưu vẫn có thể inspect.")); }
     catch (error) { notice(error.message,true); renderSession(); }
   });
-  $("show-report").addEventListener("click", async () => {
+  $("end-session").addEventListener("click", async () => {
+    if (!state.id || $("end-session").disabled) return;
+    if (!confirmed("end-session", "Nhấn lại để kết thúc ngay")) return;
+    const id = state.id, epoch = state.epoch;
+    state.ending.set(id, "requesting");
+    renderSession();
     try {
-      const report = await api(`/api/v1/sessions/${encodeURIComponent(state.id)}/report`);
-      state.report = report;
-      renderReport();
-      $("report-dialog").showModal();
-    } catch (error) { notice(error.message,true); }
+      await api(`/api/v1/sessions/${encodeURIComponent(id)}/end`, {method:"POST"});
+      state.ending.set(id, "accepted");
+      localStorage.removeItem(key("pending-answer", id));
+      localStorage.removeItem(key("draft", id));
+      if (epoch !== state.epoch || id !== state.id) return;
+      if (state.pendingRetryTimer) clearTimeout(state.pendingRetryTimer);
+      state.pendingRetryTimer = null;
+      state.pendingRetryCount = 0;
+      state.pending = null;
+      state.busy = false;
+      $("answer").value = "";
+      notice(t("Core đang dừng các agent và tổng hợp bằng chứng hiện có. Báo cáo có thể chưa đủ dữ liệu."));
+      await hydrate(epoch);
+    } catch (error) {
+      if (state.ending.get(id) === "requesting") state.ending.delete(id);
+      if (epoch === state.epoch && id === state.id) notice(error.message, true);
+    } finally { if (epoch === state.epoch && id === state.id) renderSession(); }
   });
+  $("show-report").addEventListener("click", () => openReport().catch((error) => notice(error.message,true)));
   ["new-session","empty-create"].forEach((id) => $(id).addEventListener("click", () => { if (canRun()) $("create-dialog").showModal(); }));
   $("refresh-runs").addEventListener("click", () => refreshRuns());
   $("more-runs").addEventListener("click", async () => {
@@ -647,10 +756,46 @@
   });
   document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => $(button.dataset.close).close()));
   window.addEventListener("pagehide", disconnectStream);
+  // A page restored from the back/forward cache has no stream; re-read backend state and reopen it.
+  window.addEventListener("pageshow", (event) => {
+    if (!event.persisted || !state.connected || !state.id) return;
+    const epoch = state.epoch;
+    hydrate(epoch).then(() => { if (epoch === state.epoch && state.session && !TERMINAL.has(state.session.status) && canRunSelected()) openStream(epoch); }).catch((error) => notice(error.message,true));
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || !state.connected || state.refreshing || !state.id) return;
+    hydrate().catch((error) => notice(error.message,true));
+  });
+  function download(name, text, type) {
+    const url = URL.createObjectURL(new Blob([text], {type}));
+    const link = document.createElement("a");
+    link.href = url; link.download = name;
+    document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  $("download-transcript").addEventListener("click", () => {
+    if (!state.id || !state.messages.length) return;
+    const profile = state.profile || {};
+    const lines = [`# ${t("Transcript phỏng vấn")} · ${profile.candidate_name || state.id}`, "", `- ${t("Mã phiên")}: ${state.id}`];
+    if (profile.target_role) lines.push(`- ${t("Vị trí phỏng vấn")}: ${profile.target_role}`);
+    lines.push(`- ${t("Trạng thái")}: ${state.session?.status || "—"}`, "");
+    state.messages.forEach((m) => lines.push(`## ${t("Lượt")} ${m.turn} · ${m.role === "candidate" ? t("Bạn") : t("Core · Người phỏng vấn")}`, "", m.text, ""));
+    download(`transcript_${state.id}.md`, lines.join("\n"), "text/markdown;charset=utf-8");
+  });
+  $("report-download").addEventListener("click", () => {
+    if (!state.report) return;
+    const markdown = typeof state.report.report_markdown === "string";
+    download(`report_${state.id}.${markdown ? "md" : "json"}`, markdown ? state.report.report_markdown : JSON.stringify(state.report,null,2), markdown ? "text/markdown;charset=utf-8" : "application/json");
+  });
   state.pollTimer = setInterval(async () => {
     if (!state.connected || state.refreshing || document.hidden) return;
     state.refreshing = true;
-    try { if (state.id) await hydrate(); await refreshRuns(); }
+    try {
+      // Finished sessions rarely change; avoid re-reading the full run detail every tick.
+      const settled = TERMINAL.has(state.session?.status) && !state.ending.has(state.id);
+      if (state.id && (!settled || Date.now() - state.lastHydrate > 30000)) await hydrate();
+      await refreshRuns();
+    }
     catch (error) { notice(t("Không đồng bộ được dữ liệu từ core: {error}",{error:error.message}),true); }
     finally { state.refreshing = false; }
   }, 3000);
@@ -753,12 +898,28 @@
     const tree = node(value,0);
     return (truncated ? `<p class="preview-limit">${escape(t("Cây JSON được giới hạn để giữ giao diện mượt. Mở Nội dung gốc để đọc dữ liệu đầy đủ."))}</p>` : "") + tree;
   }
+  // Chỉ PASS (sau khi tính review của người duyệt) mới xanh; FAIL và NEEDS_REVIEW đều là chưa đạt.
+  function renderVerdict(report) {
+    const assessment = report.final_assessment || {};
+    const decision = report.decision || {};
+    const verdict = report.verdict || decision.verdict || assessment.verdict;
+    if (!verdict) return "";
+    const passed = verdict === "PASS";
+    const score = decision.weighted_score ?? assessment.metrics?.weighted_score;
+    const threshold = decision.pass_threshold ?? assessment.metrics?.pass_threshold;
+    const summary = assessment.narrative?.summary || (decision.verdict_reasons || []).join(" ");
+    const note = verdict === "NEEDS_REVIEW" ? t("Kết quả nằm ở vùng ranh giới hoặc thiếu bằng chứng; cần người duyệt xác nhận.") : "";
+    const scoreText = typeof score === "number" ? t("Điểm {score}/4 · ngưỡng đạt {threshold}", {score, threshold: threshold ?? "—"}) : "";
+    return `<section class="verdict-banner ${passed ? "pass" : "fail"}" role="status"><div class="verdict-mark" aria-hidden="true">${passed ? "✓" : "✕"}</div><div><strong>${escape(passed ? t("ĐẠT PVAN") : t("KHÔNG ĐẠT PVAN"))}</strong>${scoreText ? `<span class="verdict-score">${escape(scoreText)}</span>` : ""}${summary ? `<p>${escape(summary)}</p>` : ""}${note ? `<p class="verdict-note">${escape(note)}</p>` : ""}</div></section>`;
+  }
   function renderReport() {
     const report = state.report;
     if (!report) return;
     const markdown = typeof report.report_markdown === "string" ? report.report_markdown : null;
     $("report-content").className = `document-view ${markdown === null ? "json-view" : "markdown-view"}`;
     $("report-content").innerHTML = markdown === null ? renderJson(report) : `${renderMarkdown(markdown)}<details class="report-envelope"><summary>${escape(t("Toàn bộ phản hồi JSON từ core"))}</summary><div class="json-view">${renderJson(report)}</div></details>`;
+    if (report.final_assessment?.early_ended) $("report-content").insertAdjacentHTML("afterbegin", `<p class="notice">${escape(t("Phiên kết thúc sớm. Báo cáo chỉ dựa trên bằng chứng đã lưu; một số câu trả lời có thể chưa được đánh giá."))}</p>`);
+    $("report-content").insertAdjacentHTML("afterbegin", renderVerdict(report));
     $("report-raw").textContent = JSON.stringify(report,null,2);
     $("report-copy").textContent = t("Sao chép");
   }
