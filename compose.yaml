@@ -114,7 +114,7 @@ services:
     ports:
       - "127.0.0.1:${DPL_PVAN_PORT:-8001}:8000"
     volumes:
-      - ./data/workspaces:/data/workspaces
+      - interview_workspaces:/data/workspaces
       - rag_index:/data/rag
     healthcheck:
       test:
@@ -132,6 +132,7 @@ services:
 volumes:
   redis_data:
   redisinsight_data:
+  interview_workspaces:
   rag_index:
   minio_data:
   # Legacy SQLite catalog volume: no longer mounted by app (DATABASE_URL is set); kept so

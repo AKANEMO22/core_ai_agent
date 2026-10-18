@@ -78,7 +78,7 @@ class RetentionService:
                     or self.workspace_mgr.root_base / normalize_session_id(session_id)
                 )
                 if not workspace_path.is_dir() or workspace_path.is_symlink():
-                    if not self.artifact_archive.is_archived(session_id, owner_id=session_id):
+                    if not await asyncio.to_thread(self.artifact_archive.is_archived, session_id, owner_id=session_id):
                         protected_sessions.add(session_id)
                     continue
                 workspace = SessionWorkspace(
@@ -101,7 +101,7 @@ class RetentionService:
                         session_ref(session_id),
                         sanitize_secrets(str(e)),
                     )
-                archived = self.artifact_archive.is_archived(session_id, owner_id=session_id)
+                archived = await asyncio.to_thread(self.artifact_archive.is_archived, session_id, owner_id=session_id)
                 if not archived:
                     protected_sessions.add(session_id)
                     continue

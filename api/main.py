@@ -358,7 +358,8 @@ def create_app(
             policy=tool_policy, metrics=metrics,
         )
         if inspect_trace_recorder is not None:
-            inspect_trace_recorder.bind_agent(runtime_agent, "speaker", "session", session_id)
+            # A database write: keep it off the event loop (a PostgreSQL round trip plus the trace write lock).
+            await asyncio.to_thread(inspect_trace_recorder.bind_agent, runtime_agent, "speaker", "session", session_id)
             inspect_trace_recorder.wrap(runtime_agent, "run_loop_streaming", "Speaker turn", "agent")
             if runtime_agent.compactor is not None:
                 inspect_trace_recorder.wrap(runtime_agent.compactor, "maybe_compact", "Context compaction", "operation", "speaker")
